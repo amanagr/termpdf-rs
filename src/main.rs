@@ -20,6 +20,7 @@ mod dark;
 mod highlight;
 mod keys;
 mod pdf;
+mod session;
 mod ui;
 
 use std::io;
@@ -27,7 +28,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
+use clap::parser::ValueSource;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind,
 };
@@ -60,7 +62,13 @@ struct Args {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    // Parse via ArgMatches so we can tell whether `--page` / `--dark`
+    // came from the CLI (override saved state) or from clap's default
+    // (fall back to whatever the user left on last exit).
+    let matches = Args::command().get_matches();
+    let page_explicit = matches.value_source("page") == Some(ValueSource::CommandLine);
+    let dark_explicit = matches.value_source("dark") == Some(ValueSource::CommandLine);
+    let args = Args::from_arg_matches(&matches)?;
 
     let lib = pdf::find_libpdfium()
         .context("locating libpdfium.so — run setup.sh in the project root")?;
@@ -70,8 +78,18 @@ fn main() -> Result<()> {
         .load_pdf_from_file(&args.path, None)
         .with_context(|| format!("loading PDF: {}", args.path.display()))?;
 
+    // Restore last page + dark flag for this PDF, but let an explicit
+    // CLI value (`-p 12`, `--dark`) win over the saved session.
+    let saved = session::Session::load(&args.path);
+    let start_page = if page_explicit {
+        args.page.saturating_sub(1)
+    } else {
+        saved.page
+    };
+    let start_dark = if dark_explicit { args.dark } else { saved.dark };
+
     if let Some(out) = args.probe {
-        return probe(&document, args.page.saturating_sub(1), args.dark, &out);
+        return probe(&document, start_page, start_dark, &out);
     }
 
     // ratatui-image probes the terminal at startup to figure out which
@@ -81,13 +99,7 @@ fn main() -> Result<()> {
     let picker = Picker::from_query_stdio()
         .context("querying terminal for graphics protocol — is this a Kitty/Ghostty/WezTerm?")?;
 
-    let mut app = App::new(
-        document,
-        &args.path,
-        args.page.saturating_sub(1),
-        args.dark,
-        picker,
-    )?;
+    let mut app = App::new(document, &args.path, start_page, start_dark, picker)?;
 
     setup_terminal()?;
     let res = run_loop(&mut app);
@@ -95,6 +107,9 @@ fn main() -> Result<()> {
 
     if let Err(e) = app.persist_highlights() {
         eprintln!("warning: failed to persist highlights: {e:?}");
+    }
+    if let Err(e) = app.persist_session() {
+        eprintln!("warning: failed to persist session: {e:?}");
     }
     res
 }

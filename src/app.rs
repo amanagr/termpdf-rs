@@ -6,6 +6,7 @@ use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 
 use crate::highlight::HighlightStore;
+use crate::session::Session;
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -115,5 +116,15 @@ impl<'doc> App<'doc> {
 
     pub fn persist_highlights(&self) -> Result<()> {
         self.highlights.save(&self.path)
+    }
+
+    /// Save the page + dark flag so the next open lands on the same
+    /// state. Called on clean exit alongside `persist_highlights`.
+    pub fn persist_session(&self) -> Result<()> {
+        Session {
+            page: self.page,
+            dark: self.dark,
+        }
+        .save(&self.path)
     }
 }
