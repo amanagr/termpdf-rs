@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use ratatui_image::protocol::StatefulProtocol;
-use ratatui_image::StatefulImage;
+use ratatui_image::{Resize, StatefulImage};
 
 use crate::app::{App, Mode, RenderKey};
 use crate::dark;
@@ -32,10 +32,26 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
             img_area,
         );
     } else if let Some(proto) = app.image_proto.as_mut() {
+        // Horizontal centering. ratatui-image's Resize::Fit preserves
+        // aspect ratio but anchors top-left within the area, so a
+        // portrait page in a wide terminal lands flush against the
+        // left edge. `size_for` tells us how many cells the image will
+        // occupy under Fit; we recompute the x-offset so that empty
+        // space splits evenly on both sides. Height stays full because
+        // PDFs are taller than wide and the layout already height-binds.
         // Turbofish: StatefulImage<T> is generic over the protocol type
         // and there's nothing in this call that constrains T, so the
         // compiler can't infer it from `proto`. Pin it to StatefulProtocol.
-        f.render_stateful_widget(StatefulImage::<StatefulProtocol>::new(), img_area, proto);
+        let fit = Resize::Fit(None);
+        let render_size = proto.size_for(fit.clone(), img_area);
+        let x_offset = img_area.width.saturating_sub(render_size.width) / 2;
+        let centered = Rect {
+            x: img_area.x + x_offset,
+            y: img_area.y,
+            width: render_size.width.min(img_area.width),
+            height: img_area.height,
+        };
+        f.render_stateful_widget(StatefulImage::<StatefulProtocol>::new(), centered, proto);
     }
 
     f.render_widget(status_line(app), status_area);

@@ -12,6 +12,15 @@ pub fn dispatch(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
             KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q')
         ) {
             app.show_help = false;
+            // The kitty-graphics protocol writes a row's full escape
+            // sequence into the first cell of each image row and marks
+            // every other cell `set_skip(true)`. When the help overlay
+            // drew text over those skip-cells, ratatui's diff engine
+            // never repaints them on the next frame (skip=true == "don't
+            // emit"), so help-text glyphs stay until the next page flip.
+            // Invalidating forces a full re-encode → fresh transmit
+            // sequence → the terminal repaints the entire image area.
+            app.invalidate();
         }
         return Ok(());
     }
