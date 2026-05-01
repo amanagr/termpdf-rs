@@ -1,0 +1,54 @@
+[package]
+name = "termpdf-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal PDF reader with Kitty graphics + dark mode"
+license = "MIT"
+repository = "https://github.com/amanagr/termpdf-rs"
+default-run = "termpdf"
+
+[[bin]]
+name = "termpdf"
+path = "src/main.rs"
+
+[dependencies]
+# PDF rendering. Default features enable dynamic dlopen of libpdfium
+# at runtime, image-crate integration, and a thread-safe mutex
+# wrapper. `setup.sh` stages a prebuilt libpdfium.so in vendor/.
+pdfium-render = "0.9"
+
+# TUI + Kitty/Sixel image embedding. ratatui-image picks the best
+# graphics protocol the terminal advertises; on Ghostty it lands on
+# the Kitty protocol, which is what we want for pixel-perfect output.
+#
+# ratatui-image 10 pins ratatui ^0.30, so we match. Mismatching here
+# causes two copies of `StatefulWidget` to coexist — same name, same
+# shape, different traits — and `StatefulImage` only implements one of
+# them. The error message ("similarly named trait") is the tell.
+ratatui = "0.30"
+# Skip chafa-dyn (the default) — chafa is the halfblocks fallback
+# renderer for terminals without kitty/sixel, and it pulls in
+# libchafa-devel as a system dep. Ghostty speaks kitty natively, so
+# we don't need chafa.
+ratatui-image = { version = "10", default-features = false, features = ["crossterm", "image-defaults"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+
+# Color-aware dark mode. We invert *luminance* in HSL space so red
+# text stays red, blue charts stay blue, only white/grayscale gets
+# flipped. Naive per-channel inversion turns a red diagram into a
+# cyan diagram — that's the bug almost every PDF dark-mode tool ships.
+image = "0.25"
+palette = { version = "0.7", default-features = false, features = ["std"] }
+
+# CLI parsing + JSON for highlight persistence.
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+dirs = "5"
+
+[profile.release]
+# Smaller binary, no measurable perf loss for our workload.
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

@@ -1,0 +1,6 @@
+/target
+# vendor/ is populated by setup.sh from chromium/pdfium-binaries on
+# every clean checkout; no point in committing the ~7.5 MB blob plus
+# headers/licenses that live next to it.
+/vendor
+Cargo.lock.bak
