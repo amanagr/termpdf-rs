@@ -874,11 +874,14 @@ mod tests {
         );
     }
 
-    /// The caret accent (vertical bar at the head) must land inside
-    /// the band so the user can see where their cursor is. Two-bug
-    /// regression: (1) caret rendered offscreen because the cell-min
-    /// was dropped along with the cell-overlay path; (2) caret drawn
-    /// at the anchor instead of the head.
+    /// The caret accent (dark outline + white fill) must land at the
+    /// head so the user can see where their cursor is. We compare
+    /// pixels at the head bbox vs a non-head char in the same band:
+    /// the head must be visually distinct (it's white-tinted on top
+    /// of the yellow band; the rest of the band is just yellow).
+    ///
+    /// Catches: caret not painted at all (no-op fix), caret drawn
+    /// at the anchor instead of head, caret drawn off-screen.
     #[test]
     fn bake_selection_paints_caret_inside_band_at_head() {
         use image::{Rgba, RgbaImage};
@@ -892,16 +895,34 @@ mod tests {
 
         bake_selection_into_page(&mut img, 0, sel, &pt, 0);
 
-        // The head is char idx 3. Its bbox centre must be tinted
-        // (band fill) AND have a darker outline pixel right at its
-        // edge (the caret's `outline_rect`).
-        let (cx, cy) = center_pixel(pt.chars[3].bbox, 200, 200);
-        let p = img.get_pixel(cx, cy).0;
-        // Caret blends white over the yellow band → should be brighter
-        // than the surrounding band (closer to 255 in each channel).
+        // Yellow band at 0.45 alpha over white = (255, 244, 204).
+        // White-tinted caret over that band at 0.55 alpha + dark
+        // outline => head pixels look noticeably brighter than
+        // surrounding band cells (R≈255, G,B much higher than the
+        // band's ~244/~204).
+        let (head_x, head_y) = center_pixel(pt.chars[3].bbox, 200, 200);
+        let (band_x, band_y) = center_pixel(pt.chars[1].bbox, 200, 200);
+        let head_p = img.get_pixel(head_x, head_y).0;
+        let band_p = img.get_pixel(band_x, band_y).0;
+        // saturating_add so the no-bake case (both pure white) fails
+        // here cleanly instead of panicking on integer overflow.
         assert!(
-            p[0] >= 250 && p[1] >= 230,
-            "expected white-tinted caret at head ({cx},{cy}), got {p:?}"
+            head_p[2] > band_p[2].saturating_add(20),
+            "head caret should look brighter (whiter) than the band: \
+             head={head_p:?} vs band={band_p:?}. \
+             Caret accent isn't being painted at the head."
+        );
+
+        // The anchor (idx 0) must look like the rest of the band —
+        // no extra brightening. Catches the regression where the
+        // caret follows the anchor instead of the head.
+        let (anchor_x, anchor_y) = center_pixel(pt.chars[0].bbox, 200, 200);
+        let anchor_p = img.get_pixel(anchor_x, anchor_y).0;
+        assert!(
+            anchor_p[2] <= band_p[2].saturating_add(5),
+            "anchor pixel should match the rest of the band: \
+             anchor={anchor_p:?} vs band={band_p:?}. \
+             Caret is following the anchor, not the head."
         );
     }
 
