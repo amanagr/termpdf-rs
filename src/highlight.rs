@@ -145,15 +145,45 @@ mod tests {
     }
 }
 
+/// Parse `#rrggbb` or bare `rrggbb` into RGB. Any malformed input
+/// falls back to yellow as a *whole* — a partial parse used to
+/// produce Frankenstein colors (e.g. `#zz0000` → red instead of
+/// yellow), which silently disagreed with the saved hex string.
 pub fn rgb_from_hex(hex: &str) -> (u8, u8, u8) {
-    // Tolerate "#rrggbb" and bare "rrggbb"; fall back to yellow on
-    // anything else so a hand-edited highlights.json doesn't crash.
+    const FALLBACK: (u8, u8, u8) = (0xff, 0xd5, 0x4f);
     let h = hex.trim_start_matches('#');
-    if h.len() == 6 {
-        let r = u8::from_str_radix(&h[0..2], 16).unwrap_or(0xff);
-        let g = u8::from_str_radix(&h[2..4], 16).unwrap_or(0xd5);
-        let b = u8::from_str_radix(&h[4..6], 16).unwrap_or(0x4f);
-        return (r, g, b);
+    if h.len() != 6 {
+        return FALLBACK;
     }
-    (0xff, 0xd5, 0x4f)
+    match (
+        u8::from_str_radix(&h[0..2], 16),
+        u8::from_str_radix(&h[2..4], 16),
+        u8::from_str_radix(&h[4..6], 16),
+    ) {
+        (Ok(r), Ok(g), Ok(b)) => (r, g, b),
+        _ => FALLBACK,
+    }
+}
+
+#[cfg(test)]
+mod color_tests {
+    use super::rgb_from_hex;
+
+    #[test]
+    fn valid_hex_parses() {
+        assert_eq!(rgb_from_hex("#aabbcc"), (0xaa, 0xbb, 0xcc));
+        assert_eq!(rgb_from_hex("aabbcc"), (0xaa, 0xbb, 0xcc));
+    }
+
+    #[test]
+    fn malformed_hex_falls_back_consistently() {
+        // Was a real bug: partial parse used different per-channel
+        // defaults, so "#zz0000" returned (ff, 00, 00) — red, not the
+        // documented yellow fallback. Now any parse failure on any
+        // channel returns yellow as a whole.
+        assert_eq!(rgb_from_hex("#zz0000"), (0xff, 0xd5, 0x4f));
+        assert_eq!(rgb_from_hex("#zzzzzz"), (0xff, 0xd5, 0x4f));
+        assert_eq!(rgb_from_hex(""), (0xff, 0xd5, 0x4f));
+        assert_eq!(rgb_from_hex("#abc"), (0xff, 0xd5, 0x4f));
+    }
 }

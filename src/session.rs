@@ -126,3 +126,87 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     }
     h
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_pdf_path(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("termpdf-session-{}-{}.pdf", std::process::id(), tag));
+        // The path doesn't have to exist; Session uses canonicalize
+        // best-effort and falls back to the raw path for hashing.
+        let _ = std::fs::write(&p, b"%PDF-1.4\n");
+        p
+    }
+
+    #[test]
+    fn save_then_load_roundtrips_all_fields() {
+        let pdf = temp_pdf_path("rt");
+        let mut marks = std::collections::BTreeMap::new();
+        marks.insert('a', 12);
+        marks.insert('z', 99);
+        let s = Session {
+            page: 42,
+            dark: true,
+            zoom: 2.5,
+            marks,
+        };
+        s.save(&pdf).unwrap();
+        let loaded = Session::load(&pdf);
+        assert_eq!(loaded.page, 42);
+        assert!(loaded.dark);
+        assert!((loaded.zoom - 2.5).abs() < 1e-6);
+        assert_eq!(loaded.marks.get(&'a'), Some(&12));
+        assert_eq!(loaded.marks.get(&'z'), Some(&99));
+        // Cleanup
+        let _ = std::fs::remove_file(Session::store_path(&pdf).unwrap());
+        let _ = std::fs::remove_file(&pdf);
+    }
+
+    #[test]
+    fn missing_session_file_returns_default() {
+        // Use a PDF path that will produce a unique-but-nonexistent
+        // store path. Session::load should NOT bail; defaults instead.
+        let pdf = std::env::temp_dir().join(format!(
+            "termpdf-no-session-{}-{}.pdf",
+            std::process::id(),
+            "missing"
+        ));
+        let _ = std::fs::remove_file(Session::store_path(&pdf).unwrap_or_default());
+        let s = Session::load(&pdf);
+        assert_eq!(s.page, 0);
+        assert!(!s.dark);
+        assert!((s.zoom - 1.0).abs() < 1e-6);
+        assert!(s.marks.is_empty());
+    }
+
+    #[test]
+    fn corrupt_session_file_returns_default() {
+        let pdf = temp_pdf_path("corrupt");
+        let store = Session::store_path(&pdf).unwrap();
+        std::fs::write(&store, b"not json {{{").unwrap();
+        let s = Session::load(&pdf);
+        // Hard-fail on a corrupt file would block the user from
+        // ever opening this PDF again — defaulting is the right call.
+        assert_eq!(s.page, 0);
+        let _ = std::fs::remove_file(&store);
+        let _ = std::fs::remove_file(&pdf);
+    }
+
+    #[test]
+    fn legacy_session_without_zoom_or_marks_loads() {
+        // Older sessions only had `page` and `dark`. Make sure the
+        // serde defaults kick in cleanly.
+        let pdf = temp_pdf_path("legacy");
+        let store = Session::store_path(&pdf).unwrap();
+        std::fs::write(&store, br#"{"page":7,"dark":true}"#).unwrap();
+        let s = Session::load(&pdf);
+        assert_eq!(s.page, 7);
+        assert!(s.dark);
+        assert!((s.zoom - 1.0).abs() < 1e-6);
+        assert!(s.marks.is_empty());
+        let _ = std::fs::remove_file(&store);
+        let _ = std::fs::remove_file(&pdf);
+    }
+}

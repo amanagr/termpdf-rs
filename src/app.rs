@@ -339,6 +339,9 @@ impl<'doc> App<'doc> {
         self.last_layout_key = Some(key);
         self.page_cache.clear();
         self.overlay_cache.clear();
+        // A page can OOM at huge zoom but render fine after the user
+        // zooms back out — don't keep it permanently blacklisted.
+        self.failed_pages.clear();
         self.image_proto = None;
         self.last_compose_key = None;
     }
@@ -381,16 +384,23 @@ impl<'doc> App<'doc> {
     /// in `pinned` (visible right now) are never evicted, even if
     /// the budget can't be satisfied without them.
     pub fn enforce_byte_budget(&mut self, budget: usize, pinned: std::ops::Range<usize>) {
-        loop {
-            let total: usize = self
-                .page_cache
+        // Compute the total byte cost ONCE, then maintain it
+        // incrementally as we evict. Previously this re-summed every
+        // cached page on every loop iteration — O(n²) per call.
+        // Includes overlay_cache because a per-page overlay is the
+        // same dimensions as its source bitmap; otherwise the budget
+        // silently doubles.
+        let mut total: usize = self
+            .page_cache
+            .values()
+            .map(|img| (img.width() * img.height() * 4) as usize)
+            .sum::<usize>()
+            + self
+                .overlay_cache
                 .values()
-                .map(|img| (img.width() * img.height() * 4) as usize)
-                .sum();
-            if total <= budget {
-                break;
-            }
-            // Find the oldest LRU entry that's not pinned.
+                .map(|(img, _)| (img.width() * img.height() * 4) as usize)
+                .sum::<usize>();
+        while total > budget {
             let evict = self
                 .page_cache_lru
                 .iter()
@@ -402,8 +412,12 @@ impl<'doc> App<'doc> {
                 // refuse to render.
                 break;
             };
-            self.page_cache.remove(&p);
-            self.overlay_cache.remove(&p);
+            if let Some(img) = self.page_cache.remove(&p) {
+                total = total.saturating_sub((img.width() * img.height() * 4) as usize);
+            }
+            if let Some((img, _)) = self.overlay_cache.remove(&p) {
+                total = total.saturating_sub((img.width() * img.height() * 4) as usize);
+            }
             self.page_cache_lru.retain(|&x| x != p);
         }
     }
@@ -468,6 +482,22 @@ impl<'doc> App<'doc> {
     }
 
     pub fn goto_page(&mut self, page: usize) {
+        // Record the source on the jumplist for `<C-o>` round-trip,
+        // but only on a "big" jump — sequential j/k stepping would
+        // otherwise drown the jumplist in adjacent pages. ≥ 2-page
+        // delta matches vim's heuristic for what counts as a jump.
+        let from = self.current_page();
+        let p = page.min(self.page_count.saturating_sub(1));
+        if from.abs_diff(p) >= 2 {
+            self.push_jump(from);
+        }
+        self.goto_page_no_record(p);
+    }
+
+    /// Same as `goto_page` but does NOT touch the jumplist. Used by
+    /// `<C-o>`/`<C-i>` themselves so walking the list doesn't keep
+    /// re-pushing the destinations as new jumps.
+    pub fn goto_page_no_record(&mut self, page: usize) {
         let p = page.min(self.page_count.saturating_sub(1));
         self.scroll_y_px = self
             .layout
@@ -484,6 +514,10 @@ impl<'doc> App<'doc> {
         self.goto_page(target);
     }
     pub fn first_page(&mut self) {
+        let from = self.current_page();
+        if from >= 2 {
+            self.push_jump(from);
+        }
         self.scroll_y_px = 0;
         self.invalidate_compose();
     }
@@ -491,7 +525,11 @@ impl<'doc> App<'doc> {
     /// Matches `:N` and counted `NG` semantics so all "go to page p"
     /// paths agree on where p starts.
     pub fn last_page(&mut self) {
+        let from = self.current_page();
         let last = self.page_count.saturating_sub(1);
+        if from.abs_diff(last) >= 2 {
+            self.push_jump(from);
+        }
         self.scroll_y_px = self
             .layout
             .clamp_scroll(self.layout.page_y(last), self.viewport_px.1);
@@ -1294,10 +1332,10 @@ impl<'doc> App<'doc> {
     /// Jump to mark `c`. Records the source page in the jumplist so
     /// `<C-o>` can return.
     pub fn jump_to_mark(&mut self, c: char) {
-        let from = self.current_page();
         match self.marks.get(&c).copied() {
             Some(p) if p < self.page_count => {
-                self.push_jump(from);
+                // goto_page records the jumplist for any non-trivial
+                // delta; no need for a separate push_jump here.
                 self.goto_page(p);
                 self.status = format!("'{c} → page {}", p + 1);
             }
@@ -1345,7 +1383,7 @@ impl<'doc> App<'doc> {
         }
         self.jump_idx -= 1;
         let target = self.jumplist[self.jump_idx];
-        self.goto_page(target);
+        self.goto_page_no_record(target);
         self.status = format!("jump back → page {}", target + 1);
     }
 
@@ -1357,7 +1395,7 @@ impl<'doc> App<'doc> {
         }
         self.jump_idx += 1;
         let target = self.jumplist[self.jump_idx];
-        self.goto_page(target);
+        self.goto_page_no_record(target);
         self.status = format!("jump forward → page {}", target + 1);
     }
 

@@ -122,10 +122,19 @@ pub fn run_search(
 fn pdf_rect_to_norm(r: &PdfRect, m: &PageMetrics) -> Rect01 {
     let w = m.width_pts.max(1.0);
     let h = m.height_pts.max(1.0);
-    let left = r.left().value;
-    let right = r.right().value;
-    let top = r.top().value;
-    let bottom = r.bottom().value;
+    // Some pages report rotated rects where left > right or
+    // bottom > top (pdfium leaves the raw text-frame coords on
+    // rotated pages). Use min/max so the resulting normalised
+    // rect always has positive width/height instead of clamping
+    // a negative value to zero and dropping the hit visually.
+    let raw_left = r.left().value;
+    let raw_right = r.right().value;
+    let raw_top = r.top().value;
+    let raw_bottom = r.bottom().value;
+    let left = raw_left.min(raw_right);
+    let right = raw_left.max(raw_right);
+    let top = raw_top.max(raw_bottom);
+    let bottom = raw_top.min(raw_bottom);
     Rect01 {
         x: (left / w).clamp(0.0, 1.0),
         y: ((h - top) / h).clamp(0.0, 1.0),

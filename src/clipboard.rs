@@ -91,42 +91,55 @@ fn osc52_emit(text: &str) -> std::io::Result<()> {
 }
 
 /// Try wl-copy (Wayland), xclip (X11), then xsel (X11 fallback).
-/// First success wins. Errors are swallowed — the OSC 52 path is
-/// the durable one.
+/// First binary that spawns AND exits successfully wins.
+///
+/// Critical: `xclip` without `-loops 1` blocks until the first paste
+/// (it owns the X11 selection synchronously) — `child.wait()` would
+/// hang the whole TUI. We pass `-loops 1` so xclip exits after one
+/// paste-or-clear, and we always check `status.success()` before
+/// declaring victory so a binary-on-PATH-but-misconfigured (e.g.
+/// `wl-copy` with no Wayland socket) falls through to the next.
 fn spawn_native(text: &str) -> std::io::Result<()> {
     let candidates: &[(&str, &[&str])] = if std::env::var("WAYLAND_DISPLAY").is_ok() {
         &[
             ("wl-copy", &[]),
-            ("xclip", &["-selection", "clipboard"]),
+            ("xclip", &["-selection", "clipboard", "-loops", "1"]),
             ("xsel", &["-b", "-i"]),
         ]
     } else {
         &[
-            ("xclip", &["-selection", "clipboard"]),
+            ("xclip", &["-selection", "clipboard", "-loops", "1"]),
             ("xsel", &["-b", "-i"]),
             ("wl-copy", &[]),
         ]
     };
 
     for (cmd, args) in candidates {
-        if let Ok(mut child) = Command::new(cmd)
+        let Ok(mut child) = Command::new(cmd)
             .args(*args)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-        {
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(text.as_bytes());
-            }
-            // Don't wait long; the binary will exit when stdin closes.
-            let _ = child.wait();
+        else {
+            continue;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        // Drop stdin so the child sees EOF and can exit. Without
+        // this, the child blocks on read and we deadlock here.
+        let status = match child.wait() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if status.success() {
             return Ok(());
         }
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
-        "no native clipboard binary on PATH",
+        "no working native clipboard binary on PATH",
     ))
 }
 

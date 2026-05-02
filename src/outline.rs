@@ -13,6 +13,11 @@ use pdfium_render::prelude::*;
 #[derive(Debug, Clone)]
 pub struct OutlineEntry {
     pub title: String,
+    /// Pre-lowercased title cached at load time. Filtering used to
+    /// re-lowercase + re-collect into a `Vec<char>` for every entry
+    /// on every keystroke (O(N·M) per char on a 50k-entry outline);
+    /// caching the chars here makes filter-as-you-type instant.
+    pub lc_title: Vec<char>,
     pub depth: u8,
     /// Resolved page index (0-based). `None` when the bookmark has
     /// no destination, or the destination doesn't resolve to a page
@@ -66,8 +71,10 @@ fn walk(start: PdfBookmark<'_>, depth: u8, out: &mut Vec<OutlineEntry>) {
                 .destination()
                 .and_then(|d| d.page_index().ok())
                 .map(|p| p as usize);
+            let lc_title: Vec<char> = title.to_lowercase().chars().collect();
             out.push(OutlineEntry {
                 title,
+                lc_title,
                 depth,
                 page,
             });
@@ -94,8 +101,7 @@ pub fn fuzzy_filter(entries: &[OutlineEntry], query: &str) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter_map(|(i, e)| {
-            let hay: Vec<char> = e.title.to_lowercase().chars().collect();
-            if is_subsequence(&needle, &hay) {
+            if is_subsequence(&needle, &e.lc_title) {
                 Some(i)
             } else {
                 None
@@ -152,6 +158,7 @@ mod tests {
     fn entry(title: &str, depth: u8, page: Option<usize>) -> OutlineEntry {
         OutlineEntry {
             title: title.into(),
+            lc_title: title.to_lowercase().chars().collect(),
             depth,
             page,
         }
