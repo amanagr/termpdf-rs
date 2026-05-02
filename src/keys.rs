@@ -52,7 +52,10 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
             app.prev_page(count.unwrap_or(1));
             app.pending.clear();
         }
-        KeyCode::Char('b') => app.prev_page(count.unwrap_or(1)),
+        KeyCode::Char('b') => {
+            app.prev_page(count.unwrap_or(1));
+            app.pending.clear();
+        }
         KeyCode::Char(' ') => app.scroll_by_screens(SCROLL_HALF),
 
         // Within-document scroll. Arrows for fine; Ctrl-d/u for

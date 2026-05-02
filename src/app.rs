@@ -118,7 +118,14 @@ impl<'doc> App<'doc> {
     ) -> Result<Self> {
         let page_count = document.pages().len() as usize;
         let page_metrics = pdf::page_metrics(&document)?;
-        let highlights = HighlightStore::load(path)?;
+        // Highlights are an enhancement — a corrupt or unreadable
+        // store shouldn't keep the user from opening the document.
+        // Surface the error to stderr and proceed with an empty
+        // store; the user can move/delete the bad file by hand.
+        let highlights = HighlightStore::load(path).unwrap_or_else(|e| {
+            eprintln!("warning: could not load highlights: {e:#}");
+            HighlightStore::default()
+        });
         // Empty layout — first `ensure_image` call builds a real one
         // once the viewport size is known.
         let layout = PageLayout::build(&[], 0, 0);
@@ -219,15 +226,23 @@ impl<'doc> App<'doc> {
         self.page_cache.retain(|&k, _| k >= lo && k < hi);
     }
 
-    /// Page index whose top edge is closest to the current scroll
-    /// position — used for status display and as "current page" for
-    /// jump operations / session save.
+    /// Page that contains the viewport center — what the user is
+    /// *reading*. Status line and session save use this so the
+    /// number on screen matches the visual focus, not the scroll
+    /// position. Use `leading_page()` for navigation.
     pub fn current_page(&self) -> usize {
-        // Pick the page that contains the viewport center; that's the
-        // page the user is actually reading regardless of where the
-        // top edge sits.
         let center = self.scroll_y_px + (self.viewport_px.1 as i64 / 2);
         self.layout.page_at(center).min(self.page_count.saturating_sub(1))
+    }
+
+    /// Page that contains the *top* of the viewport. This is what
+    /// `j`/`k` advance from: a `j` press should always reveal new
+    /// content, never skip a page just because a short page is
+    /// already partially visible above the viewport center.
+    pub fn leading_page(&self) -> usize {
+        self.layout
+            .page_at(self.scroll_y_px)
+            .min(self.page_count.saturating_sub(1))
     }
 
     pub fn invalidate_compose(&mut self) {
@@ -243,11 +258,11 @@ impl<'doc> App<'doc> {
     }
 
     pub fn next_page(&mut self, count: usize) {
-        let target = self.current_page().saturating_add(count.max(1));
+        let target = self.leading_page().saturating_add(count.max(1));
         self.goto_page(target);
     }
     pub fn prev_page(&mut self, count: usize) {
-        let target = self.current_page().saturating_sub(count.max(1));
+        let target = self.leading_page().saturating_sub(count.max(1));
         self.goto_page(target);
     }
     pub fn first_page(&mut self) {
@@ -346,7 +361,8 @@ impl<'doc> App<'doc> {
         });
         self.selection_page = page;
         self.mode = Mode::Visual;
-        self.status = "VISUAL — hjkl/arrows move · HJKL resize · drag mouse · y save · Esc".into();
+        self.pending.clear();
+        self.status = "VISUAL — hjkl/arrows move, HJKL resize, drag mouse, y save, Esc".into();
         self.invalidate_compose();
     }
 

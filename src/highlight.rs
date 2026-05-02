@@ -60,7 +60,13 @@ impl HighlightStore {
             return Ok(Self::default());
         }
         let data = fs::read_to_string(&p)?;
-        Ok(serde_json::from_str(&data).unwrap_or_default())
+        // Propagate parse errors instead of silently substituting an
+        // empty store. A subsequent clean exit would persist the
+        // empty store back to disk, *destroying* the user's
+        // highlights — better to bail and let the caller log the
+        // path so they can recover the file by hand.
+        serde_json::from_str(&data)
+            .map_err(|e| anyhow::anyhow!("parsing {}: {}", p.display(), e))
     }
 
     pub fn save(&self, pdf: &Path) -> Result<()> {
