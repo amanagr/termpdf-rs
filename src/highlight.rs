@@ -12,6 +12,14 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy)]
+pub struct Rect01 {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Highlight {
     pub page: usize,
@@ -61,18 +69,10 @@ impl HighlightStore {
         Ok(())
     }
 
-    /// Reserved for v0.2 — once the renderer overlays saved highlights,
-    /// `ui::draw` will iterate per-page via this. Keep `dead_code`
-    /// silenced rather than deleting it; the alternative is reintroducing
-    /// the API in v0.2 with a different name.
-    #[allow(dead_code)]
     pub fn for_page(&self, page: usize) -> impl Iterator<Item = &Highlight> {
         self.items.iter().filter(move |h| h.page == page)
     }
 
-    /// Reserved for v0.2 — visual mode's `y` will call this once mouse
-    /// drag → page-space coordinate plumbing lands.
-    #[allow(dead_code)]
     pub fn add(&mut self, h: Highlight) {
         self.items.push(h);
     }
@@ -85,4 +85,34 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     h
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct HighlightColor {
+    pub name: &'static str,
+    pub hex: &'static str,
+    /// (R, G, B) for fast in-memory blending — mirrors `hex` exactly.
+    pub rgb: (u8, u8, u8),
+}
+
+/// Cyclable highlighter palette. Order is the cycle order on `c`.
+pub const HIGHLIGHT_COLORS: &[HighlightColor] = &[
+    HighlightColor { name: "yellow", hex: "#ffd54f", rgb: (0xff, 0xd5, 0x4f) },
+    HighlightColor { name: "green",  hex: "#aed581", rgb: (0xae, 0xd5, 0x81) },
+    HighlightColor { name: "blue",   hex: "#81d4fa", rgb: (0x81, 0xd4, 0xfa) },
+    HighlightColor { name: "pink",   hex: "#f48fb1", rgb: (0xf4, 0x8f, 0xb1) },
+    HighlightColor { name: "orange", hex: "#ffab91", rgb: (0xff, 0xab, 0x91) },
+];
+
+pub fn rgb_from_hex(hex: &str) -> (u8, u8, u8) {
+    // Tolerate "#rrggbb" and bare "rrggbb"; fall back to yellow on
+    // anything else so a hand-edited highlights.json doesn't crash.
+    let h = hex.trim_start_matches('#');
+    if h.len() == 6 {
+        let r = u8::from_str_radix(&h[0..2], 16).unwrap_or(0xff);
+        let g = u8::from_str_radix(&h[2..4], 16).unwrap_or(0xd5);
+        let b = u8::from_str_radix(&h[4..6], 16).unwrap_or(0x4f);
+        return (r, g, b);
+    }
+    (0xff, 0xd5, 0x4f)
 }

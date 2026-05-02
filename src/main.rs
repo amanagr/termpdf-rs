@@ -16,6 +16,7 @@
 
 mod app;
 mod cmd;
+mod compose;
 mod dark;
 mod highlight;
 mod keys;
@@ -59,6 +60,10 @@ struct Args {
     /// or for sanity-checking pdfium + dark inversion without a TTY.
     #[arg(long, value_name = "PNG")]
     probe: Option<PathBuf>,
+    /// Zoom factor for `--probe` only (1.0 = fit; >1 = zoomed pixmap).
+    /// Lets the rendering path under zoom be exercised headlessly.
+    #[arg(long, default_value_t = 1.0)]
+    probe_zoom: f32,
 }
 
 fn main() -> Result<()> {
@@ -89,7 +94,7 @@ fn main() -> Result<()> {
     let start_dark = if dark_explicit { args.dark } else { saved.dark };
 
     if let Some(out) = args.probe {
-        return probe(&document, start_page, start_dark, &out);
+        return probe(&document, start_page, start_dark, args.probe_zoom, &out);
     }
 
     // ratatui-image probes the terminal at startup to figure out which
@@ -134,6 +139,7 @@ fn probe(
     document: &pdfium_render::prelude::PdfDocument<'_>,
     page: usize,
     dark: bool,
+    zoom: f32,
     out: &std::path::Path,
 ) -> Result<()> {
     use ratatui::layout::Rect;
@@ -142,7 +148,7 @@ fn probe(
     // font_size for pdfium's pixel-target math. (10×20 px per cell.)
     let picker = Picker::halfblocks();
     let area = Rect { x: 0, y: 0, width: 80, height: 40 };
-    let img = pdf::render_page(document, page, area, &picker, 1.0)?;
+    let img = pdf::render_page(document, page, area, &picker, zoom)?;
     let img = if dark {
         image::DynamicImage::ImageRgba8(dark::invert_luminance(&img))
     } else {
