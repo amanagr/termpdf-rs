@@ -136,16 +136,33 @@ fn pick_protocol(resolved: ProtocolChoice) -> Picker {
 }
 
 /// One-line stderr hint when running inside tmux without
-/// `allow-passthrough` configured. We can't reliably detect the
-/// passthrough flag, so we always print the hint when `$TMUX` is set
-/// (suppressible via `$TERMPDF_NO_TMUX_HINT`).
+/// `allow-passthrough` configured. We can't reliably probe the
+/// passthrough setting from here, so we print the hint at most ONCE
+/// per machine: after the first run an ack-marker is dropped under
+/// `$XDG_DATA_HOME/termpdf-rs/`. Suppressible per-invocation via
+/// `$TERMPDF_NO_TMUX_HINT`; the marker itself can be deleted to
+/// re-arm the hint.
 fn tmux_passthrough_hint() {
-    if std::env::var("TMUX").is_ok() && std::env::var("TERMPDF_NO_TMUX_HINT").is_err() {
-        eprintln!(
-            "note: running inside tmux. If images don't render, run\n  \
-             tmux set -g allow-passthrough on\n  \
-             (silence with TERMPDF_NO_TMUX_HINT=1)"
-        );
+    if std::env::var("TMUX").is_err() || std::env::var("TERMPDF_NO_TMUX_HINT").is_ok() {
+        return;
+    }
+    let marker = dirs::data_local_dir().map(|d| d.join("termpdf-rs/.tmux-hint-acked"));
+    if let Some(ref m) = marker {
+        if m.exists() {
+            return;
+        }
+    }
+    eprintln!(
+        "note: running inside tmux. If images don't render, run\n  \
+         tmux set -g allow-passthrough on\n  \
+         (this hint won't repeat — re-arm by deleting \
+         $XDG_DATA_HOME/termpdf-rs/.tmux-hint-acked)"
+    );
+    if let Some(m) = marker {
+        if let Some(parent) = m.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&m, b"");
     }
 }
 
@@ -162,9 +179,29 @@ fn main() -> Result<()> {
         .context("locating libpdfium.so — run setup.sh in the project root")?;
     let bindings = pdf::bindings(&lib)?;
     let pdfium = pdfium_render::prelude::Pdfium::new(bindings);
-    let document = pdfium
-        .load_pdf_from_file(&args.path, None)
-        .with_context(|| format!("loading PDF: {}", args.path.display()))?;
+    let document = match pdfium.load_pdf_from_file(&args.path, None) {
+        Ok(d) => d,
+        Err(e) => {
+            // Translate pdfium's "PASSWORD required" into a clear,
+            // user-actionable message rather than a raw anyhow chain.
+            // Password-protected PDFs aren't supported yet — surface
+            // the limitation explicitly so the user doesn't think the
+            // file is corrupt.
+            use pdfium_render::prelude::{PdfiumError, PdfiumInternalError};
+            if matches!(
+                &e,
+                PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::PasswordError)
+            ) {
+                anyhow::bail!(
+                    "{}: PDF is password-protected; termpdf-rs does not yet \
+                     support encrypted documents. Decrypt with `qpdf --decrypt` \
+                     or open in another reader.",
+                    args.path.display()
+                );
+            }
+            return Err(e).with_context(|| format!("loading PDF: {}", args.path.display()));
+        }
+    };
 
     // Restore last page + dark flag for this PDF, but let an explicit
     // CLI value (`-p 12`, `--dark`) win over the saved session.
@@ -183,7 +220,15 @@ fn main() -> Result<()> {
     tmux_passthrough_hint();
     let picker = pick_protocol(args.protocol);
 
-    let mut app = App::new(document, &args.path, start_page, start_dark, picker)?;
+    let mut app = App::new(
+        document,
+        &args.path,
+        start_page,
+        start_dark,
+        saved.zoom,
+        saved.marks.clone(),
+        picker,
+    )?;
 
     setup_terminal()?;
     let res = run_loop(&mut app);

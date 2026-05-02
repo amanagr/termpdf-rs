@@ -49,6 +49,26 @@ pub fn execute(app: &mut App<'_>, line: &str) {
         "nohl" | "nohlsearch" => app.clear_search(),
         "toc" => app.toggle_toc(),
         "help" => app.show_help = true,
+        // `:export PATH` — dump every saved highlight into a Markdown
+        // notes file (page-grouped, with quoted text + any inline
+        // notes). Path defaults to `<pdf-stem>.notes.md` next to the
+        // PDF when omitted.
+        "export" | "notes" => {
+            let target = parts.next().map(std::path::PathBuf::from).unwrap_or_else(|| {
+                let mut p = app.path.clone();
+                let stem = p
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("notes")
+                    .to_string();
+                p.set_file_name(format!("{stem}.notes.md"));
+                p
+            });
+            match app.export_notes(&target) {
+                Ok(()) => app.status = format!("exported notes → {}", target.display()),
+                Err(e) => app.status = format!("export failed: {e:#}"),
+            }
+        }
         _ => app.status = format!("unknown command: {cmd}"),
     }
 }

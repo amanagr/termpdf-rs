@@ -13,12 +13,36 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     /// 0-indexed page number the user was on at exit.
+    #[serde(default)]
     pub page: usize,
     /// Dark mode flag at exit.
+    #[serde(default)]
     pub dark: bool,
+    /// Zoom factor at exit (1.0 = fit-width).
+    #[serde(default = "default_zoom")]
+    pub zoom: f32,
+    /// Vim-style named marks `m{a..z}` → page index. Persisted so
+    /// `'a` after a reopen lands where the user expected.
+    #[serde(default)]
+    pub marks: std::collections::BTreeMap<char, usize>,
+}
+
+fn default_zoom() -> f32 {
+    1.0
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self {
+            page: 0,
+            dark: false,
+            zoom: 1.0,
+            marks: std::collections::BTreeMap::new(),
+        }
+    }
 }
 
 impl Session {

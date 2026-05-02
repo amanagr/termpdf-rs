@@ -43,6 +43,24 @@ pub fn dispatch(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
 }
 
 fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
+    // Mark-set / mark-jump consume the very next keystroke as the
+    // mark name. Handled before the regular dispatch so a literal
+    // `j`/`k`/`q` here lands in the BTreeMap instead of moving pages.
+    if app.awaiting_mark_set {
+        app.awaiting_mark_set = false;
+        if let KeyCode::Char(c) = k.code {
+            app.set_mark(c);
+        }
+        return Ok(());
+    }
+    if app.awaiting_mark_jump {
+        app.awaiting_mark_jump = false;
+        if let KeyCode::Char(c) = k.code {
+            app.jump_to_mark(c);
+        }
+        return Ok(());
+    }
+
     let count = parse_count(&app.pending);
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
 
@@ -82,6 +100,10 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         KeyCode::Right => app.scroll_x_by(SCROLL_LINE),
         KeyCode::Char('d') if ctrl => app.scroll_by_screens(SCROLL_HALF),
         KeyCode::Char('u') if ctrl => app.scroll_by_screens(-SCROLL_HALF),
+        // Vim-style jumplist: <C-o> back, <C-i> / Tab forward.
+        KeyCode::Char('o') if ctrl => app.jump_back(),
+        KeyCode::Char('i') if ctrl => app.jump_forward(),
+        KeyCode::Tab => app.jump_forward(),
         KeyCode::Char('h') if !ctrl => app.scroll_x_by(-SCROLL_LINE),
         KeyCode::Char('l') if !ctrl => app.scroll_x_by(SCROLL_LINE),
         KeyCode::Char('d') => app.toggle_dark(),
@@ -136,6 +158,11 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         }
         KeyCode::Char('v') => app.enter_visual(),
         KeyCode::Char('o') => app.toggle_toc(),
+
+        // Marks: `m{a-z}` to set, `'{a-z}` to jump. Two-stroke pattern
+        // matched in the awaiting_mark_* prelude above.
+        KeyCode::Char('m') => app.awaiting_mark_set = true,
+        KeyCode::Char('\'') => app.awaiting_mark_jump = true,
 
         KeyCode::Esc => {
             app.pending.clear();
@@ -193,11 +220,14 @@ fn visual_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         }
         return Ok(());
     }
-    // gg-pending: previous was `g`, awaiting `g`.
+    // g-pending: previous was `g`. Awaits `g` (page-top) or `y`
+    // (yank-as-markdown). Anything else cancels.
     if app.pending == "g" {
         app.pending.clear();
-        if let KeyCode::Char('g') = k.code {
-            app.move_head_page_top();
+        match k.code {
+            KeyCode::Char('g') => app.move_head_page_top(),
+            KeyCode::Char('y') => app.yank_selection_as_markdown(),
+            _ => {}
         }
         return Ok(());
     }

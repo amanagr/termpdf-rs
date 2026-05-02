@@ -34,21 +34,69 @@ alias pdf='~/termpdf-rs/target/release/termpdf'
 
 ## Keys
 
-| Keys                  | Action                          |
-| --------------------- | ------------------------------- |
-| `j` `k` Space `b`     | next / prev page                |
-| `N j` / `N k`         | jump N pages forward / back     |
-| `gg` / `G`            | first / last page               |
-| `N G`                 | jump to page N                  |
-| `+` `-` `0`           | zoom in / out / reset           |
-| `d`                   | toggle dark mode                |
-| `v` … `y`             | visual-mode highlight (v0.2)    |
-| `/<query>`            | search (v0.2)                   |
-| `:<n>`                | jump to page n                  |
-| `:q`                  | quit                            |
-| `:set dark` / `:set nodark` | dark mode via command     |
-| `?`                   | toggle help overlay             |
-| `q`                   | quit                            |
+The full keymap lives in the `?` overlay. Highlights:
+
+### Navigation
+
+| Keys                       | Action                                    |
+| -------------------------- | ----------------------------------------- |
+| `j` / `k`                  | next / prev page (boundary)               |
+| `N j` / `N k`              | jump N pages                              |
+| Space / `b`                | one screen down / up (less-style)         |
+| `Ctrl-d` / `Ctrl-u`        | half-screen down / up                     |
+| arrows / `h` / `l`         | pixel-grain scroll (`l`/`h` horizontal)   |
+| mouse wheel                | scroll (Shift = horizontal)               |
+| `gg` / `G`                 | first / last page                         |
+| `N G` / `:<n>` / `:goto N` | jump to page N                            |
+| `Ctrl-o` / `Ctrl-i` / Tab  | jumplist back / forward                   |
+| `m{a-z}` / `'{a-z}`        | set / jump to mark (persisted per PDF)    |
+| `+` / `-` / `0`            | zoom in / out / reset                     |
+| `d` / `:set [no]dark`      | toggle dark mode                          |
+
+### Selection (Visual mode — `v`)
+
+| Keys                       | Action                                    |
+| -------------------------- | ----------------------------------------- |
+| `h` `j` `k` `l`            | move caret by char / line                 |
+| `w` / `b` / `e`            | word start / back / end                   |
+| `0` / `^` / `$`            | line start / first non-blank / line end   |
+| `gg` / `G`                 | first / last char on this page            |
+| `f<c>` / `F<c>`            | next / prev `<c>` on this line            |
+| `iw` / `is` / `ip`         | inner word / sentence / paragraph         |
+| `V` / `Ctrl-v`             | linewise / blockwise selection            |
+| `c`                        | cycle highlight color                     |
+| `y` / Enter                | save highlight + copy text                |
+| `Y`                        | copy text only (no highlight)             |
+| `gy`                       | copy as Markdown blockquote w/ citation   |
+| click + drag               | highlight with the mouse                  |
+| `x` (Normal)               | delete last highlight on current page     |
+
+### Search & TOC
+
+| Keys                       | Action                                    |
+| -------------------------- | ----------------------------------------- |
+| `/<query>`                 | search the document                       |
+| `n` / `N`                  | next / previous match                     |
+| `:nohl`                    | clear search results                      |
+| `o` / `:toc`               | open outline panel (`/` filters)          |
+
+### Commands & misc
+
+| Keys                       | Action                                    |
+| -------------------------- | ----------------------------------------- |
+| `:export [path]`           | dump highlights as Markdown notes         |
+| `:q` / `q`                 | quit                                      |
+| `?`                        | toggle help overlay                       |
+
+### Supported terminals & OS
+
+Linux x86\_64 only at the moment (`setup.sh` downloads a pinned
+pdfium build for that target). Best inside Kitty, Ghostty, or
+WezTerm. `--protocol sixel` works in xterm/foot; halfblocks is the
+last-resort fallback (text is illegible).
+
+Password-protected PDFs are not yet supported — decrypt with
+`qpdf --decrypt input.pdf out.pdf` first.
 
 ## Why this stack
 

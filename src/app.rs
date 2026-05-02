@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use image::{DynamicImage, Rgba, RgbaImage};
 use pdfium_render::prelude::PdfDocument;
 use ratatui::layout::Rect;
@@ -196,6 +196,21 @@ pub struct App<'doc> {
     /// session restored one). Consumed by the first `ensure_layout`
     /// call to compute the initial scroll offset, then cleared.
     pub pending_initial_page: Option<usize>,
+
+    /// Vim-style named marks `m{a..z}` → page index. Persisted via
+    /// `Session` so a reopened document still has its marks.
+    pub marks: std::collections::BTreeMap<char, usize>,
+    /// Jumplist of recently-visited pages. `<C-o>` walks backwards,
+    /// `<C-i>` (Tab) walks forward; same model as vim. Cursor sits
+    /// at `jump_idx`.
+    pub jumplist: Vec<usize>,
+    pub jump_idx: usize,
+    /// True after typing `m`, awaiting the mark name. Mirrors the
+    /// `g`-pending pattern in `keys.rs`.
+    pub awaiting_mark_set: bool,
+    /// True after typing `'`, awaiting the mark name to jump to.
+    pub awaiting_mark_jump: bool,
+
     pub should_quit: bool,
 }
 
@@ -205,47 +220,20 @@ impl<'doc> App<'doc> {
         path: &Path,
         page: usize,
         dark: bool,
+        zoom: f32,
+        marks: std::collections::BTreeMap<char, usize>,
         picker: Picker,
     ) -> Result<Self> {
         let page_count = document.pages().len() as usize;
         let page_metrics = pdf::page_metrics(&document)?;
-        // Eager-load the outline. Failure here is non-fatal — most
-        // PDFs have no outline at all and should still open.
         let outline = outline::load(&document).unwrap_or_else(|e| {
             eprintln!("warning: could not load outline: {e:#}");
             Vec::new()
         });
-        // Highlights now live as native PDF annotations on the
-        // document itself rather than a parallel JSON sidecar — that
-        // way they travel with the file, are visible in any viewer,
-        // and survive the user moving or renaming the PDF. If the
-        // PDF read fails we fall back to the legacy JSON store so a
-        // user upgrading from a sidecar-era version doesn't lose
-        // their work.
-        let highlights = match pdfhighlights::load_from_pdf(&document) {
-            Ok(mut from_pdf) => {
-                // Migration: if a sidecar exists from a prior
-                // version, fold its entries in and let the next save
-                // commit them as PDF annotations.
-                if let Ok(legacy) = HighlightStore::load(path) {
-                    if !legacy.items.is_empty() && from_pdf.items.is_empty() {
-                        eprintln!(
-                            "note: migrated {} highlight(s) from sidecar JSON into the PDF",
-                            legacy.items.len()
-                        );
-                        from_pdf = legacy;
-                    }
-                }
-                from_pdf
-            }
-            Err(e) => {
-                eprintln!("warning: could not read PDF annotations: {e:#}");
-                HighlightStore::load(path).unwrap_or_else(|e| {
-                    eprintln!("warning: could not load legacy sidecar highlights: {e:#}");
-                    HighlightStore::default()
-                })
-            }
-        };
+        let highlights = pdfhighlights::load_from_pdf(&document).unwrap_or_else(|e| {
+            eprintln!("warning: could not read PDF annotations: {e:#}");
+            HighlightStore::default()
+        });
         // Empty layout — first `ensure_image` call builds a real one
         // once the viewport size is known.
         let layout = PageLayout::build(&[], 0, 0);
@@ -260,7 +248,7 @@ impl<'doc> App<'doc> {
             cmd_buffer: String::new(),
             status: String::new(),
             show_help: false,
-            zoom: 1.0,
+            zoom: zoom.clamp(0.25, 8.0),
             scroll_y_px: 0,
             scroll_x: 0.0,
             viewport_px: (0, 0),
@@ -292,6 +280,11 @@ impl<'doc> App<'doc> {
             toc_filter: String::new(),
             toc_filter_editing: false,
             pending_initial_page: if page < page_count { Some(page) } else { None },
+            marks,
+            jumplist: Vec::new(),
+            jump_idx: 0,
+            awaiting_mark_set: false,
+            awaiting_mark_jump: false,
             should_quit: false,
         };
         Ok(app)
@@ -1280,8 +1273,232 @@ impl<'doc> App<'doc> {
         Session {
             page: self.current_page(),
             dark: self.dark,
+            zoom: self.zoom,
+            marks: self.marks.clone(),
         }
         .save(&self.path)
+    }
+
+    /// Set mark `c` to the currently-leading page. Vim's marks are
+    /// scoped per buffer; ours are per PDF and persisted via Session.
+    pub fn set_mark(&mut self, c: char) {
+        if !c.is_ascii_lowercase() {
+            self.status = format!("marks must be a-z, got {c:?}");
+            return;
+        }
+        let p = self.current_page();
+        self.marks.insert(c, p);
+        self.status = format!("mark {c} set to page {}", p + 1);
+    }
+
+    /// Jump to mark `c`. Records the source page in the jumplist so
+    /// `<C-o>` can return.
+    pub fn jump_to_mark(&mut self, c: char) {
+        let from = self.current_page();
+        match self.marks.get(&c).copied() {
+            Some(p) if p < self.page_count => {
+                self.push_jump(from);
+                self.goto_page(p);
+                self.status = format!("'{c} → page {}", p + 1);
+            }
+            Some(_) => self.status = format!("mark '{c}' points past end of doc"),
+            None => self.status = format!("no mark '{c}'"),
+        }
+    }
+
+    /// Append `from` to the jumplist (truncating any forward history),
+    /// then position the cursor at the end. Mirrors vim semantics:
+    /// after a fresh jump, `<C-i>` redo is gone.
+    pub fn push_jump(&mut self, from: usize) {
+        self.jumplist.truncate(self.jump_idx.min(self.jumplist.len()));
+        self.jumplist.push(from);
+        self.jump_idx = self.jumplist.len();
+        // Bound the list so a long session doesn't grow without limit.
+        const MAX_JUMPS: usize = 100;
+        if self.jumplist.len() > MAX_JUMPS {
+            let drop = self.jumplist.len() - MAX_JUMPS;
+            self.jumplist.drain(..drop);
+            self.jump_idx = self.jumplist.len();
+        }
+    }
+
+    /// Walk backwards (`<C-o>`) through the jumplist. The first
+    /// invocation pushes the current page so `<C-i>` can return.
+    pub fn jump_back(&mut self) {
+        if self.jumplist.is_empty() {
+            self.status = "jumplist empty".into();
+            return;
+        }
+        // On first walk-back, snapshot where we are now so <C-i> can
+        // come back. Detect "first walk" by jump_idx == jumplist.len().
+        if self.jump_idx == self.jumplist.len() {
+            let here = self.current_page();
+            if self.jumplist.last().copied() != Some(here) {
+                self.jumplist.push(here);
+                // Don't bump jump_idx — we're about to step back from
+                // the end, into the entry just before this snapshot.
+            }
+        }
+        if self.jump_idx == 0 {
+            self.status = "at oldest jump".into();
+            return;
+        }
+        self.jump_idx -= 1;
+        let target = self.jumplist[self.jump_idx];
+        self.goto_page(target);
+        self.status = format!("jump back → page {}", target + 1);
+    }
+
+    /// Walk forward (`<C-i>`) through the jumplist.
+    pub fn jump_forward(&mut self) {
+        if self.jump_idx + 1 >= self.jumplist.len() {
+            self.status = "at newest jump".into();
+            return;
+        }
+        self.jump_idx += 1;
+        let target = self.jumplist[self.jump_idx];
+        self.goto_page(target);
+        self.status = format!("jump forward → page {}", target + 1);
+    }
+
+    /// Yank the active selection as a Markdown blockquote with a
+    /// trailing citation: `> line\n> line\n\n— filename, page N`.
+    /// Pulled out of `yank_selection` so the regular y/Y paths stay
+    /// plain-text. Sets status; clears Visual mode.
+    pub fn yank_selection_as_markdown(&mut self) {
+        let Some(sel) = self.text_selection.take() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        let (lo, hi) = sel.ordered();
+        let mut combined = String::new();
+        for page_idx in lo.page..=hi.page {
+            let Some(pt) = self.text_cache.get(page_idx) else {
+                continue;
+            };
+            let start = if page_idx == lo.page { lo.idx } else { 0 };
+            let end = if page_idx == hi.page {
+                hi.idx
+            } else {
+                pt.chars.len().saturating_sub(1)
+            };
+            let s = pt.extract(start, end);
+            if !s.is_empty() {
+                if !combined.is_empty() {
+                    combined.push_str("\n\n");
+                }
+                combined.push_str(&s);
+            }
+        }
+        let text = combined.trim();
+        if text.is_empty() {
+            self.status = "selection has no text (image-only?)".into();
+            self.mouse_dragging = false;
+            self.mode = Mode::Normal;
+            return;
+        }
+        let quoted: String = text
+            .lines()
+            .map(|l| if l.is_empty() { "> ".into() } else { format!("> {l}") })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let stem = self
+            .path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("document.pdf");
+        let cite_page = lo.page + 1;
+        let cite_range = if hi.page > lo.page {
+            format!("pp. {}–{}", cite_page, hi.page + 1)
+        } else {
+            format!("p. {cite_page}")
+        };
+        let payload = format!("{quoted}\n\n— {stem}, {cite_range}\n");
+        let outcome = crate::clipboard::copy(&payload);
+        self.mouse_dragging = false;
+        self.mode = Mode::Normal;
+        self.status = if outcome.truncated {
+            format!("copied markdown quote ({}, truncated by clipboard)", cite_range)
+        } else {
+            format!("copied markdown quote ({})", cite_range)
+        };
+    }
+
+    /// Walk every saved highlight and produce a Markdown notes file
+    /// at `out_path`. One entry per highlight, page-grouped, with the
+    /// quoted text pulled from the page's text layer if available.
+    pub fn export_notes(&mut self, out_path: &Path) -> Result<()> {
+        use std::io::Write;
+        if self.highlights.items.is_empty() {
+            anyhow::bail!("no highlights to export");
+        }
+        let stem = self
+            .path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("document.pdf");
+        // Group by page for a clean, scannable output. Clone so we
+        // don't hold an immutable borrow on `self.highlights` while
+        // calling the mutating `text_for_highlight` below.
+        let mut by_page: std::collections::BTreeMap<usize, Vec<Highlight>> =
+            std::collections::BTreeMap::new();
+        for h in &self.highlights.items {
+            by_page.entry(h.page).or_default().push(h.clone());
+        }
+        let mut buf = String::new();
+        buf.push_str(&format!("# Notes — {stem}\n\n"));
+        for (page, items) in by_page {
+            buf.push_str(&format!("## Page {}\n\n", page + 1));
+            for h in items {
+                let text = self
+                    .text_for_highlight(&h)
+                    .unwrap_or_else(|| "(image region — no extractable text)".to_string());
+                let quoted: String = text
+                    .lines()
+                    .map(|l| if l.is_empty() { "> ".into() } else { format!("> {l}") })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                buf.push_str(&quoted);
+                buf.push_str("\n\n");
+                if let Some(note) = &h.note {
+                    buf.push_str(&format!("**Note:** {note}\n\n"));
+                }
+            }
+        }
+        let mut f = std::fs::File::create(out_path)
+            .with_context(|| format!("creating {}", out_path.display()))?;
+        f.write_all(buf.as_bytes())
+            .with_context(|| format!("writing {}", out_path.display()))?;
+        Ok(())
+    }
+
+    /// Best-effort text extraction for a saved highlight: load the
+    /// page's text layer, find chars whose bbox overlaps the
+    /// highlight rect, and concatenate them. Returns None if no chars
+    /// land inside the rect (image-only region).
+    fn text_for_highlight(&mut self, h: &Highlight) -> Option<String> {
+        let metrics = self.page_metrics.get(h.page).copied()?;
+        let pt = self
+            .text_cache
+            .get_or_load(&self.document, h.page, &metrics)
+            .ok()?;
+        let mut idxs: Vec<usize> = Vec::new();
+        for (i, c) in pt.chars.iter().enumerate() {
+            if c.is_generated {
+                continue;
+            }
+            let cx = c.bbox.x + c.bbox.w * 0.5;
+            let cy = c.bbox.y + c.bbox.h * 0.5;
+            if cx >= h.x && cx <= h.x + h.w && cy >= h.y && cy <= h.y + h.h {
+                idxs.push(i);
+            }
+        }
+        if idxs.is_empty() {
+            return None;
+        }
+        let start = *idxs.first().unwrap();
+        let end = *idxs.last().unwrap();
+        Some(pt.extract(start, end))
     }
 }
 
