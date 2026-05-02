@@ -15,6 +15,7 @@
 //!   Search:  / to enter (stub for v0.1)
 
 mod app;
+mod clipboard;
 mod cmd;
 mod compose;
 mod dark;
@@ -23,6 +24,7 @@ mod keys;
 mod layout;
 mod pdf;
 mod session;
+mod text;
 mod ui;
 
 use std::io;

@@ -152,7 +152,8 @@ fn visual_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
     let shift = k.modifiers.contains(KeyModifiers::SHIFT);
     match k.code {
         KeyCode::Esc | KeyCode::Char('q') => app.exit_visual(),
-        KeyCode::Char('y') | KeyCode::Enter => app.save_selection(),
+        KeyCode::Char('y') | KeyCode::Enter => app.yank_selection(true),
+        KeyCode::Char('Y') => app.yank_selection(false),
         KeyCode::Char('c') => app.cycle_color(),
 
         KeyCode::Char('h') => app.nudge_selection(-SELECTION_STEP, 0.0, false),

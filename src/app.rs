@@ -400,11 +400,40 @@ impl<'doc> App<'doc> {
         self.invalidate_compose();
     }
 
-    /// Save the current Visual-mode selection as a highlight on the
-    /// selection's bound page and return to Normal mode.
-    pub fn save_selection(&mut self) {
-        if let Some(sel) = self.selection.take() {
-            let color = HIGHLIGHT_COLORS[self.selection_color_idx % HIGHLIGHT_COLORS.len()];
+    /// Yank the active Visual-mode selection: extract its text,
+    /// copy to the clipboard, and (if `save`) persist a highlight on
+    /// the selection's bound page. Returns to Normal mode.
+    ///
+    /// `save = true` is the `y` keybinding (highlight + copy);
+    /// `save = false` is `Y` (copy text without leaving a yellow
+    /// box). Either way, an empty extraction (image-only region) is
+    /// surfaced in the status line rather than silently swallowed —
+    /// users want to know if their quote didn't actually land.
+    pub fn yank_selection(&mut self, save: bool) {
+        let Some(sel) = self.selection.take() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        let color = HIGHLIGHT_COLORS[self.selection_color_idx % HIGHLIGHT_COLORS.len()];
+        let metrics = self.page_metrics.get(self.selection_page).copied();
+
+        // Try to extract text; an Err here is a real pdfium failure
+        // (corrupt page), distinct from "empty rect" which returns
+        // Ok("").
+        let text = match metrics {
+            Some(m) => crate::text::extract_rect(&self.document, self.selection_page, sel, &m)
+                .unwrap_or_default(),
+            None => String::new(),
+        };
+        let text = text.trim();
+
+        let copy_outcome = if !text.is_empty() {
+            Some(crate::clipboard::copy(text))
+        } else {
+            None
+        };
+
+        if save {
             self.highlights.add(Highlight {
                 page: self.selection_page,
                 x: sel.x,
@@ -415,15 +444,34 @@ impl<'doc> App<'doc> {
                 note: None,
             });
             self.highlight_revision += 1;
-            self.status = format!(
-                "highlight saved on page {} ({})",
-                self.selection_page + 1,
-                color.name
-            );
         }
+
+        // Status message: tell the user what actually happened.
+        self.status = match (save, copy_outcome) {
+            (true, Some(o)) if o.truncated => {
+                format!("highlight saved + copied {} bytes (truncated)", o.bytes)
+            }
+            (true, Some(o)) => format!("highlight saved + copied {} bytes", o.bytes),
+            (true, None) => format!(
+                "highlight saved on page {} (no text in selection)",
+                self.selection_page + 1
+            ),
+            (false, Some(o)) if o.truncated => {
+                format!("copied {} bytes (truncated)", o.bytes)
+            }
+            (false, Some(o)) => format!("copied {} bytes", o.bytes),
+            (false, None) => "no text in selection".into(),
+        };
+
         self.drag_anchor = None;
         self.mode = Mode::Normal;
         self.invalidate_compose();
+    }
+
+    /// Backwards-compatible name for `y` (save + copy). Visual-mode
+    /// keybinding `y` and the search-helper module both call this.
+    pub fn save_selection(&mut self) {
+        self.yank_selection(true);
     }
 
     pub fn cycle_color(&mut self) {
