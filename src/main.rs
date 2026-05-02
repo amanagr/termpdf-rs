@@ -119,10 +119,31 @@ fn pick_protocol(resolved: ProtocolChoice) -> Picker {
             }
         }
     } else {
-        // Try probing first to get an accurate font_size; if that
-        // fails, halfblocks() supplies a sensible default. Then pin
-        // the requested protocol on top.
-        let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+        // Explicit `--protocol` means the user already knows what
+        // their terminal supports — skip the stdio probe so we work
+        // even when nothing on the wire will answer (CI, pty-driven
+        // integration tests, captured pipelines).
+        //
+        // We still need a cell font_size for the layout math, so
+        // honour `$TERMPDF_CELL_PX="WxH"` if set; otherwise use a
+        // sensible 8×16 default that matches most terminals close
+        // enough for headless smoke tests.
+        let cell = std::env::var("TERMPDF_CELL_PX")
+            .ok()
+            .and_then(|s| {
+                let mut it = s.split('x');
+                let w: u16 = it.next()?.parse().ok()?;
+                let h: u16 = it.next()?.parse().ok()?;
+                Some((w, h))
+            })
+            .unwrap_or((8, 16));
+        // `from_fontsize` is the only constructor that doesn't probe
+        // stdio; the deprecation nudges everyone toward `from_query_stdio`,
+        // but for the explicit-protocol case that's exactly what we
+        // need to avoid (and the alternative `halfblocks()` would force
+        // the wrong protocol type).
+        #[allow(deprecated)]
+        let mut picker = Picker::from_fontsize(cell);
         let target = match resolved {
             ProtocolChoice::Kitty => ProtocolType::Kitty,
             ProtocolChoice::Sixel => ProtocolType::Sixel,

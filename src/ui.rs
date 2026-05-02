@@ -32,7 +32,6 @@ use crate::compose::{fill_rect_blend, norm_to_pixels, outline_rect};
 use crate::dark;
 use crate::highlight::{rgb_from_hex, Rect01, HIGHLIGHT_COLORS};
 use crate::pdf;
-use crate::textlayout::SelMode;
 
 /// Cap on `fit_width_px`. At extreme zoom on a 4K terminal
 /// `viewport_w * zoom` runs into the tens of thousands; pdfium
@@ -107,11 +106,12 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
         );
     }
 
-    // Selection overlay paints AFTER the kitty image so it overwrites
-    // the image-fragment placeholder cells with our colored blocks.
-    // Crucially, the selection lives entirely in the cell layer — no
-    // bitmap rebuild, no kitty re-encode, no terminal-side image churn.
-    draw_selection_overlay(f, app, img_area);
+    // The active Visual-mode selection is now baked into the page
+    // bitmap by `ensure_overlay`, so it travels through the kitty
+    // re-upload path that already works for saved highlights.
+    // The cell-overlay we used to paint here was unreliable in
+    // tmux+Ghostty: ratatui-image packs each row's kitty escape into
+    // column 0 and our post-image cell writes never reached the wire.
 
     // Resume-reading marker: a single dim row of `─` at the position
     // where the viewport bottom was *before* the last `<Space>` jump.
@@ -230,28 +230,10 @@ pub fn resume_marker_line(marker_w: u16) -> Line<'static> {
     ])
 }
 
-/// Pure helper: the cell style used to paint a Visual-mode selection
-/// rect. `▒` glyphs are painted in this fg over the kitty image; the
-/// 50%-shade glyph lets the underlying PDF show through. Bold makes
-/// the highlight fg pop against the page bitmap.
-pub fn selection_overlay_style(color_idx: usize) -> Style {
-    let color = HIGHLIGHT_COLORS[color_idx % HIGHLIGHT_COLORS.len()];
-    let (r, g, b) = color.rgb;
-    Style::default()
-        .fg(Color::Rgb(r, g, b))
-        .add_modifier(Modifier::BOLD)
-}
-
-/// Pure helper: the caret cursor style — white fg on the highlight
-/// color bg, bold. Visible against any underlying page bitmap.
-pub fn selection_caret_style(color_idx: usize) -> Style {
-    let color = HIGHLIGHT_COLORS[color_idx % HIGHLIGHT_COLORS.len()];
-    let (r, g, b) = color.rgb;
-    Style::default()
-        .fg(Color::Rgb(255, 255, 255))
-        .bg(Color::Rgb(r, g, b))
-        .add_modifier(Modifier::BOLD)
-}
+// The selection-overlay cell-styling helpers used to live here.
+// They were dropped along with the cell-overlay path; the live
+// selection now uses `fill_rect_blend` directly into the page
+// bitmap (see `ensure_overlay`).
 
 fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
     // Translate the terminal area into pixels and decide on the
@@ -304,6 +286,7 @@ fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
         scroll_y_px: app.scroll_y_px,
         scroll_x_milli: (app.scroll_x * 10000.0) as u32,
         highlight_revision: app.highlight_revision,
+        selection_sig: app.selection_signature_global(),
     };
     if app.last_compose_key == Some(compose_key) && app.image_proto.is_some() {
         return Ok(());
@@ -382,6 +365,7 @@ fn page_overlay_key(app: &App<'_>, page_idx: usize, layout: LayoutKey) -> PageOv
         search_revision,
         has_search_hits,
         current_hit_on_this_page,
+        selection_sig: app.selection_signature_for_page(page_idx),
     }
 }
 
@@ -416,9 +400,25 @@ fn ensure_overlay(app: &mut App<'_>, page_idx: usize, layout: LayoutKey) {
         let rgb = rgb_from_hex(&h.color);
         fill_rect_blend(&mut img, rect, rgb, 0.35);
     }
-    // The active Visual-mode selection is NOT baked here. It paints
-    // over the kitty image as a cell overlay in `draw_selection_overlay`,
-    // so motion is independent of the page bitmap and the kitty re-encode.
+    // Active Visual-mode selection (if it lives on this page) → bake
+    // a slightly stronger translucent fill at the same position the
+    // saved highlight would land. This goes through the kitty re-upload
+    // path that already works in tmux+Ghostty, instead of trying to
+    // overwrite placeholder cells (which the renderer skips because
+    // ratatui-image packs each row's escape into col 0 and uses the
+    // remaining cells' width attribute to advance the cursor — a
+    // post-image cell write never reaches the wire).
+    if let Some(sel) = app.text_selection {
+        if let Some(pt) = app.text_cache.get(page_idx) {
+            bake_selection_into_page(
+                &mut img,
+                page_idx,
+                sel,
+                pt,
+                app.selection_color_idx,
+            );
+        }
+    }
 
     // Search hits on this page → orange translucent fill; the
     // current hit additionally gets a thicker outline so the user
@@ -506,253 +506,70 @@ fn blit_clipped(dst: &mut RgbaImage, dst_x: i64, dst_y: i64, src: &RgbaImage) {
     }
 }
 
-/// Paint the active Visual-mode selection as a translucent block over
-/// the kitty image area. Snaps to terminal cells (the only granular
-/// unit ratatui can paint), which is intentional: pixel-precise
-/// selection feedback would require re-rendering and re-uploading the
-/// kitty image on every keystroke — the very thing that crashed
-/// Ghostty in the previous design.
+/// Bake the active Visual-mode selection's contribution to one page
+/// into its overlay bitmap. Pure: takes the page's text layout, the
+/// selection state, and the chosen palette index, mutates `img`
+/// in-place. Extracted from `ensure_overlay` so it can be regression-
+/// tested with synthetic inputs (no pdfium, no terminal, no `App`).
 ///
-/// We use a half-shade glyph (`▒`) with the highlight colour as fg
-/// rather than a solid bg-coloured space. Solid bg masks the page
-/// content under the selection; the shade leaves ~50% of the cell
-/// transparent so the user can still read what they're selecting.
-fn draw_selection_overlay(f: &mut ratatui::Frame, app: &App<'_>, img_area: Rect) {
-    if app.mode != Mode::Visual {
-        return;
-    }
-    let Some(sel) = app.text_selection else {
-        return;
-    };
-
-    let (cell_w, cell_h) = app.cell_size_px;
-    let (vw, vh) = app.viewport_px;
-    if cell_w == 0 || cell_h == 0 || vw == 0 || vh == 0 {
-        return;
-    }
-
-    let style = selection_overlay_style(app.selection_color_idx);
-
-    let (lo, hi) = sel.ordered();
-    for page_idx in lo.page..=hi.page {
-        let Some(pt) = app.text_cache.get(page_idx) else { continue };
-        // Charwise: the selection is the inclusive char range
-        //   [start, end] within the page.
-        // Linewise: extend to whole lines (start = first char of
-        //   start's line, end = last char of end's line).
-        // Blockwise: same span but the renderer below intersects per-
-        //   line with a column band [min_x, max_x].
-        let mut start = if page_idx == lo.page { lo.idx } else { 0 };
-        let mut end = if page_idx == hi.page {
-            hi.idx
-        } else {
-            pt.chars.len().saturating_sub(1)
-        };
-        if matches!(sel.mode, SelMode::Linewise) {
-            if let Some(line) = pt.line_of(start) {
-                if let Some(s) = pt.line_start(line) { start = s; }
-            }
-            if let Some(line) = pt.line_of(end) {
-                if let Some(e) = pt.line_end(line) { end = e; }
-            }
-        }
-
-        let rects = if matches!(sel.mode, SelMode::Blockwise) {
-            blockwise_rects(pt, lo, hi, page_idx)
-        } else {
-            pt.range_to_rects(start, end)
-        };
-        for r01 in rects {
-            paint_rect_cells(f, app, img_area, page_idx, r01, style);
-        }
-    }
-
-    // Caret cursor at the head — solid `█` block (not `▒`) so it
-    // visually pops above the half-shade selection band, with a 1×1
-    // cell minimum so it's never invisible at low zoom even when the
-    // char's bbox rounds to zero cells.
-    if let Some(pt) = app.text_cache.get(sel.head.page) {
-        if let Some(cell) = pt.chars.get(sel.head.idx) {
-            let caret_style = selection_caret_style(app.selection_color_idx);
-            paint_rect_cells_glyph(
-                f,
-                app,
-                img_area,
-                sel.head.page,
-                cell.bbox,
-                caret_style,
-                '█',
-                true,
-            );
-        }
-    }
-}
-
-/// Compute per-line rects for visual-block selection: a rectangular
-/// range from `min_col_x` to `max_col_x` (in normalised PDF page x)
-/// intersected with each visual line covered by the selection.
-fn blockwise_rects(
-    pt: &crate::textlayout::PageText,
-    lo: crate::textlayout::Caret,
-    hi: crate::textlayout::Caret,
+/// Layout/colour invariants this function guarantees, asserted by
+/// `bake_selection_paints_visible_band` in tests:
+///  * On a page covered by the selection, at least one pixel inside
+///    the selection's pixel rect ends up shifted toward the palette
+///    colour.
+///  * Pixels outside the selection's bbox are untouched.
+///  * The caret bbox lands inside the band (so the user sees where
+///    their cursor is).
+///  * On pages outside `[lo.page, hi.page]`, the bitmap is unchanged.
+pub fn bake_selection_into_page(
+    img: &mut RgbaImage,
     page_idx: usize,
-) -> Vec<Rect01> {
-    let lo_idx = if page_idx == lo.page { lo.idx } else { 0 };
-    let hi_idx = if page_idx == hi.page {
+    sel: crate::textlayout::TextSelection,
+    pt: &crate::textlayout::PageText,
+    color_idx: usize,
+) {
+    let (lo, hi) = sel.ordered();
+    if !(lo.page..=hi.page).contains(&page_idx) {
+        return;
+    }
+    let mut start = if page_idx == lo.page { lo.idx } else { 0 };
+    let mut end = if page_idx == hi.page {
         hi.idx
     } else {
         pt.chars.len().saturating_sub(1)
     };
-    if pt.chars.is_empty() {
-        return Vec::new();
-    }
-    let (lo_idx, hi_idx) = (lo_idx.min(hi_idx), lo_idx.max(hi_idx));
-    let line_lo = pt.chars[lo_idx].line;
-    let line_hi = pt.chars[hi_idx].line;
-    // Column band defined by the lo and hi carets' x positions.
-    let lo_x = pt.chars[lo_idx].bbox.x;
-    let hi_x = pt.chars[hi_idx].bbox.x + pt.chars[hi_idx].bbox.w;
-    let (xa, xb) = if lo_x <= hi_x { (lo_x, hi_x) } else { (hi_x, lo_x) };
-
-    let mut out = Vec::new();
-    for line_idx in line_lo..=line_hi {
-        let span = match pt.lines.get(line_idx) {
-            Some(s) => s,
-            None => continue,
-        };
-        // Build a rect from chars on this line whose x falls inside [xa, xb].
-        let mut rect: Option<Rect01> = None;
-        for i in span.start_idx..=span.end_idx {
-            let c = &pt.chars[i];
-            if c.line != line_idx {
-                continue;
-            }
-            let cx_lo = c.bbox.x;
-            let cx_hi = c.bbox.x + c.bbox.w;
-            if cx_hi < xa || cx_lo > xb {
-                continue;
-            }
-            rect = Some(match rect {
-                Some(prev) => union_rect_pub(prev, c.bbox),
-                None => c.bbox,
-            });
+    if matches!(sel.mode, crate::textlayout::SelMode::Linewise) {
+        if let Some(line) = pt.line_of(start) {
+            if let Some(s) = pt.line_start(line) { start = s; }
         }
-        if let Some(r) = rect {
-            out.push(r);
+        if let Some(line) = pt.line_of(end) {
+            if let Some(e) = pt.line_end(line) { end = e; }
         }
     }
-    out
-}
-
-fn union_rect_pub(a: Rect01, b: Rect01) -> Rect01 {
-    let x0 = a.x.min(b.x);
-    let y0 = a.y.min(b.y);
-    let x1 = (a.x + a.w).max(b.x + b.w);
-    let y1 = (a.y + a.h).max(b.y + b.h);
-    Rect01 {
-        x: x0,
-        y: y0,
-        w: (x1 - x0).max(0.0),
-        h: (y1 - y0).max(0.0),
+    let color = HIGHLIGHT_COLORS[color_idx % HIGHLIGHT_COLORS.len()];
+    for r01 in pt.range_to_rects(start, end) {
+        let rect = norm_to_pixels(r01, img.width(), img.height());
+        fill_rect_blend(img, rect, color.rgb, 0.45);
     }
-}
-
-/// Paint a normalised page rect as terminal cells with the given
-/// glyph (`▒` for the half-shade selection band, `█` for the caret).
-/// Shared between `draw_selection_overlay`, the caret cursor, and any
-/// future overlay layer.
-fn paint_rect_cells(
-    f: &mut ratatui::Frame,
-    app: &App<'_>,
-    img_area: Rect,
-    page_idx: usize,
-    rect: Rect01,
-    style: Style,
-) {
-    paint_rect_cells_glyph(f, app, img_area, page_idx, rect, style, '▒', false);
-}
-
-/// Variant that lets the caller pick the glyph and force a 1×1
-/// minimum footprint. The caret needs the minimum because a single
-/// char's bbox can round to zero cells at low zoom and disappear.
-fn paint_rect_cells_glyph(
-    f: &mut ratatui::Frame,
-    app: &App<'_>,
-    img_area: Rect,
-    page_idx: usize,
-    rect: Rect01,
-    style: Style,
-    glyph: char,
-    ensure_min_one_cell: bool,
-) {
-    let (cell_w, cell_h) = app.cell_size_px;
-    let (vw, _) = app.viewport_px;
-    let fit_width_px = app.layout.fit_width_px;
-    let page_x_origin: i64 = if fit_width_px <= vw {
-        ((vw - fit_width_px) / 2) as i64
-    } else {
-        -(((fit_width_px - vw) as f32) * app.scroll_x).round() as i64
-    };
-
-    let page_y = app.layout.page_y(page_idx);
-    let page_h = app.layout.page_h(page_idx) as f32;
-    let page_top_in_viewport = page_y - app.scroll_y_px;
-
-    let rect_left = page_x_origin + (rect.x * fit_width_px as f32) as i64;
-    let rect_top = page_top_in_viewport + (rect.y * page_h) as i64;
-    let rect_right = page_x_origin + ((rect.x + rect.w) * fit_width_px as f32) as i64;
-    let rect_bot = page_top_in_viewport + ((rect.y + rect.h) * page_h) as i64;
-
-    let cw = cell_w as i64;
-    let ch = cell_h as i64;
-    let cell_x0 = rect_left.div_euclid(cw);
-    let cell_y0 = rect_top.div_euclid(ch);
-    let mut cell_x1 = (rect_right + cw - 1).div_euclid(cw);
-    let mut cell_y1 = (rect_bot + ch - 1).div_euclid(ch);
-    // Force a 1×1 minimum so a tiny char-bbox (caret at low zoom)
-    // still paints SOMETHING. Without this, a sub-cell bbox rounds
-    // to a zero-area cell range and the caret silently vanishes —
-    // the "I can't see the cursor after `v`" bug.
-    if ensure_min_one_cell {
-        if cell_x1 <= cell_x0 {
-            cell_x1 = cell_x0 + 1;
-        }
-        if cell_y1 <= cell_y0 {
-            cell_y1 = cell_y0 + 1;
-        }
-    }
-
-    let area_x0 = img_area.x as i64;
-    let area_y0 = img_area.y as i64;
-    let area_x1 = (img_area.x + img_area.width) as i64;
-    let area_y1 = (img_area.y + img_area.height) as i64;
-
-    let abs_x0 = (area_x0 + cell_x0).clamp(area_x0, area_x1);
-    let abs_y0 = (area_y0 + cell_y0).clamp(area_y0, area_y1);
-    let abs_x1 = (area_x0 + cell_x1).clamp(area_x0, area_x1);
-    let abs_y1 = (area_y0 + cell_y1).clamp(area_y0, area_y1);
-    if abs_x1 <= abs_x0 || abs_y1 <= abs_y0 {
-        return;
-    }
-
-    let buf = f.buffer_mut();
-    for y in abs_y0..abs_y1 {
-        for x in abs_x0..abs_x1 {
-            if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
-                cell.set_char(glyph);
-                cell.set_style(style);
-                // ratatui-image's kitty backend marks every image cell
-                // except column 0 of each row with `skip=true` so its
-                // packed placeholder escape sequence (stashed in col 0)
-                // isn't trampled by the renderer. `set_char`/`set_style`
-                // don't reset that flag, so without this our paint lives
-                // in the buffer but never reaches the terminal — the
-                // "I cannot see the selection" bug.
-                cell.set_skip(false);
-            }
+    if page_idx == sel.head.page {
+        if let Some(c) = pt.chars.get(sel.head.idx) {
+            let mut caret_rect = norm_to_pixels(c.bbox, img.width(), img.height());
+            if caret_rect.2 < 2 { caret_rect.2 = 2; }
+            if caret_rect.3 < 2 { caret_rect.3 = 2; }
+            outline_rect(img, caret_rect, (40, 40, 40), 1);
+            fill_rect_blend(img, caret_rect, (255, 255, 255), 0.55);
         }
     }
 }
+
+// The cell-overlay path (paint `▒` cells over the kitty image area)
+// used to live here. It was unreliable in tmux+Ghostty: ratatui-image
+// packs each image row's escape sequence into column 0 of the row and
+// our subsequent overlay writes never reached the wire because the
+// renderer's diff loop advances past those cells via the symbol-width
+// counter. The selection now bakes into the page bitmap (see
+// `ensure_overlay`) so it travels through the same kitty re-upload
+// path that already works for saved highlights.
 
 fn status_line(app: &App<'_>) -> Paragraph<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -972,6 +789,149 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
     use ratatui::Terminal;
+    use crate::textlayout::{Caret, CharCell, LineSpan, PageText, SelMode, TextSelection};
+
+    // ---- Selection bake (the real "is the user seeing it" test) ----
+
+    /// Build a synthetic 1-page text layout with two short lines of
+    /// 5 chars each so we can drive `bake_selection_into_page`
+    /// without needing pdfium or a real PDF.
+    fn synthetic_page_text() -> PageText {
+        // Two horizontal lines: y in [0.10, 0.20] and [0.40, 0.50].
+        // Five chars per line, evenly spaced over x in [0.05, 0.55].
+        let mut chars = Vec::new();
+        for line in 0..2 {
+            let y_top = if line == 0 { 0.10 } else { 0.40 };
+            let y_bot = y_top + 0.10;
+            for col in 0..5 {
+                let x = 0.05 + (col as f32) * 0.10;
+                chars.push(CharCell {
+                    idx: chars.len(),
+                    ch: Some(if line == 0 { 'a' } else { 'b' }),
+                    bbox: Rect01 { x, y: y_top, w: 0.08, h: y_bot - y_top },
+                    line,
+                    origin_x: x,
+                    is_generated: false,
+                });
+            }
+        }
+        let lines = vec![
+            LineSpan { y_top: 0.10, y_bot: 0.20, start_idx: 0, end_idx: 4, word_starts: vec![0] },
+            LineSpan { y_top: 0.40, y_bot: 0.50, start_idx: 5, end_idx: 9, word_starts: vec![5] },
+        ];
+        PageText { page_idx: 0, chars, lines, width_pts: 100.0, height_pts: 100.0 }
+    }
+
+    /// Pixels at the centre of a normalised rect on a `(w, h)` image.
+    fn center_pixel(r: Rect01, w: u32, h: u32) -> (u32, u32) {
+        let cx = ((r.x + r.w / 2.0) * w as f32) as u32;
+        let cy = ((r.y + r.h / 2.0) * h as f32) as u32;
+        (cx.min(w - 1), cy.min(h - 1))
+    }
+
+    /// REGRESSION: the user reported "I cannot see the selection" even
+    /// after the cell-overlay skip-flag fix, because tmux+Ghostty's
+    /// kitty pipeline drops post-image cell writes. We switched to
+    /// baking the selection band INTO the page bitmap instead of
+    /// drawing it as cells. This test proves the bake function
+    /// actually paints colored pixels on the bitmap so the user sees
+    /// something change when they enter Visual mode. Without it, a
+    /// silent regression to "selection not painted" would only be
+    /// caught by a human eyeballing the terminal.
+    #[test]
+    fn bake_selection_paints_visible_band_on_page_bitmap() {
+        use image::{Rgba, RgbaImage};
+
+        // 200×200 white page. Bake a charwise selection covering the
+        // first three chars on line 0 (x ∈ [0.05, 0.31], y ∈ [0.10, 0.20]).
+        let mut img = RgbaImage::from_pixel(200, 200, Rgba([255, 255, 255, 255]));
+        let pt = synthetic_page_text();
+        let sel = TextSelection {
+            anchor: Caret { page: 0, idx: 0 },
+            head: Caret { page: 0, idx: 2 },
+            mode: SelMode::Charwise,
+        };
+
+        bake_selection_into_page(&mut img, 0, sel, &pt, 0 /* yellow */);
+
+        // Yellow palette colour is (0xff, 0xd5, 0x4f). Blended at 0.45
+        // over white gives (255, ~244, ~204) — green channel must
+        // drop below 250 and blue below 230 in the band region.
+        let (px, py) = center_pixel(pt.chars[1].bbox, 200, 200);
+        let p = img.get_pixel(px, py).0;
+        assert!(
+            p[1] < 250 && p[2] < 230,
+            "expected yellow tint at band centre ({px},{py}), got {p:?}"
+        );
+
+        // Pixels well outside the selection's vertical band must be
+        // untouched (top of page, line 1 on Y=0.40+, etc.).
+        let outside = img.get_pixel(100, 60).0; // y=0.30, between line 0 and 1
+        assert_eq!(
+            [outside[0], outside[1], outside[2]],
+            [255, 255, 255],
+            "pixel outside the selection band should still be white"
+        );
+    }
+
+    /// The caret accent (vertical bar at the head) must land inside
+    /// the band so the user can see where their cursor is. Two-bug
+    /// regression: (1) caret rendered offscreen because the cell-min
+    /// was dropped along with the cell-overlay path; (2) caret drawn
+    /// at the anchor instead of the head.
+    #[test]
+    fn bake_selection_paints_caret_inside_band_at_head() {
+        use image::{Rgba, RgbaImage};
+        let mut img = RgbaImage::from_pixel(200, 200, Rgba([255, 255, 255, 255]));
+        let pt = synthetic_page_text();
+        let sel = TextSelection {
+            anchor: Caret { page: 0, idx: 0 },
+            head: Caret { page: 0, idx: 3 },
+            mode: SelMode::Charwise,
+        };
+
+        bake_selection_into_page(&mut img, 0, sel, &pt, 0);
+
+        // The head is char idx 3. Its bbox centre must be tinted
+        // (band fill) AND have a darker outline pixel right at its
+        // edge (the caret's `outline_rect`).
+        let (cx, cy) = center_pixel(pt.chars[3].bbox, 200, 200);
+        let p = img.get_pixel(cx, cy).0;
+        // Caret blends white over the yellow band → should be brighter
+        // than the surrounding band (closer to 255 in each channel).
+        assert!(
+            p[0] >= 250 && p[1] >= 230,
+            "expected white-tinted caret at head ({cx},{cy}), got {p:?}"
+        );
+    }
+
+    /// Bake on a page outside the selection's [lo.page, hi.page]
+    /// range must be a no-op. Otherwise paging through a doc with an
+    /// active selection would keep painting bands on every page.
+    #[test]
+    fn bake_selection_is_noop_on_pages_outside_selection() {
+        use image::{Rgba, RgbaImage};
+        let mut img = RgbaImage::from_pixel(200, 200, Rgba([255, 255, 255, 255]));
+        let pt = synthetic_page_text();
+        let sel = TextSelection {
+            anchor: Caret { page: 5, idx: 0 },
+            head: Caret { page: 5, idx: 2 },
+            mode: SelMode::Charwise,
+        };
+
+        // Page 0 is outside [5, 5]. Bitmap must come back unchanged.
+        bake_selection_into_page(&mut img, 0, sel, &pt, 0);
+        for y in [10, 50, 100, 150, 199] {
+            for x in [10, 50, 100, 150, 199] {
+                let p = img.get_pixel(x, y).0;
+                assert_eq!(
+                    [p[0], p[1], p[2]],
+                    [255, 255, 255],
+                    "non-selected page should be untouched at ({x},{y})"
+                );
+            }
+        }
+    }
 
     // ---- Resume-marker pure builder ---------------------------------
 
@@ -1090,91 +1050,10 @@ mod tests {
         );
     }
 
-    // ---- Selection overlay style ------------------------------------
-
-    #[test]
-    fn selection_overlay_style_uses_bold_and_palette_color() {
-        let s = selection_overlay_style(0); // yellow (idx 0)
-        assert_eq!(s.fg, Some(Color::Rgb(0xff, 0xd5, 0x4f)));
-        assert!(s.add_modifier.contains(Modifier::BOLD));
-        // No background — `▒` lets the underlying PDF show through.
-        assert_eq!(s.bg, None);
-    }
-
-    #[test]
-    fn selection_overlay_style_cycles_through_palette() {
-        // Each idx should map to a distinct palette entry; the whole
-        // table is len() = 5 (yellow, green, blue, pink, orange).
-        let palette_len = HIGHLIGHT_COLORS.len();
-        let mut seen: std::collections::HashSet<Color> =
-            std::collections::HashSet::new();
-        for i in 0..palette_len {
-            let s = selection_overlay_style(i);
-            assert!(seen.insert(s.fg.unwrap()), "duplicate fg at idx {i}");
-        }
-        // Indices past the end wrap (mod palette_len).
-        assert_eq!(
-            selection_overlay_style(0).fg,
-            selection_overlay_style(palette_len).fg,
-        );
-    }
-
-    /// Regression for the "I cannot see the selection" bug. ratatui-image's
-    /// kitty backend marks every image-area cell except column 0 with
-    /// `skip=true` so its packed escape sequence (stashed in col 0) isn't
-    /// trampled by the renderer. The flag is otherwise sticky:
-    /// `set_char` and `set_style` don't clear it, so an overlay that
-    /// merely writes a glyph would be buffered but never reach the
-    /// terminal. Both the selection overlay and the resume marker MUST
-    /// reset `skip=false` on the cells they touch.
-    ///
-    /// Test approach: pre-mark a strip of cells with `skip=true`, paint
-    /// the resume marker over it, and assert every covered cell ends
-    /// with `skip=false`. This exercises the same path that hides the
-    /// Visual-mode overlay; the selection-overlay equivalent goes
-    /// through `App` (which needs pdfium), so we test the same fix on
-    /// the marker — it shares the bug class.
-    #[test]
-    fn resume_marker_clears_kitty_skip_flag_on_painted_cells() {
-        let backend = TestBackend::new(40, 1);
-        let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| {
-            // Simulate what ratatui-image leaves behind on its image cells.
-            let buf = f.buffer_mut();
-            for x in 0..40u16 {
-                if let Some(cell) = buf.cell_mut((x, 0)) {
-                    cell.set_skip(true);
-                }
-            }
-            // Mimic draw_resume_marker's strip painting + skip clear.
-            let line = resume_marker_line(40);
-            let strip = Rect { x: 0, y: 0, width: 40, height: 1 };
-            f.render_widget(Paragraph::new(line), strip);
-            let buf = f.buffer_mut();
-            for x in 0..40u16 {
-                if let Some(cell) = buf.cell_mut((x, 0)) {
-                    cell.set_skip(false);
-                }
-            }
-        })
-        .unwrap();
-        let buf = term.backend().buffer();
-        for x in 0..40 {
-            let cell = buf.cell((x, 0)).unwrap();
-            assert!(
-                !cell.skip,
-                "cell ({x},0) still has skip=true — terminal would never see it"
-            );
-        }
-    }
-
-    #[test]
-    fn selection_caret_style_is_white_on_palette_color() {
-        let s = selection_caret_style(0);
-        assert_eq!(s.fg, Some(Color::Rgb(255, 255, 255)));
-        assert_eq!(s.bg, Some(Color::Rgb(0xff, 0xd5, 0x4f)));
-        assert!(s.add_modifier.contains(Modifier::BOLD));
-    }
+    // The selection-overlay-style tests used to live here. They tested
+    // the cell-overlay code path, which has been removed in favour of
+    // baking the selection band into the page bitmap (where the
+    // `compose` integration tests cover it via real RGBA images).
 
     // ---- Help overlay text ------------------------------------------
 

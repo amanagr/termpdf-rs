@@ -43,10 +43,13 @@ pub struct LayoutKey {
 /// page the selection lives on — everything else keeps its
 /// already-overlaid copy across frames.
 ///
-/// The active Visual-mode selection is NOT in this key — it's drawn
-/// on top of the kitty image as ratatui cells (see
-/// `ui::draw_selection_overlay`), so nudging the selection never
-/// touches the page bitmap or triggers a kitty graphics re-upload.
+/// `selection_sig` is the selection's per-page fingerprint (or 0 if
+/// the selection doesn't touch this page). The live Visual-mode band
+/// is alpha-blended into the page bitmap because the cell-overlay
+/// approach we tried first was unreliable in tmux-passthrough kitty:
+/// ratatui-image's placeholder packing meant our cell writes never
+/// reached the wire. Baking it into the bitmap goes through the same
+/// kitty re-upload path that already works for saved highlights.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageOverlayKey {
     pub layout: LayoutKey,
@@ -60,15 +63,17 @@ pub struct PageOverlayKey {
     pub has_search_hits: bool,
     /// True if the currently-focused search hit lives on this page.
     pub current_hit_on_this_page: bool,
+    /// Fingerprint of the active selection's contribution to this
+    /// page (0 = none). Hash of (lo_idx, hi_idx, mode, color_idx),
+    /// stable across frames that don't change the selection.
+    pub selection_sig: u64,
 }
 
 /// Cache key for the *compose* tier (stitch visible pages into a
 /// viewport-sized canvas, blend overlays). Cheap; we still cache it
-/// so a still frame doesn't pointlessly re-blit.
-///
-/// Like `PageOverlayKey`, the live selection is intentionally absent:
-/// the selection lives in a separate cell-overlay layer, so its
-/// motion doesn't invalidate the kitty-encoded image.
+/// so a still frame doesn't pointlessly re-blit. `selection_sig` is
+/// a process-global fingerprint of the active selection so the
+/// compose cache invalidates when it moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ComposeKey {
     pub layout: LayoutKey,
@@ -77,6 +82,7 @@ pub struct ComposeKey {
     pub scroll_y_px: i64,
     pub scroll_x_milli: u32,
     pub highlight_revision: u64,
+    pub selection_sig: u64,
 }
 
 pub struct App<'doc> {
@@ -536,6 +542,60 @@ impl<'doc> App<'doc> {
 
     pub fn invalidate_compose(&mut self) {
         self.last_compose_key = None;
+    }
+
+    /// Derive the active selection's per-page fingerprint for the
+    /// page-overlay cache key. Returns 0 when the selection is empty
+    /// or doesn't touch this page so a non-baking page hits the cache
+    /// regardless of selection state on other pages.
+    pub fn selection_signature_for_page(&self, page_idx: usize) -> u64 {
+        let Some(sel) = self.text_selection else { return 0 };
+        let (lo, hi) = sel.ordered();
+        if page_idx < lo.page || page_idx > hi.page {
+            return 0;
+        }
+        // FNV-style mix; cheap and good enough for cache invalidation.
+        let mut h: u64 = 0xcbf29ce484222325;
+        let mut mix = |v: u64| {
+            h ^= v;
+            h = h.wrapping_mul(0x100000001b3);
+        };
+        mix(lo.page as u64);
+        mix(lo.idx as u64);
+        mix(hi.page as u64);
+        mix(hi.idx as u64);
+        mix(self.selection_color_idx as u64);
+        mix(match sel.mode {
+            crate::textlayout::SelMode::Charwise => 1,
+            crate::textlayout::SelMode::Linewise => 2,
+            crate::textlayout::SelMode::Blockwise => 3,
+        });
+        // Distinguish "no selection" (0) from any real selection by
+        // forcing the low bit on. Real signatures are always odd.
+        h | 1
+    }
+
+    /// Process-global selection fingerprint for the compose tier.
+    /// 0 if there's no active selection.
+    pub fn selection_signature_global(&self) -> u64 {
+        let Some(sel) = self.text_selection else { return 0 };
+        let (lo, hi) = sel.ordered();
+        let mut h: u64 = 0xcbf29ce484222325;
+        let mut mix = |v: u64| {
+            h ^= v;
+            h = h.wrapping_mul(0x100000001b3);
+        };
+        mix(lo.page as u64);
+        mix(lo.idx as u64);
+        mix(hi.page as u64);
+        mix(hi.idx as u64);
+        mix(self.selection_color_idx as u64);
+        mix(match sel.mode {
+            crate::textlayout::SelMode::Charwise => 1,
+            crate::textlayout::SelMode::Linewise => 2,
+            crate::textlayout::SelMode::Blockwise => 3,
+        });
+        h | 1
     }
 
     pub fn goto_page(&mut self, page: usize) {

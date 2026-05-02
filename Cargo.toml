@@ -54,6 +54,15 @@ anyhow = "1"
 dirs = "6"
 base64 = "0.22"
 
+[dev-dependencies]
+# PTY-driven integration tests. Spawns the built `termpdf` binary
+# inside a fake pty so we can drive keystrokes and capture every
+# byte the renderer writes — the only way to verify, without a
+# human watching the screen, that the kitty graphics + selection
+# overlay actually reaches the wire (and not just the ratatui
+# buffer). Heavy dep, kept dev-only.
+portable-pty = "0.9"
+
 [profile.release]
 # Smaller binary, no measurable perf loss for our workload.
 lto = "thin"
