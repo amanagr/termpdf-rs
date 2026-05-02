@@ -48,12 +48,7 @@ pub fn find_libpdfium() -> Result<String> {
         }
     }
 
-    for p in [
-        "/home/aman/termpdf-rs/vendor/lib/libpdfium.so",
-        "/home/aman/termpdf-rs/vendor/libpdfium.so",
-        "/usr/lib64/libpdfium.so",
-        "/usr/lib/libpdfium.so",
-    ] {
+    for p in ["/usr/lib64/libpdfium.so", "/usr/lib/libpdfium.so"] {
         if Path::new(p).exists() {
             return Ok(p.to_string());
         }

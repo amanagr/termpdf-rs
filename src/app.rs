@@ -101,6 +101,10 @@ pub struct App<'doc> {
     /// Bumped on every highlight add/delete so the compose cache
     /// invalidates without re-hashing the store.
     pub highlight_revision: u64,
+    /// Set by `App::new` when the user passed a starting page (or the
+    /// session restored one). Consumed by the first `ensure_layout`
+    /// call to compute the initial scroll offset, then cleared.
+    pub pending_initial_page: Option<usize>,
     pub should_quit: bool,
 }
 
@@ -147,20 +151,16 @@ impl<'doc> App<'doc> {
             last_compose_key: None,
             highlights,
             highlight_revision: 0,
+            pending_initial_page: if page < page_count { Some(page) } else { None },
             should_quit: false,
         };
-        // Restore initial scroll position from the saved page (if any).
-        // The actual y-pixel offset is computed once `layout` is built
-        // for real on the first frame; for now stash the requested
-        // page in `selection_page` as the "wanted page" so we don't
-        // need an extra field. We resolve in `ensure_layout`.
-        app.scroll_y_px = page as i64; // sentinel: < page_count means "page index, not pixels"
         Ok(app)
     }
 
-    /// Rebuild the layout if `LayoutKey` changed. Resolves the
-    /// startup "page-as-sentinel" trick into a real pixel offset on
-    /// the first call. Called at the top of `ui::ensure_image`.
+    /// Rebuild the layout if `LayoutKey` changed. On the very first
+    /// call (no prior layout), resolves any `pending_initial_page`
+    /// into a real scroll offset. Called at the top of
+    /// `ui::ensure_image`.
     pub fn ensure_layout(&mut self, fit_width_px: u32, viewport_h_px: u32) {
         let key = LayoutKey {
             fit_width_px,
@@ -172,40 +172,36 @@ impl<'doc> App<'doc> {
             self.scroll_y_px = self.layout.clamp_scroll(self.scroll_y_px, viewport_h_px);
             return;
         }
-        // Translate the startup sentinel (small i64 == page index)
-        // before we lose the old layout. After the first frame
-        // scroll_y_px is always a real pixel offset.
-        let want_page_jump = if self.last_layout_key.is_none() {
-            let page_idx = self.scroll_y_px as usize;
-            if page_idx < self.page_count {
-                Some(page_idx)
-            } else {
-                None
-            }
-        } else {
-            // Preserve current scroll *as a fraction of the page we're
-            // looking at* across zoom changes — otherwise zooming in
-            // jumps the user back to the doc top.
+
+        // Across-zoom scroll preservation: capture the user's current
+        // logical reading position *before* we throw away the old
+        // layout. We measure as "fraction into the current page";
+        // this stays sensible across resize and zoom. If the user is
+        // currently parked in an inter-page gap, `page_at` assigns
+        // the gap to the page above, so `local_y` can exceed
+        // `cur_page_h` by up to `gap_px`. Clamp to [0,1] so the
+        // restored position never overshoots into the next page.
+        let preserve = if self.last_layout_key.is_some() {
             let cur_page = self.layout.page_at(self.scroll_y_px);
             let cur_page_y = self.layout.page_y(cur_page);
             let cur_page_h = self.layout.page_h(cur_page).max(1) as f32;
-            let frac_into_page = (self.scroll_y_px - cur_page_y) as f32 / cur_page_h;
-            self.layout = PageLayout::build(&self.page_metrics, fit_width_px, layout_gap_px());
-            let new_page_y = self.layout.page_y(cur_page);
-            let new_page_h = self.layout.page_h(cur_page) as f32;
-            self.scroll_y_px = new_page_y + (frac_into_page * new_page_h) as i64;
-            self.scroll_y_px = self.layout.clamp_scroll(self.scroll_y_px, viewport_h_px);
-            self.last_layout_key = Some(key);
-            self.page_cache.clear();
-            self.image_proto = None;
-            self.last_compose_key = None;
-            return;
+            let frac =
+                ((self.scroll_y_px - cur_page_y) as f32 / cur_page_h).clamp(0.0, 1.0);
+            Some((cur_page, frac))
+        } else {
+            None
         };
 
         self.layout = PageLayout::build(&self.page_metrics, fit_width_px, layout_gap_px());
-        if let Some(page_idx) = want_page_jump {
+
+        if let Some((cur_page, frac)) = preserve {
+            let new_page_y = self.layout.page_y(cur_page);
+            let new_page_h = self.layout.page_h(cur_page) as f32;
+            self.scroll_y_px = new_page_y + (frac * new_page_h) as i64;
+        } else if let Some(page_idx) = self.pending_initial_page.take() {
             self.scroll_y_px = self.layout.page_y(page_idx);
         }
+
         self.scroll_y_px = self.layout.clamp_scroll(self.scroll_y_px, viewport_h_px);
         self.last_layout_key = Some(key);
         self.page_cache.clear();
@@ -258,10 +254,14 @@ impl<'doc> App<'doc> {
         self.scroll_y_px = 0;
         self.invalidate_compose();
     }
+    /// `G` lands on the *top* of the last page, not the doc bottom.
+    /// Matches `:N` and counted `NG` semantics so all "go to page p"
+    /// paths agree on where p starts.
     pub fn last_page(&mut self) {
+        let last = self.page_count.saturating_sub(1);
         self.scroll_y_px = self
             .layout
-            .clamp_scroll(i64::MAX, self.viewport_px.1);
+            .clamp_scroll(self.layout.page_y(last), self.viewport_px.1);
         self.invalidate_compose();
     }
 
@@ -295,11 +295,12 @@ impl<'doc> App<'doc> {
     }
 
     /// Scroll vertically by a number of pixels (positive = down).
-    /// Clamped to document bounds.
+    /// Clamped to document bounds. Saturating add guards against an
+    /// `i64::MIN`/`i64::MAX` `dy_px` from a user-supplied count.
     pub fn scroll_by_px(&mut self, dy_px: i64) {
         let new = self
             .layout
-            .clamp_scroll(self.scroll_y_px + dy_px, self.viewport_px.1);
+            .clamp_scroll(self.scroll_y_px.saturating_add(dy_px), self.viewport_px.1);
         if new != self.scroll_y_px {
             self.scroll_y_px = new;
             self.invalidate_compose();
