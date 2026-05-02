@@ -61,9 +61,14 @@ enum ProtocolChoice {
 }
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Terminal PDF reader (kitty/sixel/halfblocks)")]
+#[command(
+    version,
+    about = "Terminal PDF reader (kitty/sixel/halfblocks)",
+    arg_required_else_help = true,
+)]
 struct Args {
     /// Path to the PDF file.
+    #[arg(value_hint = clap::ValueHint::FilePath)]
     path: PathBuf,
     /// Page to open initially (1-indexed). Default: 1.
     #[arg(short, long, default_value_t = 1)]
@@ -72,14 +77,21 @@ struct Args {
     #[arg(short, long)]
     dark: bool,
     /// Force a specific terminal graphics protocol. `auto` (default)
-    /// probes the terminal and falls back to halfblocks. May also be
-    /// set via `$TERMPDF_PROTOCOL`.
-    #[arg(long, value_enum, default_value_t = ProtocolChoice::Auto)]
+    /// probes the terminal and falls back to halfblocks. Env-resolved
+    /// values are validated by clap (typo → hard error rather than a
+    /// silent fall-through to auto, which is what the hand-rolled
+    /// parser used to do).
+    #[arg(
+        long,
+        value_enum,
+        env = "TERMPDF_PROTOCOL",
+        default_value_t = ProtocolChoice::Auto,
+    )]
     protocol: ProtocolChoice,
     /// Smoke test: render the requested page once (no TUI, no terminal
     /// query) and write the result PNG to the given path. Useful for CI
     /// or for sanity-checking pdfium + dark inversion without a TTY.
-    #[arg(long, value_name = "PNG")]
+    #[arg(long, value_name = "PNG", value_hint = clap::ValueHint::FilePath)]
     probe: Option<PathBuf>,
     /// Zoom factor for `--probe` only (1.0 = fit; >1 = zoomed pixmap).
     /// Lets the rendering path under zoom be exercised headlessly.
@@ -87,22 +99,10 @@ struct Args {
     probe_zoom: f32,
 }
 
-/// Resolve the effective protocol given the CLI flag and
-/// `$TERMPDF_PROTOCOL`, then build a `Picker`. CLI flag wins; env
-/// only kicks in when the flag is left at its default `auto`.
-fn pick_protocol(cli: ProtocolChoice) -> Picker {
-    let resolved = if cli != ProtocolChoice::Auto {
-        cli
-    } else {
-        match std::env::var("TERMPDF_PROTOCOL").ok().as_deref() {
-            Some("kitty") => ProtocolChoice::Kitty,
-            Some("sixel") => ProtocolChoice::Sixel,
-            Some("iterm2") => ProtocolChoice::Iterm2,
-            Some("halfblocks") => ProtocolChoice::Halfblocks,
-            _ => ProtocolChoice::Auto,
-        }
-    };
-
+/// Build a `Picker` for the resolved protocol. The CLI/env merge is
+/// done by clap (`env = "TERMPDF_PROTOCOL"` on the `--protocol` arg),
+/// so this function only needs to translate the choice into a Picker.
+fn pick_protocol(resolved: ProtocolChoice) -> Picker {
     if resolved == ProtocolChoice::Auto {
         // Probe; degrade to halfblocks when the terminal answers
         // nothing (xterm without sixel, basic Windows Terminal, …).

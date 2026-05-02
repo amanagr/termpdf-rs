@@ -15,6 +15,9 @@ path = "src/main.rs"
 # PDF rendering. Default features enable dynamic dlopen of libpdfium
 # at runtime, image-crate integration, and a thread-safe mutex
 # wrapper. `setup.sh` stages a prebuilt libpdfium.so in vendor/.
+# Stay on 0.9.x: 0.9.0 was a major cleanup that removed all
+# previously-deprecated APIs and added Send+Sync everywhere. Don't
+# bump past 0.9 without auditing for the next breaking release.
 pdfium-render = "0.9"
 
 # TUI + Kitty/Sixel image embedding. ratatui-image picks the best
@@ -31,7 +34,7 @@ ratatui = "0.30"
 # libchafa-devel as a system dep. Ghostty speaks kitty natively, so
 # we don't need chafa.
 ratatui-image = { version = "10", default-features = false, features = ["crossterm", "image-defaults"] }
-crossterm = { version = "0.29", features = ["event-stream"] }
+crossterm = "0.29"
 
 # Color-aware dark mode. We invert *luminance* in HSL space so red
 # text stays red, blue charts stay blue, only white/grayscale gets
@@ -41,11 +44,14 @@ image = "0.25"
 palette = { version = "0.7", default-features = false, features = ["std"] }
 
 # CLI parsing + JSON for highlight persistence.
-clap = { version = "4", features = ["derive"] }
+# clap: wrap_help gives sensible long-help wrapping on narrow terms.
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
-dirs = "5"
+# dirs 6 is the maintained line; 5→6 is a transparent bump for our
+# use of `data_local_dir()`.
+dirs = "6"
 base64 = "0.22"
 
 [profile.release]
