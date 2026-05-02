@@ -117,10 +117,21 @@ pub struct App<'doc> {
     pub drag_anchor: Option<(usize, f32, f32)>,
 
     pub picker: Picker,
-    /// Per-page rendered bitmap (no overlays applied). Sliding-
-    /// window evicted around the visible page range so memory stays
-    /// bounded on large documents.
+    /// Per-page rendered bitmap (no overlays applied). Bounded by
+    /// both a sliding window around the visible range *and* a hard
+    /// byte budget — whichever is tighter wins. Insertion order is
+    /// tracked separately so we can LRU-evict when over budget.
     pub page_cache: HashMap<usize, DynamicImage>,
+    /// LRU order — most-recently-used page is at the back. Touched
+    /// every time `ensure_image` reads or inserts a page.
+    pub page_cache_lru: Vec<usize>,
+    /// Sign of the last vertical scroll (+1 / -1 / 0). Used to
+    /// prefetch ahead of the user's scroll direction so steady
+    /// reading rarely hits a cache miss.
+    pub last_scroll_dir: i8,
+    /// Page bitmaps that pdfium failed on (corrupt page,
+    /// out-of-memory, …). Cached so we don't re-attempt every frame.
+    pub failed_pages: std::collections::HashSet<usize>,
     /// Per-page bitmap with saved highlights and (if applicable)
     /// the active selection blended in. Rebuilt on overlay change
     /// for a single page; everything else stays cached. This is
@@ -217,6 +228,9 @@ impl<'doc> App<'doc> {
             drag_anchor: None,
             picker,
             page_cache: HashMap::new(),
+            page_cache_lru: Vec::new(),
+            last_scroll_dir: 0,
+            failed_pages: std::collections::HashSet::new(),
             overlay_cache: HashMap::new(),
             image_proto: None,
             last_compose_key: None,
@@ -289,15 +303,90 @@ impl<'doc> App<'doc> {
     }
 
     /// Drop cached page bitmaps (and their overlay derivatives) that
-    /// are far from the visible window. Keeps a small prefetch
-    /// margin on either side so light scroll hits the cache instead
-    /// of re-rendering.
+    /// are far from the visible window. Keeps a generous prefetch
+    /// margin so steady scrolling rarely re-renders.
     pub fn evict_far_pages(&mut self, visible: std::ops::Range<usize>) {
-        const MARGIN: usize = 1;
+        const MARGIN: usize = 3;
         let lo = visible.start.saturating_sub(MARGIN);
         let hi = visible.end.saturating_add(MARGIN);
         self.page_cache.retain(|&k, _| k >= lo && k < hi);
         self.overlay_cache.retain(|&k, _| k >= lo && k < hi);
+        self.page_cache_lru.retain(|&k| k >= lo && k < hi);
+    }
+
+    /// Mark a page as the most-recently-used. Called every time
+    /// `ensure_image` reads or inserts a bitmap.
+    pub fn touch_page(&mut self, page: usize) {
+        self.page_cache_lru.retain(|&p| p != page);
+        self.page_cache_lru.push(page);
+    }
+
+    /// Evict the least-recently-used cached pages until the total
+    /// byte cost of `page_cache` is below `budget`. Pages currently
+    /// in `pinned` (visible right now) are never evicted, even if
+    /// the budget can't be satisfied without them.
+    pub fn enforce_byte_budget(&mut self, budget: usize, pinned: std::ops::Range<usize>) {
+        loop {
+            let total: usize = self
+                .page_cache
+                .values()
+                .map(|img| (img.width() * img.height() * 4) as usize)
+                .sum();
+            if total <= budget {
+                break;
+            }
+            // Find the oldest LRU entry that's not pinned.
+            let evict = self
+                .page_cache_lru
+                .iter()
+                .copied()
+                .find(|p| !pinned.contains(p));
+            let Some(p) = evict else {
+                // Everything left is pinned; budget is undersized
+                // for the current viewport. Better to overshoot than
+                // refuse to render.
+                break;
+            };
+            self.page_cache.remove(&p);
+            self.overlay_cache.remove(&p);
+            self.page_cache_lru.retain(|&x| x != p);
+        }
+    }
+
+    /// Pages worth speculatively rendering ahead of the current
+    /// viewport, in priority order (most useful first). Used by
+    /// `ui::ensure_image` to fill in pages just outside the visible
+    /// range, biased by `last_scroll_dir` so a downward scroll
+    /// preloads pages below.
+    pub fn prefetch_targets(&self, visible: std::ops::Range<usize>) -> Vec<usize> {
+        const PREFETCH: usize = 2;
+        let mut out: Vec<usize> = Vec::new();
+        if self.last_scroll_dir >= 0 {
+            for i in 0..PREFETCH {
+                let p = visible.end + i;
+                if p < self.page_count {
+                    out.push(p);
+                }
+            }
+            for i in 1..=PREFETCH {
+                if let Some(p) = visible.start.checked_sub(i) {
+                    out.push(p);
+                }
+            }
+        } else {
+            for i in 1..=PREFETCH {
+                if let Some(p) = visible.start.checked_sub(i) {
+                    out.push(p);
+                }
+            }
+            for i in 0..PREFETCH {
+                let p = visible.end + i;
+                if p < self.page_count {
+                    out.push(p);
+                }
+            }
+        }
+        out
     }
 
     /// Page that contains the viewport center — what the user is
@@ -386,11 +475,14 @@ impl<'doc> App<'doc> {
     /// Scroll vertically by a number of pixels (positive = down).
     /// Clamped to document bounds. Saturating add guards against an
     /// `i64::MIN`/`i64::MAX` `dy_px` from a user-supplied count.
+    /// Records the sign so `prefetch_targets` knows which direction
+    /// to bias the speculative renders.
     pub fn scroll_by_px(&mut self, dy_px: i64) {
         let new = self
             .layout
             .clamp_scroll(self.scroll_y_px.saturating_add(dy_px), self.viewport_px.1);
         if new != self.scroll_y_px {
+            self.last_scroll_dir = (new - self.scroll_y_px).signum() as i8;
             self.scroll_y_px = new;
             self.invalidate_compose();
         }

@@ -42,6 +42,18 @@ use crate::pdf;
 /// character per viewport anyway).
 pub const MAX_FIT_WIDTH_PX: u32 = 4096;
 
+/// Soft byte budget on `App::page_cache`. A 4-byte-per-pixel RGBA
+/// budget; 256 MB ≈ 64 megapixels of cached pages, which is several
+/// dozen typical pages or a smaller number of big scanned ones.
+/// Override at startup with `$TERMPDF_CACHE_MB`.
+pub fn page_cache_budget_bytes() -> usize {
+    let mb = std::env::var("TERMPDF_CACHE_MB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(256);
+    mb.saturating_mul(1024 * 1024)
+}
+
 pub fn draw(f: &mut Frame, app: &mut App<'_>) {
     let area = f.area();
     let chunks = Layout::default()
@@ -112,18 +124,21 @@ fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
     // LayoutKey because `ensure_layout` clears the cache on change.
     let visible = app.layout.visible_pages(app.scroll_y_px, viewport_h);
     for page_idx in visible.clone() {
-        if !app.page_cache.contains_key(&page_idx) {
-            let img = pdf::render_page_at_width(&app.document, page_idx, fit_width_px)?;
-            let img = if app.dark {
-                DynamicImage::ImageRgba8(dark::invert_luminance(&img))
-            } else {
-                img
-            };
-            app.page_cache.insert(page_idx, img);
-            app.last_compose_key = None; // force compose to repaint
-        }
+        ensure_page_rendered(app, page_idx, fit_width_px, /*allow_failure=*/ true)?;
+        app.touch_page(page_idx);
     }
+
+    // Speculatively render a few pages outside the viewport in the
+    // user's scroll direction. Failures here are swallowed —
+    // prefetch is best-effort, the user hasn't asked to see these
+    // pages yet.
+    let prefetch = app.prefetch_targets(visible.clone());
+    for page_idx in prefetch {
+        let _ = ensure_page_rendered(app, page_idx, fit_width_px, true);
+    }
+
     app.evict_far_pages(visible.clone());
+    app.enforce_byte_budget(page_cache_budget_bytes(), visible.clone());
 
     // Compose key: changes to scroll, selection, highlight count, or
     // viewport invalidate the cached canvas.
@@ -161,6 +176,48 @@ fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
     app.image_proto = Some(app.picker.new_resize_protocol(DynamicImage::ImageRgba8(canvas)));
     app.last_compose_key = Some(compose_key);
     Ok(())
+}
+
+/// Render `page_idx` through pdfium if it's not already cached.
+/// Honours `App::failed_pages` so a corrupt page isn't re-attempted
+/// every frame. With `allow_failure=true`, errors are stored and
+/// then suppressed (returning Ok); with `allow_failure=false`, the
+/// error propagates so the caller can paint a render-error message.
+fn ensure_page_rendered(
+    app: &mut App<'_>,
+    page_idx: usize,
+    fit_width_px: u32,
+    allow_failure: bool,
+) -> Result<()> {
+    if app.page_cache.contains_key(&page_idx) {
+        return Ok(());
+    }
+    if app.failed_pages.contains(&page_idx) {
+        return Ok(());
+    }
+    match pdf::render_page_at_width(&app.document, page_idx, fit_width_px) {
+        Ok(img) => {
+            let img = if app.dark {
+                DynamicImage::ImageRgba8(dark::invert_luminance(&img))
+            } else {
+                img
+            };
+            app.page_cache.insert(page_idx, img);
+            app.last_compose_key = None;
+            Ok(())
+        }
+        Err(e) => {
+            // Mark the page so we don't keep re-attempting; surface
+            // a one-shot status line so the user knows.
+            app.failed_pages.insert(page_idx);
+            app.status = format!("page {}: render failed", page_idx + 1);
+            if allow_failure {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 fn page_overlay_key(app: &App<'_>, page_idx: usize, layout: LayoutKey) -> PageOverlayKey {
