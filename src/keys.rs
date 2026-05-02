@@ -169,7 +169,39 @@ fn cmd_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
 }
 
 fn visual_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
-    let _ = k.modifiers.contains(KeyModifiers::SHIFT);
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+
+    // f-pending: previous keypress was `f`/`F`, awaiting the target
+    // char. Stored as a single `f` or `F` in `pending`.
+    if app.pending == "f" || app.pending == "F" {
+        let forward = app.pending == "f";
+        app.pending.clear();
+        if let KeyCode::Char(c) = k.code {
+            app.move_head_find_char(c, forward);
+        }
+        return Ok(());
+    }
+    // i-pending: previous keypress was `i`, awaiting text-object
+    // (`iw`/`is`/`ip`).
+    if app.pending == "i" {
+        app.pending.clear();
+        match k.code {
+            KeyCode::Char('w') => app.select_inner_word(),
+            KeyCode::Char('s') => app.select_inner_sentence(),
+            KeyCode::Char('p') => app.select_inner_paragraph(),
+            _ => {}
+        }
+        return Ok(());
+    }
+    // gg-pending: previous was `g`, awaiting `g`.
+    if app.pending == "g" {
+        app.pending.clear();
+        if let KeyCode::Char('g') = k.code {
+            app.move_head_page_top();
+        }
+        return Ok(());
+    }
+
     match k.code {
         KeyCode::Esc | KeyCode::Char('q') => app.exit_visual(),
         KeyCode::Char('y') | KeyCode::Enter => app.yank_selection(true),
@@ -183,9 +215,31 @@ fn visual_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         KeyCode::Char('j') | KeyCode::Down => app.move_head_lines(1),
         KeyCode::Char('k') | KeyCode::Up => app.move_head_lines(-1),
 
-        // Word motions (Phase 3) and line-extreme motions land here
-        // in upcoming commits; the old HJKL "resize" keys have no
-        // text-selection equivalent and are deliberately freed up.
+        // Word motions.
+        KeyCode::Char('w') => app.move_head_word_forward(),
+        KeyCode::Char('b') => app.move_head_word_back(),
+        KeyCode::Char('e') => app.move_head_word_end(),
+
+        // Line-extreme + page-extreme motions.
+        KeyCode::Char('0') => app.move_head_line_start(),
+        KeyCode::Char('^') => app.move_head_line_first_nonblank(),
+        KeyCode::Char('$') => app.move_head_line_end(),
+        KeyCode::Char('G') => app.move_head_page_bottom(),
+        KeyCode::Char('g') => app.pending.push('g'),
+
+        // f<c>/F<c> — start a one-char wait for the target.
+        KeyCode::Char('f') => app.pending.push('f'),
+        KeyCode::Char('F') => app.pending.push('F'),
+
+        // Text objects: `i` then w/s/p.
+        KeyCode::Char('i') => app.pending.push('i'),
+
+        // Visual mode flavours: V switches to linewise, <C-v> to
+        // blockwise. They modify the active selection's mode rather
+        // than re-entering — the anchor stays put.
+        KeyCode::Char('V') => app.enter_visual_line(),
+        KeyCode::Char('v') if ctrl => app.enter_visual_block(),
+
         _ => {}
     }
     Ok(())

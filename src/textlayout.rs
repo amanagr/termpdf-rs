@@ -228,6 +228,256 @@ impl PageText {
         self.lines.get(line).map(|l| l.end_idx)
     }
 
+    /// First non-whitespace char on `line` (vim's `^`). Falls back
+    /// to `line_start` if the whole line is whitespace.
+    pub fn line_first_non_blank(&self, line: usize) -> Option<usize> {
+        let span = self.lines.get(line)?;
+        for i in span.start_idx..=span.end_idx {
+            let c = &self.chars[i];
+            if c.line != line {
+                continue;
+            }
+            let blank = c.ch.map(|ch| ch.is_whitespace()).unwrap_or(true);
+            if !blank {
+                return Some(i);
+            }
+        }
+        Some(span.start_idx)
+    }
+
+    /// Index of the next word-start at or after `from`, walking
+    /// forward across lines if necessary. Returns the last char on
+    /// the page if no further word-start exists.
+    pub fn next_word_start(&self, from: usize) -> usize {
+        let mut from_line = self.line_of(from).unwrap_or(0);
+        // First check the rest of the current line.
+        loop {
+            let span = match self.lines.get(from_line) {
+                Some(s) => s,
+                None => break,
+            };
+            for &ws in &span.word_starts {
+                if ws > from {
+                    return ws;
+                }
+            }
+            from_line += 1;
+            // Wrap into the next line — its first word_start (if any)
+            // is the next word; otherwise its start_idx.
+            if let Some(next) = self.lines.get(from_line) {
+                if let Some(&ws) = next.word_starts.first() {
+                    return ws;
+                }
+                return next.start_idx;
+            }
+            break;
+        }
+        self.chars.len().saturating_sub(1)
+    }
+
+    /// Index of the previous word-start at or before `from`. Returns
+    /// `0` if none.
+    pub fn prev_word_start(&self, from: usize) -> usize {
+        let mut line_idx = self.line_of(from).unwrap_or(0);
+        loop {
+            let span = match self.lines.get(line_idx) {
+                Some(s) => s,
+                None => return 0,
+            };
+            // Walk word_starts in reverse, looking for one strictly
+            // less than `from`.
+            for &ws in span.word_starts.iter().rev() {
+                if ws < from {
+                    return ws;
+                }
+            }
+            if line_idx == 0 {
+                return 0;
+            }
+            line_idx -= 1;
+            if let Some(prev) = self.lines.get(line_idx) {
+                if let Some(&ws) = prev.word_starts.last() {
+                    return ws;
+                }
+                return prev.start_idx;
+            }
+        }
+    }
+
+    /// Index of the end of the word containing or after `from` —
+    /// vim's `e`. Returns the last char of the page if `from` is
+    /// already at the doc's last word's end.
+    pub fn end_of_word(&self, from: usize) -> usize {
+        let n = self.chars.len();
+        if n == 0 {
+            return 0;
+        }
+        let mut i = from.min(n - 1);
+        // If on whitespace, advance into the next word first.
+        let is_blank = |idx: usize| {
+            self.chars[idx]
+                .ch
+                .map(|ch| ch.is_whitespace())
+                .unwrap_or(true)
+        };
+        while i + 1 < n && is_blank(i) {
+            i += 1;
+        }
+        // Walk forward while still on a word char; stop on the last
+        // word char before whitespace or end.
+        while i + 1 < n && !is_blank(i + 1) {
+            i += 1;
+        }
+        i
+    }
+
+    /// Find the next occurrence of `target` (case-sensitive) on the
+    /// same line as `from`, strictly after `from`. Vim's `f<c>`.
+    pub fn find_char_in_line(&self, from: usize, target: char) -> Option<usize> {
+        let line = self.line_of(from)?;
+        let span = self.lines.get(line)?;
+        for i in (from + 1)..=span.end_idx {
+            if self.chars[i].ch == Some(target) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Vim's `F<c>` — previous occurrence on the same line.
+    pub fn rfind_char_in_line(&self, from: usize, target: char) -> Option<usize> {
+        let line = self.line_of(from)?;
+        let span = self.lines.get(line)?;
+        for i in (span.start_idx..from).rev() {
+            if self.chars[i].ch == Some(target) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Word range surrounding `from` — `[start, end]` inclusive,
+    /// covering the contiguous run of non-whitespace chars. Returns
+    /// `None` if `from` lies on whitespace and there's no adjacent
+    /// word (vim's `iw` used on whitespace selects the whitespace
+    /// run instead; we keep the simpler "snap to nearest word"
+    /// behavior for now).
+    pub fn word_around(&self, from: usize) -> Option<(usize, usize)> {
+        let n = self.chars.len();
+        if n == 0 {
+            return None;
+        }
+        let from = from.min(n - 1);
+        let is_blank = |idx: usize| {
+            self.chars[idx]
+                .ch
+                .map(|ch| ch.is_whitespace())
+                .unwrap_or(true)
+        };
+        // If on a blank, snap forward to the next word (matches vim
+        // when `iw` lands on whitespace under cursor).
+        let mut anchor = from;
+        if is_blank(anchor) {
+            while anchor + 1 < n && is_blank(anchor) {
+                anchor += 1;
+            }
+            if is_blank(anchor) {
+                return None;
+            }
+        }
+        let mut start = anchor;
+        while start > 0 && !is_blank(start - 1) {
+            start -= 1;
+        }
+        let mut end = anchor;
+        while end + 1 < n && !is_blank(end + 1) {
+            end += 1;
+        }
+        Some((start, end))
+    }
+
+    /// Sentence range around `from`. Sentences end at `. ! ?` followed
+    /// by whitespace or end-of-line. Sufficient for prose; doesn't
+    /// try to handle abbreviations. Returns inclusive `[start, end]`.
+    pub fn sentence_around(&self, from: usize) -> Option<(usize, usize)> {
+        let n = self.chars.len();
+        if n == 0 {
+            return None;
+        }
+        let from = from.min(n - 1);
+        let is_terminator = |idx: usize| {
+            matches!(self.chars[idx].ch, Some('.') | Some('!') | Some('?'))
+        };
+        // Walk back to start: previous terminator (skipping past it
+        // and any following whitespace).
+        let mut start = from;
+        while start > 0 {
+            if is_terminator(start - 1) {
+                break;
+            }
+            start -= 1;
+        }
+        // Skip any leading whitespace.
+        while start < n
+            && self.chars[start]
+                .ch
+                .map(|ch| ch.is_whitespace())
+                .unwrap_or(true)
+        {
+            start += 1;
+            if start >= n {
+                return None;
+            }
+        }
+        // Walk forward to end: next terminator (inclusive).
+        let mut end = from;
+        while end + 1 < n && !is_terminator(end) {
+            end += 1;
+        }
+        Some((start, end))
+    }
+
+    /// Paragraph range around `from`. Paragraph boundaries are
+    /// detected from gaps between visual lines (Y gap > 1.6× the
+    /// median line height) — a simple and reliable heuristic for
+    /// body text. Returns inclusive `[start, end]`.
+    pub fn paragraph_around(&self, from: usize) -> Option<(usize, usize)> {
+        if self.chars.is_empty() || self.lines.is_empty() {
+            return None;
+        }
+        let from = from.min(self.chars.len() - 1);
+        let cur_line = self.line_of(from)?;
+        // Median line height as gap threshold.
+        let mut heights: Vec<f32> = self
+            .lines
+            .iter()
+            .map(|l| (l.y_bot - l.y_top).max(1e-6))
+            .collect();
+        heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let med = heights[heights.len() / 2].max(1e-4);
+        let gap_threshold = med * 1.6;
+
+        let mut start_line = cur_line;
+        while start_line > 0 {
+            let prev = &self.lines[start_line - 1];
+            let here = &self.lines[start_line];
+            if here.y_top - prev.y_bot > gap_threshold {
+                break;
+            }
+            start_line -= 1;
+        }
+        let mut end_line = cur_line;
+        while end_line + 1 < self.lines.len() {
+            let here = &self.lines[end_line];
+            let next = &self.lines[end_line + 1];
+            if next.y_top - here.y_bot > gap_threshold {
+                break;
+            }
+            end_line += 1;
+        }
+        Some((self.lines[start_line].start_idx, self.lines[end_line].end_idx))
+    }
+
     /// Per-visual-line rectangles covering the inclusive char range
     /// `[start, end]`. Implements the textbook 3-band model: tail of
     /// the start line, full bands of inner lines, head of the end
@@ -572,6 +822,82 @@ mod tests {
             cell(4, 0.34, 0.10, 0.05, 0.04, 'd'),
         ]);
         assert_eq!(pt.lines[0].word_starts, vec![0, 3]);
+    }
+
+    #[test]
+    fn next_word_start_walks_forward() {
+        // "ab cd ef" on one line.
+        let pt = page_with(vec![
+            cell(0, 0.10, 0.10, 0.05, 0.04, 'a'),
+            cell(1, 0.16, 0.10, 0.05, 0.04, 'b'),
+            cell(2, 0.22, 0.10, 0.05, 0.04, ' '),
+            cell(3, 0.28, 0.10, 0.05, 0.04, 'c'),
+            cell(4, 0.34, 0.10, 0.05, 0.04, 'd'),
+            cell(5, 0.40, 0.10, 0.05, 0.04, ' '),
+            cell(6, 0.46, 0.10, 0.05, 0.04, 'e'),
+            cell(7, 0.52, 0.10, 0.05, 0.04, 'f'),
+        ]);
+        // From char 0 ('a'), next word start = 3 ('c').
+        assert_eq!(pt.next_word_start(0), 3);
+        // From char 3 ('c'), next = 6 ('e').
+        assert_eq!(pt.next_word_start(3), 6);
+        // From last char, returns last.
+        assert_eq!(pt.next_word_start(7), 7);
+    }
+
+    #[test]
+    fn end_of_word_lands_on_last_letter() {
+        let pt = page_with(vec![
+            cell(0, 0.10, 0.10, 0.05, 0.04, 'a'),
+            cell(1, 0.16, 0.10, 0.05, 0.04, 'b'),
+            cell(2, 0.22, 0.10, 0.05, 0.04, ' '),
+            cell(3, 0.28, 0.10, 0.05, 0.04, 'c'),
+        ]);
+        // From 'a', end of word = 1 ('b').
+        assert_eq!(pt.end_of_word(0), 1);
+        // From the space, end of NEXT word = 3 ('c').
+        assert_eq!(pt.end_of_word(2), 3);
+    }
+
+    #[test]
+    fn word_around_snaps_to_inner_word() {
+        let pt = page_with(vec![
+            cell(0, 0.10, 0.10, 0.05, 0.04, 'a'),
+            cell(1, 0.16, 0.10, 0.05, 0.04, 'b'),
+            cell(2, 0.22, 0.10, 0.05, 0.04, ' '),
+            cell(3, 0.28, 0.10, 0.05, 0.04, 'c'),
+            cell(4, 0.34, 0.10, 0.05, 0.04, 'd'),
+        ]);
+        assert_eq!(pt.word_around(1), Some((0, 1)));
+        assert_eq!(pt.word_around(4), Some((3, 4)));
+        // From the space, snaps to next word.
+        assert_eq!(pt.word_around(2), Some((3, 4)));
+    }
+
+    #[test]
+    fn find_char_in_line_forward_and_back() {
+        let pt = page_with(vec![
+            cell(0, 0.10, 0.10, 0.05, 0.04, 'a'),
+            cell(1, 0.16, 0.10, 0.05, 0.04, 'b'),
+            cell(2, 0.22, 0.10, 0.05, 0.04, 'a'),
+            cell(3, 0.28, 0.10, 0.05, 0.04, 'c'),
+        ]);
+        // From 0, next 'a' = 2.
+        assert_eq!(pt.find_char_in_line(0, 'a'), Some(2));
+        // From 3, prev 'a' = 2.
+        assert_eq!(pt.rfind_char_in_line(3, 'a'), Some(2));
+        // No match returns None.
+        assert_eq!(pt.find_char_in_line(0, 'z'), None);
+    }
+
+    #[test]
+    fn line_first_non_blank_skips_leading_space() {
+        let pt = page_with(vec![
+            cell(0, 0.10, 0.10, 0.05, 0.04, ' '),
+            cell(1, 0.16, 0.10, 0.05, 0.04, ' '),
+            cell(2, 0.22, 0.10, 0.05, 0.04, 'x'),
+        ]);
+        assert_eq!(pt.line_first_non_blank(0), Some(2));
     }
 
     #[test]

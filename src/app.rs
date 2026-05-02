@@ -16,7 +16,7 @@ use crate::pdf::{self, PageMetrics};
 use crate::pdfhighlights;
 use crate::search::SearchResults;
 use crate::session::Session;
-use crate::textlayout::{Caret, TextCache, TextSelection};
+use crate::textlayout::{Caret, SelMode, TextCache, TextSelection};
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -940,6 +940,183 @@ impl<'doc> App<'doc> {
                 }
             }
             sel.head.idx = best.0;
+        }
+    }
+
+    /// Move head to the next word start (`w`).
+    pub fn move_head_word_forward(&mut self) {
+        if let Some(sel) = self.text_selection.as_mut() {
+            if let Some(pt) = self.text_cache.get(sel.head.page) {
+                sel.head.idx = pt.next_word_start(sel.head.idx);
+            }
+        }
+    }
+
+    /// Move head to the previous word start (`b`).
+    pub fn move_head_word_back(&mut self) {
+        if let Some(sel) = self.text_selection.as_mut() {
+            if let Some(pt) = self.text_cache.get(sel.head.page) {
+                sel.head.idx = pt.prev_word_start(sel.head.idx);
+            }
+        }
+    }
+
+    /// Move head to end of word (`e`).
+    pub fn move_head_word_end(&mut self) {
+        if let Some(sel) = self.text_selection.as_mut() {
+            if let Some(pt) = self.text_cache.get(sel.head.page) {
+                sel.head.idx = pt.end_of_word(sel.head.idx);
+            }
+        }
+    }
+
+    /// Move head to first char of current line (`0`).
+    pub fn move_head_line_start(&mut self) {
+        if let Some(sel) = self.text_selection.as_mut() {
+            if let Some(pt) = self.text_cache.get(sel.head.page) {
+                if let Some(line) = pt.line_of(sel.head.idx) {
+                    if let Some(start) = pt.line_start(line) {
+                        sel.head.idx = start;
+                    }
+                }
+            }
+        }
+    }
+
+    /// First non-blank on current line (`^`).
+    pub fn move_head_line_first_nonblank(&mut self) {
+        if let Some(sel) = self.text_selection.as_mut() {
+            if let Some(pt) = self.text_cache.get(sel.head.page) {
+                if let Some(line) = pt.line_of(sel.head.idx) {
+                    if let Some(idx) = pt.line_first_non_blank(line) {
+                        sel.head.idx = idx;
+                    }
+                }
+            }
+        }
+    }
+
+    /// End of current line (`$`).
+    pub fn move_head_line_end(&mut self) {
+        if let Some(sel) = self.text_selection.as_mut() {
+            if let Some(pt) = self.text_cache.get(sel.head.page) {
+                if let Some(line) = pt.line_of(sel.head.idx) {
+                    if let Some(end) = pt.line_end(line) {
+                        sel.head.idx = end;
+                    }
+                }
+            }
+        }
+    }
+
+    /// `gg` / `G` over text — first/last char of the current page.
+    /// Cross-page caret motion is intentionally deferred: `j`/`k` and
+    /// `w`/`b` still respect page boundaries; document-wide motion is
+    /// what `Page Down` / `:goto N` are for.
+    pub fn move_head_page_top(&mut self) {
+        if let Some(sel) = self.text_selection.as_mut() {
+            if !self
+                .text_cache
+                .get(sel.head.page)
+                .map(|pt| pt.chars.is_empty())
+                .unwrap_or(true)
+            {
+                sel.head.idx = 0;
+            }
+        }
+    }
+
+    pub fn move_head_page_bottom(&mut self) {
+        if let Some(sel) = self.text_selection.as_mut() {
+            if let Some(pt) = self.text_cache.get(sel.head.page) {
+                if !pt.chars.is_empty() {
+                    sel.head.idx = pt.chars.len() - 1;
+                }
+            }
+        }
+    }
+
+    /// `f<c>` — jump to the next occurrence of `c` on the current line.
+    pub fn move_head_find_char(&mut self, target: char, forward: bool) {
+        if let Some(sel) = self.text_selection.as_mut() {
+            if let Some(pt) = self.text_cache.get(sel.head.page) {
+                let new = if forward {
+                    pt.find_char_in_line(sel.head.idx, target)
+                } else {
+                    pt.rfind_char_in_line(sel.head.idx, target)
+                };
+                if let Some(idx) = new {
+                    sel.head.idx = idx;
+                }
+            }
+        }
+    }
+
+    /// `iw` — set selection to the word containing the head.
+    pub fn select_inner_word(&mut self) {
+        if let Some(sel) = self.text_selection.as_mut() {
+            if let Some(pt) = self.text_cache.get(sel.head.page) {
+                if let Some((s, e)) = pt.word_around(sel.head.idx) {
+                    sel.anchor.idx = s;
+                    sel.head.idx = e;
+                    sel.anchor.page = sel.head.page;
+                }
+            }
+        }
+    }
+
+    /// `is` — sentence around the head.
+    pub fn select_inner_sentence(&mut self) {
+        if let Some(sel) = self.text_selection.as_mut() {
+            if let Some(pt) = self.text_cache.get(sel.head.page) {
+                if let Some((s, e)) = pt.sentence_around(sel.head.idx) {
+                    sel.anchor.idx = s;
+                    sel.head.idx = e;
+                    sel.anchor.page = sel.head.page;
+                }
+            }
+        }
+    }
+
+    /// `ip` — paragraph around the head.
+    pub fn select_inner_paragraph(&mut self) {
+        if let Some(sel) = self.text_selection.as_mut() {
+            if let Some(pt) = self.text_cache.get(sel.head.page) {
+                if let Some((s, e)) = pt.paragraph_around(sel.head.idx) {
+                    sel.anchor.idx = s;
+                    sel.head.idx = e;
+                    sel.anchor.page = sel.head.page;
+                }
+            }
+        }
+    }
+
+    /// `V` — switch the active selection to linewise. The anchor and
+    /// head still point at chars; the renderer expands them to whole
+    /// lines.
+    pub fn enter_visual_line(&mut self) {
+        if let Some(sel) = self.text_selection.as_mut() {
+            sel.mode = SelMode::Linewise;
+        } else {
+            self.enter_visual();
+            if let Some(sel) = self.text_selection.as_mut() {
+                sel.mode = SelMode::Linewise;
+            }
+        }
+    }
+
+    /// `<C-v>` — visual-block (rectangular). Reserved field on
+    /// `TextSelection`; renderer is char-rectangle (per-line slice
+    /// from the leftmost selected column to the rightmost on each
+    /// row covered by the selection).
+    pub fn enter_visual_block(&mut self) {
+        if let Some(sel) = self.text_selection.as_mut() {
+            sel.mode = SelMode::Blockwise;
+        } else {
+            self.enter_visual();
+            if let Some(sel) = self.text_selection.as_mut() {
+                sel.mode = SelMode::Blockwise;
+            }
         }
     }
 

@@ -32,6 +32,7 @@ use crate::compose::{fill_rect_blend, norm_to_pixels, outline_rect};
 use crate::dark;
 use crate::highlight::{rgb_from_hex, Rect01, HIGHLIGHT_COLORS};
 use crate::pdf;
+use crate::textlayout::SelMode;
 
 /// Cap on `fit_width_px`. At extreme zoom on a 4K terminal
 /// `viewport_w * zoom` runs into the tens of thousands; pdfium
@@ -394,16 +395,116 @@ fn draw_selection_overlay(f: &mut ratatui::Frame, app: &App<'_>, img_area: Rect)
     let (lo, hi) = sel.ordered();
     for page_idx in lo.page..=hi.page {
         let Some(pt) = app.text_cache.get(page_idx) else { continue };
-        let start = if page_idx == lo.page { lo.idx } else { 0 };
-        let end = if page_idx == hi.page {
+        // Charwise: the selection is the inclusive char range
+        //   [start, end] within the page.
+        // Linewise: extend to whole lines (start = first char of
+        //   start's line, end = last char of end's line).
+        // Blockwise: same span but the renderer below intersects per-
+        //   line with a column band [min_x, max_x].
+        let mut start = if page_idx == lo.page { lo.idx } else { 0 };
+        let mut end = if page_idx == hi.page {
             hi.idx
         } else {
             pt.chars.len().saturating_sub(1)
         };
-        let rects = pt.range_to_rects(start, end);
+        if matches!(sel.mode, SelMode::Linewise) {
+            if let Some(line) = pt.line_of(start) {
+                if let Some(s) = pt.line_start(line) { start = s; }
+            }
+            if let Some(line) = pt.line_of(end) {
+                if let Some(e) = pt.line_end(line) { end = e; }
+            }
+        }
+
+        let rects = if matches!(sel.mode, SelMode::Blockwise) {
+            blockwise_rects(pt, lo, hi, page_idx)
+        } else {
+            pt.range_to_rects(start, end)
+        };
         for r01 in rects {
             paint_rect_cells(f, app, img_area, page_idx, r01, style);
         }
+    }
+
+    // Caret cursor at the head, painted with a thicker fg so the user
+    // knows where motions are anchored.
+    if let Some(pt) = app.text_cache.get(sel.head.page) {
+        if let Some(cell) = pt.chars.get(sel.head.idx) {
+            let caret_style = Style::default()
+                .fg(Color::Rgb(255, 255, 255))
+                .bg(Color::Rgb(r, g, b))
+                .add_modifier(Modifier::BOLD);
+            paint_rect_cells(f, app, img_area, sel.head.page, cell.bbox, caret_style);
+        }
+    }
+}
+
+/// Compute per-line rects for visual-block selection: a rectangular
+/// range from `min_col_x` to `max_col_x` (in normalised PDF page x)
+/// intersected with each visual line covered by the selection.
+fn blockwise_rects(
+    pt: &crate::textlayout::PageText,
+    lo: crate::textlayout::Caret,
+    hi: crate::textlayout::Caret,
+    page_idx: usize,
+) -> Vec<Rect01> {
+    let lo_idx = if page_idx == lo.page { lo.idx } else { 0 };
+    let hi_idx = if page_idx == hi.page {
+        hi.idx
+    } else {
+        pt.chars.len().saturating_sub(1)
+    };
+    if pt.chars.is_empty() {
+        return Vec::new();
+    }
+    let (lo_idx, hi_idx) = (lo_idx.min(hi_idx), lo_idx.max(hi_idx));
+    let line_lo = pt.chars[lo_idx].line;
+    let line_hi = pt.chars[hi_idx].line;
+    // Column band defined by the lo and hi carets' x positions.
+    let lo_x = pt.chars[lo_idx].bbox.x;
+    let hi_x = pt.chars[hi_idx].bbox.x + pt.chars[hi_idx].bbox.w;
+    let (xa, xb) = if lo_x <= hi_x { (lo_x, hi_x) } else { (hi_x, lo_x) };
+
+    let mut out = Vec::new();
+    for line_idx in line_lo..=line_hi {
+        let span = match pt.lines.get(line_idx) {
+            Some(s) => s,
+            None => continue,
+        };
+        // Build a rect from chars on this line whose x falls inside [xa, xb].
+        let mut rect: Option<Rect01> = None;
+        for i in span.start_idx..=span.end_idx {
+            let c = &pt.chars[i];
+            if c.line != line_idx {
+                continue;
+            }
+            let cx_lo = c.bbox.x;
+            let cx_hi = c.bbox.x + c.bbox.w;
+            if cx_hi < xa || cx_lo > xb {
+                continue;
+            }
+            rect = Some(match rect {
+                Some(prev) => union_rect_pub(prev, c.bbox),
+                None => c.bbox,
+            });
+        }
+        if let Some(r) = rect {
+            out.push(r);
+        }
+    }
+    out
+}
+
+fn union_rect_pub(a: Rect01, b: Rect01) -> Rect01 {
+    let x0 = a.x.min(b.x);
+    let y0 = a.y.min(b.y);
+    let x1 = (a.x + a.w).max(b.x + b.w);
+    let y1 = (a.y + a.h).max(b.y + b.h);
+    Rect01 {
+        x: x0,
+        y: y0,
+        w: (x1 - x0).max(0.0),
+        h: (y1 - y0).max(0.0),
     }
 }
 
@@ -602,9 +703,15 @@ fn draw_help(f: &mut Frame, area: Rect) {
         "  + / - / 0              zoom in / out / reset",
         "  d                      toggle dark mode (luminance-only)",
         "",
-        "  v                      enter Visual mode (keyboard highlight)",
-        "    hjkl / arrows        move selection",
-        "    HJKL / Shift+arrows  resize selection",
+        "  v                      enter Visual mode (text caret)",
+        "    h j k l              move caret by char / line",
+        "    w / b / e            next / prev word start / word end",
+        "    0 / ^ / $            line start / first non-blank / line end",
+        "    gg / G               first / last char on this page",
+        "    f<c> / F<c>          jump to next/prev <c> on this line",
+        "    iw / is / ip         select inner word / sentence / paragraph",
+        "    V                    switch to linewise selection",
+        "    Ctrl-v               switch to blockwise (rectangular)",
         "    c                    cycle highlight color",
         "    y / Enter            save highlight + copy text to clipboard",
         "    Y                    copy text to clipboard (no highlight)",
