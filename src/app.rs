@@ -126,6 +126,13 @@ pub struct App<'doc> {
     /// holds the per-page char geometry these carets reference.
     pub text_selection: Option<TextSelection>,
     pub selection_color_idx: usize,
+    /// True while the user is positioning the caret BEFORE growing a
+    /// selection. In this mode each motion moves both `anchor` and
+    /// `head` together so the band stays a single char (placement,
+    /// not selection). Pressing `v` again toggles to selection mode:
+    /// anchor locks and motions only move `head`. Toggle back with
+    /// `v` if the user wants to relocate the start point.
+    pub selection_placement: bool,
     /// Per-page text-layout cache, lazily populated when the user
     /// enters Visual mode or starts a mouse drag. LRU-evicted along
     /// with the page bitmap cache.
@@ -317,6 +324,7 @@ impl<'doc> App<'doc> {
             last_layout_key: None,
             text_selection: None,
             selection_color_idx: 0,
+            selection_placement: false,
             text_cache: TextCache::default(),
             mouse_dragging: false,
             picker,
@@ -570,6 +578,7 @@ impl<'doc> App<'doc> {
             crate::textlayout::SelMode::Linewise => 2,
             crate::textlayout::SelMode::Blockwise => 3,
         });
+        mix(if self.selection_placement { 1 } else { 0 });
         // Distinguish "no selection" (0) from any real selection by
         // forcing the low bit on. Real signatures are always odd.
         h | 1
@@ -595,6 +604,7 @@ impl<'doc> App<'doc> {
             crate::textlayout::SelMode::Linewise => 2,
             crate::textlayout::SelMode::Blockwise => 3,
         });
+        mix(if self.selection_placement { 1 } else { 0 });
         h | 1
     }
 
@@ -801,8 +811,35 @@ impl<'doc> App<'doc> {
         let caret = Caret { page, idx };
         self.text_selection = Some(TextSelection::new(caret));
         self.mode = Mode::Visual;
+        self.selection_placement = true;
         self.pending.clear();
-        self.status = "VISUAL — drag to select · y save+copy · Y copy · c color · Esc".into();
+        self.status = "VISUAL · placement — hjkl moves caret · v starts selection · Esc cancels".into();
+    }
+
+    /// Toggle between placement (caret moves freely, anchor follows
+    /// head) and selection (anchor locked, motions grow the band).
+    /// `v` in Visual mode runs this; entering Visual via `v` from
+    /// Normal starts in placement so the user can position before
+    /// committing to a selection.
+    pub fn toggle_selection_placement(&mut self) {
+        if self.mode != Mode::Visual { return }
+        self.selection_placement = !self.selection_placement;
+        self.status = if self.selection_placement {
+            "VISUAL · placement — hjkl moves caret · v starts selection · Esc cancels".into()
+        } else {
+            "VISUAL · selecting — y save · Y copy · c color · v relocate anchor · Esc".into()
+        };
+        self.invalidate_compose();
+    }
+
+    /// If we're in placement mode, sync the anchor to wherever the
+    /// head just landed so motions move both together (i.e. no band
+    /// growth). Called after every caret-motion in `keys::visual_keys`.
+    pub fn sync_anchor_to_head_if_placing(&mut self) {
+        if !self.selection_placement { return }
+        if let Some(sel) = self.text_selection.as_mut() {
+            sel.anchor = sel.head;
+        }
     }
 
 
@@ -845,6 +882,7 @@ impl<'doc> App<'doc> {
     pub fn exit_visual(&mut self) {
         self.text_selection = None;
         self.mouse_dragging = false;
+        self.selection_placement = false;
         self.mode = Mode::Normal;
         self.status.clear();
         // Clear leftover pending-key bytes (e.g. partial `g` from `gg`)
@@ -1517,6 +1555,10 @@ impl<'doc> App<'doc> {
         self.text_selection = Some(TextSelection::new(caret));
         self.mouse_dragging = true;
         self.mode = Mode::Visual;
+        // Mouse drag is an explicit "I'm selecting NOW" gesture; skip
+        // placement mode entirely so the band starts growing from the
+        // very first drag delta.
+        self.selection_placement = false;
         self.status = "Drag to select · release to save · Esc to cancel".into();
     }
 

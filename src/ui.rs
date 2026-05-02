@@ -416,6 +416,7 @@ fn ensure_overlay(app: &mut App<'_>, page_idx: usize, layout: LayoutKey) {
                 sel,
                 pt,
                 app.selection_color_idx,
+                app.selection_placement,
             );
         }
     }
@@ -527,29 +528,36 @@ pub fn bake_selection_into_page(
     sel: crate::textlayout::TextSelection,
     pt: &crate::textlayout::PageText,
     color_idx: usize,
+    placement_mode: bool,
 ) {
     let (lo, hi) = sel.ordered();
     if !(lo.page..=hi.page).contains(&page_idx) {
         return;
     }
-    let mut start = if page_idx == lo.page { lo.idx } else { 0 };
-    let mut end = if page_idx == hi.page {
-        hi.idx
-    } else {
-        pt.chars.len().saturating_sub(1)
-    };
-    if matches!(sel.mode, crate::textlayout::SelMode::Linewise) {
-        if let Some(line) = pt.line_of(start) {
-            if let Some(s) = pt.line_start(line) { start = s; }
+    // In placement mode the user is positioning the caret — don't
+    // paint the (single-char) band fill; it would look like a tiny
+    // yellow blob and falsely suggest text is already selected.
+    // Just draw the caret accent so it looks like a cursor.
+    if !placement_mode {
+        let mut start = if page_idx == lo.page { lo.idx } else { 0 };
+        let mut end = if page_idx == hi.page {
+            hi.idx
+        } else {
+            pt.chars.len().saturating_sub(1)
+        };
+        if matches!(sel.mode, crate::textlayout::SelMode::Linewise) {
+            if let Some(line) = pt.line_of(start) {
+                if let Some(s) = pt.line_start(line) { start = s; }
+            }
+            if let Some(line) = pt.line_of(end) {
+                if let Some(e) = pt.line_end(line) { end = e; }
+            }
         }
-        if let Some(line) = pt.line_of(end) {
-            if let Some(e) = pt.line_end(line) { end = e; }
+        let color = HIGHLIGHT_COLORS[color_idx % HIGHLIGHT_COLORS.len()];
+        for r01 in pt.range_to_rects(start, end) {
+            let rect = norm_to_pixels(r01, img.width(), img.height());
+            fill_rect_blend(img, rect, color.rgb, 0.45);
         }
-    }
-    let color = HIGHLIGHT_COLORS[color_idx % HIGHLIGHT_COLORS.len()];
-    for r01 in pt.range_to_rects(start, end) {
-        let rect = norm_to_pixels(r01, img.width(), img.height());
-        fill_rect_blend(img, rect, color.rgb, 0.45);
     }
     if page_idx == sel.head.page {
         if let Some(c) = pt.chars.get(sel.head.idx) {
@@ -732,8 +740,10 @@ pub fn help_overlay_lines() -> Vec<&'static str> {
         "  + / - / 0              zoom in / out / reset",
         "  d                      toggle dark mode (luminance-only)",
         "",
-        "  v                      enter Visual mode (text caret)",
-        "    h j k l              move caret by char / line",
+        "  v                      Visual mode — placement first (caret moves freely)",
+        "    h j k l              move caret by char / line (no selection yet)",
+        "    v  again             lock anchor → motions now grow the selection",
+        "    v  third time        unlock anchor → caret moves freely again",
         "    w / b / e            next / prev word start / word end",
         "    0 / ^ / $            line start / first non-blank / line end",
         "    gg / G               first / last char on this page",
@@ -852,7 +862,7 @@ mod tests {
             mode: SelMode::Charwise,
         };
 
-        bake_selection_into_page(&mut img, 0, sel, &pt, 0 /* yellow */);
+        bake_selection_into_page(&mut img, 0, sel, &pt, 0 /* yellow */, false);
 
         // Yellow palette colour is (0xff, 0xd5, 0x4f). Blended at 0.45
         // over white gives (255, ~244, ~204) — green channel must
@@ -893,7 +903,7 @@ mod tests {
             mode: SelMode::Charwise,
         };
 
-        bake_selection_into_page(&mut img, 0, sel, &pt, 0);
+        bake_selection_into_page(&mut img, 0, sel, &pt, 0, false);
 
         // Yellow band at 0.45 alpha over white = (255, 244, 204).
         // White-tinted caret over that band at 0.55 alpha + dark
@@ -941,7 +951,7 @@ mod tests {
         };
 
         // Page 0 is outside [5, 5]. Bitmap must come back unchanged.
-        bake_selection_into_page(&mut img, 0, sel, &pt, 0);
+        bake_selection_into_page(&mut img, 0, sel, &pt, 0, false);
         for y in [10, 50, 100, 150, 199] {
             for x in [10, 50, 100, 150, 199] {
                 let p = img.get_pixel(x, y).0;
@@ -952,6 +962,78 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// In placement mode the bake must NOT paint a band fill — the
+    /// user is positioning the caret, not selecting yet. We verify
+    /// the band-area pixels stay white (untouched by `fill_rect_blend`)
+    /// while the caret-area pixels still get the white-tinted accent.
+    /// Without this skip, a single-char "tiny yellow blob" would
+    /// suggest text is already selected.
+    #[test]
+    fn bake_in_placement_mode_paints_caret_but_not_band() {
+        use image::{Rgba, RgbaImage};
+        let mut img = RgbaImage::from_pixel(200, 200, Rgba([255, 255, 255, 255]));
+        let pt = synthetic_page_text();
+        // anchor == head means placement mode's "caret only" intent.
+        let caret = Caret { page: 0, idx: 2 };
+        let sel = TextSelection { anchor: caret, head: caret, mode: SelMode::Charwise };
+
+        bake_selection_into_page(&mut img, 0, sel, &pt, 0, /*placement=*/ true);
+
+        // Pick a pixel inside the char's bbox but OUTSIDE the caret
+        // accent (which sits centred). The caret's outline+white blend
+        // is one pixel thick on each border + a translucent fill;
+        // even there the colour is not pure yellow. The band fill
+        // alone would tint the whole bbox (255, 244, 204). We assert
+        // there is NO tinted-yellow region anywhere on the bitmap —
+        // i.e. no pixel with that telltale (low-blue, high-green-red)
+        // combo which only fill_rect_blend at the band step produces.
+        let mut yellow_band_pixels = 0;
+        for y in 0..200u32 {
+            for x in 0..200u32 {
+                let p = img.get_pixel(x, y).0;
+                // Yellow band signature: R=255, G≈244, B≈204.
+                if p[0] == 255 && (240..=250).contains(&p[1]) && (200..=220).contains(&p[2]) {
+                    yellow_band_pixels += 1;
+                }
+            }
+        }
+        assert_eq!(
+            yellow_band_pixels, 0,
+            "placement mode should not paint the yellow band fill — \
+             found {yellow_band_pixels} band-tinted pixels"
+        );
+
+        // The caret accent must still be there so the user can see
+        // where their cursor is.
+        let (cx, cy) = center_pixel(pt.chars[2].bbox, 200, 200);
+        let p = img.get_pixel(cx, cy).0;
+        assert!(
+            p[0] >= 250 && p[1] >= 250 && p[2] >= 250,
+            "caret centre should be white-tinted in placement mode, got {p:?}"
+        );
+        // …and at least a few pixels inside the bbox that aren't pure
+        // white — the caret fill (translucent white over the page)
+        // and the outline (gray after the fill blends over it) both
+        // produce sub-255 components.
+        let head = &pt.chars[2].bbox;
+        let x0 = (head.x * 200.0) as u32;
+        let y0 = (head.y * 200.0) as u32;
+        let x1 = ((head.x + head.w) * 200.0) as u32;
+        let y1 = ((head.y + head.h) * 200.0) as u32;
+        let mut non_white = 0;
+        for y in y0..y1.min(200) {
+            for x in x0..x1.min(200) {
+                let p = img.get_pixel(x.min(199), y.min(199)).0;
+                if p[0] != 255 || p[1] != 255 || p[2] != 255 { non_white += 1; }
+            }
+        }
+        assert!(
+            non_white >= 4,
+            "placement mode must still draw the caret accent inside the head's bbox \
+             (found {non_white} non-white pixels)"
+        );
     }
 
     // ---- Resume-marker pure builder ---------------------------------

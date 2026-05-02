@@ -318,10 +318,20 @@ fn visual_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         // than re-entering — the anchor stays put.
         KeyCode::Char('V') => app.enter_visual_line(),
         KeyCode::Char('v') if ctrl => app.enter_visual_block(),
+        // `v` toggles placement vs selection. Entering Visual lands
+        // in placement so the user can position the caret first; the
+        // first `v` here locks the anchor and starts growing the band.
+        // A second `v` reverts to placement so they can relocate.
+        KeyCode::Char('v') => app.toggle_selection_placement(),
 
         _ => {}
     }
     if moved_head {
+        // In placement mode the band must stay collapsed to a single
+        // char — drag the anchor along with the head so both move
+        // together. Once the user presses `v` to lock, this becomes
+        // a no-op and motions grow the selection from the lock point.
+        app.sync_anchor_to_head_if_placing();
         app.scroll_to_head_if_offscreen();
     }
     Ok(())
