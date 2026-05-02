@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use image::DynamicImage;
+use image::{DynamicImage, RgbaImage};
 use pdfium_render::prelude::PdfDocument;
 use ratatui::layout::Rect;
 use ratatui_image::picker::Picker;
@@ -29,6 +29,22 @@ pub enum Mode {
 pub struct LayoutKey {
     pub fit_width_px: u32,
     pub dark: bool,
+}
+
+/// Cache key for the *per-page overlay* tier. The composited
+/// (with-overlays) RgbaImage cached in `overlay_cache` is keyed on
+/// this so a mouse-drag selection only rebuilds the bitmap of the
+/// page the selection lives on — everything else keeps its
+/// already-overlaid copy across frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageOverlayKey {
+    pub layout: LayoutKey,
+    pub highlight_revision: u64,
+    /// `None` unless the active Visual-mode selection lives on
+    /// this page. Encodes (x, y, w, h, color_idx) at 1/10000th
+    /// resolution so f32 rounding doesn't trigger spurious
+    /// rebuilds.
+    pub sel_sig: Option<(u32, u32, u32, u32, usize)>,
 }
 
 /// Cache key for the *compose* tier (stitch visible pages into a
@@ -94,6 +110,12 @@ pub struct App<'doc> {
     /// window evicted around the visible page range so memory stays
     /// bounded on large documents.
     pub page_cache: HashMap<usize, DynamicImage>,
+    /// Per-page bitmap with saved highlights and (if applicable)
+    /// the active selection blended in. Rebuilt on overlay change
+    /// for a single page; everything else stays cached. This is
+    /// what the drag-time hot path reads — without it, every
+    /// mouse-move event re-cloned every visible page.
+    pub overlay_cache: HashMap<usize, (RgbaImage, PageOverlayKey)>,
     pub image_proto: Option<StatefulProtocol>,
     pub last_compose_key: Option<ComposeKey>,
 
@@ -129,7 +151,7 @@ impl<'doc> App<'doc> {
         // Empty layout — first `ensure_image` call builds a real one
         // once the viewport size is known.
         let layout = PageLayout::build(&[], 0, 0);
-        let mut app = Self {
+        let app = Self {
             document,
             path: path.to_path_buf(),
             page_count,
@@ -154,6 +176,7 @@ impl<'doc> App<'doc> {
             drag_anchor: None,
             picker,
             page_cache: HashMap::new(),
+            overlay_cache: HashMap::new(),
             image_proto: None,
             last_compose_key: None,
             highlights,
@@ -212,18 +235,21 @@ impl<'doc> App<'doc> {
         self.scroll_y_px = self.layout.clamp_scroll(self.scroll_y_px, viewport_h_px);
         self.last_layout_key = Some(key);
         self.page_cache.clear();
+        self.overlay_cache.clear();
         self.image_proto = None;
         self.last_compose_key = None;
     }
 
-    /// Drop cached page bitmaps that are far from the visible window.
-    /// Keeps a small prefetch margin on either side so light scroll
-    /// hits the cache instead of re-rendering.
+    /// Drop cached page bitmaps (and their overlay derivatives) that
+    /// are far from the visible window. Keeps a small prefetch
+    /// margin on either side so light scroll hits the cache instead
+    /// of re-rendering.
     pub fn evict_far_pages(&mut self, visible: std::ops::Range<usize>) {
         const MARGIN: usize = 1;
         let lo = visible.start.saturating_sub(MARGIN);
         let hi = visible.end.saturating_add(MARGIN);
         self.page_cache.retain(|&k, _| k >= lo && k < hi);
+        self.overlay_cache.retain(|&k, _| k >= lo && k < hi);
     }
 
     /// Page that contains the viewport center — what the user is

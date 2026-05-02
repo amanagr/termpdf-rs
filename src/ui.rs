@@ -27,11 +27,20 @@ use ratatui::Frame;
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::{Resize, StatefulImage};
 
-use crate::app::{App, ComposeKey, LayoutKey, Mode};
+use crate::app::{App, ComposeKey, LayoutKey, Mode, PageOverlayKey};
 use crate::compose::{fill_rect_blend, norm_to_pixels, outline_rect};
 use crate::dark;
 use crate::highlight::{rgb_from_hex, Rect01, HIGHLIGHT_COLORS};
 use crate::pdf;
+
+/// Cap on `fit_width_px`. At extreme zoom on a 4K terminal
+/// `viewport_w * zoom` runs into the tens of thousands; pdfium
+/// happily produces gigantic pixmaps that stall every render. We
+/// cap the layout width so the bitmap and the layout always agree;
+/// the user just stops gaining sharper pixels beyond the cap (which
+/// is well past the threshold where you'd be reading a single
+/// character per viewport anyway).
+pub const MAX_FIT_WIDTH_PX: u32 = 4096;
 
 pub fn draw(f: &mut Frame, app: &mut App<'_>) {
     let area = f.area();
@@ -85,7 +94,8 @@ fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
     let viewport_h = (area.height as u32) * (cell_h as u32);
     app.viewport_px = (viewport_w, viewport_h);
 
-    let fit_width_px = ((viewport_w as f32) * app.zoom).max(1.0) as u32;
+    let fit_width_px = (((viewport_w as f32) * app.zoom).max(1.0) as u32)
+        .min(MAX_FIT_WIDTH_PX);
     app.ensure_layout(fit_width_px, viewport_h);
 
     let layout_key = LayoutKey {
@@ -136,15 +146,87 @@ fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
         return Ok(());
     }
 
+    // Make sure every visible page has a fresh overlay bitmap before
+    // we stitch them together. Done in a separate loop so the borrow
+    // of `app` stays mutable here, then immutable in compose.
+    for page_idx in visible {
+        ensure_overlay(app, page_idx, layout_key);
+    }
+
     let canvas = compose_viewport(app, viewport_w, viewport_h);
     app.image_proto = Some(app.picker.new_resize_protocol(DynamicImage::ImageRgba8(canvas)));
     app.last_compose_key = Some(compose_key);
     Ok(())
 }
 
-/// Paint the viewport canvas: stitch slices of every visible page
-/// into a single RgbaImage, applying per-page highlight overlays
-/// and the active Visual-mode selection.
+fn page_overlay_key(app: &App<'_>, page_idx: usize, layout: LayoutKey) -> PageOverlayKey {
+    let sel_sig = if app.selection_page == page_idx {
+        app.selection.map(|s| {
+            (
+                (s.x * 10000.0) as u32,
+                (s.y * 10000.0) as u32,
+                (s.w * 10000.0) as u32,
+                (s.h * 10000.0) as u32,
+                app.selection_color_idx,
+            )
+        })
+    } else {
+        None
+    };
+    PageOverlayKey {
+        layout,
+        highlight_revision: app.highlight_revision,
+        sel_sig,
+    }
+}
+
+/// Build (or refresh) the cached overlay bitmap for `page_idx`. The
+/// overlay bitmap is the raw pdfium output with saved highlights
+/// for this page alpha-blended in, plus the Visual-mode selection
+/// if it currently lives on this page. During a mouse-drag this
+/// runs only for the page under the cursor — every other visible
+/// page reuses its already-overlaid bitmap.
+fn ensure_overlay(app: &mut App<'_>, page_idx: usize, layout: LayoutKey) {
+    let key = page_overlay_key(app, page_idx, layout);
+    if app
+        .overlay_cache
+        .get(&page_idx)
+        .map(|(_, k)| *k == key)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let Some(src) = app.page_cache.get(&page_idx) else {
+        return;
+    };
+    let mut img = src.to_rgba8();
+
+    // Saved highlights for this page → translucent fill, no border.
+    for h in app.highlights.for_page(page_idx) {
+        let rect = norm_to_pixels(
+            Rect01 { x: h.x, y: h.y, w: h.w, h: h.h },
+            img.width(),
+            img.height(),
+        );
+        let rgb = rgb_from_hex(&h.color);
+        fill_rect_blend(&mut img, rect, rgb, 0.35);
+    }
+    // Active Visual-mode selection if it lives on this page.
+    if app.selection_page == page_idx {
+        if let Some(sel) = app.selection {
+            let rect = norm_to_pixels(sel, img.width(), img.height());
+            let color = HIGHLIGHT_COLORS[app.selection_color_idx % HIGHLIGHT_COLORS.len()];
+            fill_rect_blend(&mut img, rect, color.rgb, 0.30);
+            outline_rect(&mut img, rect, color.rgb, 2);
+        }
+    }
+
+    app.overlay_cache.insert(page_idx, (img, key));
+}
+
+/// Paint the viewport canvas: stitch the cached overlay bitmap of
+/// every visible page into a single RgbaImage. No per-page
+/// allocation here — `ensure_overlay` did that work above.
 fn compose_viewport(app: &App<'_>, viewport_w: u32, viewport_h: u32) -> RgbaImage {
     // Background colour matches the page background so the inter-
     // page gap looks intentional rather than like a render error.
@@ -157,7 +239,6 @@ fn compose_viewport(app: &App<'_>, viewport_w: u32, viewport_h: u32) -> RgbaImag
         return canvas;
     }
 
-    // Horizontal positioning of the page strip in the viewport.
     let page_x_origin: i64 = if fit_width_px <= viewport_w {
         ((viewport_w - fit_width_px) / 2) as i64
     } else {
@@ -165,56 +246,29 @@ fn compose_viewport(app: &App<'_>, viewport_w: u32, viewport_h: u32) -> RgbaImag
     };
 
     for page_idx in visible {
-        let Some(page_img) = app.page_cache.get(&page_idx) else {
+        let Some((page_img, _)) = app.overlay_cache.get(&page_idx) else {
             continue;
         };
-        let mut page_rgba = page_img.to_rgba8();
-
-        // Saved highlights for this page → translucent fill, no border.
-        for h in app.highlights.for_page(page_idx) {
-            let rect = norm_to_pixels(
-                Rect01 { x: h.x, y: h.y, w: h.w, h: h.h },
-                page_rgba.width(),
-                page_rgba.height(),
-            );
-            let rgb = rgb_from_hex(&h.color);
-            fill_rect_blend(&mut page_rgba, rect, rgb, 0.35);
-        }
-        // Active Visual-mode selection if it lives on this page.
-        if let Some(sel) = app.selection {
-            if app.selection_page == page_idx {
-                let rect = norm_to_pixels(sel, page_rgba.width(), page_rgba.height());
-                let color = HIGHLIGHT_COLORS[app.selection_color_idx % HIGHLIGHT_COLORS.len()];
-                fill_rect_blend(&mut page_rgba, rect, color.rgb, 0.30);
-                outline_rect(&mut page_rgba, rect, color.rgb, 2);
-            }
-        }
-
-        // Position of this page within the viewport.
         let page_doc_y = app.layout.page_y(page_idx);
         let page_y_in_viewport = page_doc_y - app.scroll_y_px;
-        blit_clipped(
-            &mut canvas,
-            page_x_origin,
-            page_y_in_viewport,
-            &page_rgba,
-        );
+        blit_clipped(&mut canvas, page_x_origin, page_y_in_viewport, page_img);
     }
 
     canvas
 }
 
 /// Blit `src` onto `dst` at position `(dst_x, dst_y)`, clipping to
-/// the destination's bounds. Coordinates are signed so a partially
-/// off-screen src (top of first visible page above the viewport,
-/// for example) just gets clipped instead of panicking.
+/// the destination's bounds. Row-wise `copy_from_slice` over the
+/// raw RGBA buffer; `image::imageops::overlay` would do alpha
+/// blending we don't need (overlay bitmaps are opaque). Coordinates
+/// are signed so a partially off-screen src (top of first visible
+/// page above the viewport) is clipped instead of panicking.
 fn blit_clipped(dst: &mut RgbaImage, dst_x: i64, dst_y: i64, src: &RgbaImage) {
     let dw = dst.width() as i64;
     let dh = dst.height() as i64;
     let sw = src.width() as i64;
     let sh = src.height() as i64;
 
-    // Source rect: figure out which portion of `src` lands inside dst.
     let sx0 = (-dst_x).max(0);
     let sy0 = (-dst_y).max(0);
     let sx1 = (dw - dst_x).min(sw);
@@ -223,13 +277,18 @@ fn blit_clipped(dst: &mut RgbaImage, dst_x: i64, dst_y: i64, src: &RgbaImage) {
         return;
     }
 
+    let dst_w = dst.width() as usize;
+    let src_w = src.width() as usize;
+    let row_bytes = ((sx1 - sx0) as usize) * 4;
+    let dst_buf = dst.as_mut();
+    let src_buf = src.as_raw();
     for sy in sy0..sy1 {
-        for sx in sx0..sx1 {
-            let sp = src.get_pixel(sx as u32, sy as u32);
-            let dx = (dst_x + sx) as u32;
-            let dy = (dst_y + sy) as u32;
-            dst.put_pixel(dx, dy, *sp);
-        }
+        let src_off = (sy as usize) * src_w * 4 + (sx0 as usize) * 4;
+        let dst_y_row = (dst_y + sy) as usize;
+        let dst_x_off = (dst_x + sx0) as usize;
+        let dst_off = dst_y_row * dst_w * 4 + dst_x_off * 4;
+        dst_buf[dst_off..dst_off + row_bytes]
+            .copy_from_slice(&src_buf[src_off..src_off + row_bytes]);
     }
 }
 
