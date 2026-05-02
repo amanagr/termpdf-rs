@@ -463,52 +463,20 @@ impl<'doc> App<'doc> {
     /// `(page_idx, normalised_x_in_page, normalised_y_in_page)`.
     /// Returns `None` if the cell is outside the image area or below
     /// the last page (i.e. inside an inter-page gap or the empty
-    /// area past the doc end).
+    /// area past the doc end). Thin wrapper over `cell_to_page_coord_pure`
+    /// — the pure version is what unit tests exercise.
     pub fn cell_to_page_coord(&self, col: u16, row: u16) -> Option<(usize, f32, f32)> {
-        let area = self.image_area;
-        if col < area.x || row < area.y {
-            return None;
-        }
-        let local_col = col - area.x;
-        let local_row = row - area.y;
-        if local_col >= area.width || local_row >= area.height {
-            return None;
-        }
-        let (cell_w, cell_h) = self.cell_size_px;
-        let viewport_x = local_col as i64 * cell_w as i64;
-        let viewport_y = local_row as i64 * cell_h as i64;
-
-        let (vw, _) = self.viewport_px;
-        let fw = self.layout.fit_width_px;
-        // X offset of the rendered page strip within the viewport.
-        let page_x_origin: i64 = if fw <= vw {
-            ((vw - fw) / 2) as i64
-        } else {
-            -(((fw - vw) as f32) * self.scroll_x).round() as i64
-        };
-        let page_x = viewport_x - page_x_origin;
-        if page_x < 0 || page_x >= fw as i64 {
-            return None;
-        }
-
-        let doc_y = self.scroll_y_px + viewport_y;
-        let page_idx = self.layout.page_at(doc_y);
-        if page_idx >= self.page_count {
-            return None;
-        }
-        let page_top = self.layout.page_y(page_idx);
-        let page_h = self.layout.page_h(page_idx);
-        if page_h == 0 {
-            return None;
-        }
-        let local_y = doc_y - page_top;
-        if local_y < 0 || local_y >= page_h as i64 {
-            // Inside an inter-page gap.
-            return None;
-        }
-        let nx = (page_x as f32 / fw as f32).clamp(0.0, 1.0);
-        let ny = (local_y as f32 / page_h as f32).clamp(0.0, 1.0);
-        Some((page_idx, nx, ny))
+        cell_to_page_coord_pure(
+            col,
+            row,
+            self.image_area,
+            self.cell_size_px,
+            self.viewport_px,
+            self.scroll_x,
+            self.scroll_y_px,
+            &self.layout,
+            self.page_count,
+        )
     }
 
     /// Begin a mouse-drag highlight at `(col, row)`. Switches into
@@ -591,6 +559,63 @@ pub fn layout_gap_px() -> u32 {
     8
 }
 
+/// Pure version of `App::cell_to_page_coord`, extracted so the
+/// many branches of the mouse-coord transform can be unit-tested
+/// without constructing a `PdfDocument`.
+pub fn cell_to_page_coord_pure(
+    col: u16,
+    row: u16,
+    image_area: Rect,
+    cell_size_px: (u16, u16),
+    viewport_px: (u32, u32),
+    scroll_x: f32,
+    scroll_y_px: i64,
+    layout: &PageLayout,
+    page_count: usize,
+) -> Option<(usize, f32, f32)> {
+    if col < image_area.x || row < image_area.y {
+        return None;
+    }
+    let local_col = col - image_area.x;
+    let local_row = row - image_area.y;
+    if local_col >= image_area.width || local_row >= image_area.height {
+        return None;
+    }
+    let (cell_w, cell_h) = cell_size_px;
+    let viewport_x = local_col as i64 * cell_w as i64;
+    let viewport_y = local_row as i64 * cell_h as i64;
+
+    let (vw, _) = viewport_px;
+    let fw = layout.fit_width_px;
+    let page_x_origin: i64 = if fw <= vw {
+        ((vw - fw) / 2) as i64
+    } else {
+        -(((fw - vw) as f32) * scroll_x).round() as i64
+    };
+    let page_x = viewport_x - page_x_origin;
+    if page_x < 0 || page_x >= fw as i64 {
+        return None;
+    }
+
+    let doc_y = scroll_y_px + viewport_y;
+    let page_idx = layout.page_at(doc_y);
+    if page_idx >= page_count {
+        return None;
+    }
+    let page_top = layout.page_y(page_idx);
+    let page_h = layout.page_h(page_idx);
+    if page_h == 0 {
+        return None;
+    }
+    let local_y = doc_y - page_top;
+    if local_y < 0 || local_y >= page_h as i64 {
+        return None;
+    }
+    let nx = (page_x as f32 / fw as f32).clamp(0.0, 1.0);
+    let ny = (local_y as f32 / page_h as f32).clamp(0.0, 1.0);
+    Some((page_idx, nx, ny))
+}
+
 /// Pure helper: compute the new selection rectangle after a Visual
 /// mode hjkl/HJKL keypress. Sliding leaves size fixed; resizing
 /// grows/shrinks from the bottom-right corner. Both modes clamp to
@@ -616,6 +641,104 @@ pub fn nudge_rect(sel: Rect01, dx: f32, dy: f32, resize: bool) -> Rect01 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pdf::PageMetrics;
+
+    fn metrics(n: usize) -> Vec<PageMetrics> {
+        // 100×200pt portrait pages.
+        vec![PageMetrics { width_pts: 100.0, height_pts: 200.0 }; n]
+    }
+
+    fn layout_for(n: usize, fit_width_px: u32) -> PageLayout {
+        PageLayout::build(&metrics(n), fit_width_px, 8)
+    }
+
+    #[test]
+    fn cell_to_page_coord_outside_image_area_is_none() {
+        // image_area at (5,2)..(85,42); cell (4,1) is before x; cell
+        // (90,3) is past width; cell (10,50) is past height.
+        let layout = layout_for(3, 100);
+        let area = Rect { x: 5, y: 2, width: 80, height: 40 };
+        let cell = (10u16, 20u16);
+        assert!(cell_to_page_coord_pure(4, 10, area, cell, (800, 800), 0.0, 0, &layout, 3).is_none());
+        assert!(cell_to_page_coord_pure(10, 1, area, cell, (800, 800), 0.0, 0, &layout, 3).is_none());
+        assert!(cell_to_page_coord_pure(90, 3, area, cell, (800, 800), 0.0, 0, &layout, 3).is_none());
+        assert!(cell_to_page_coord_pure(10, 50, area, cell, (800, 800), 0.0, 0, &layout, 3).is_none());
+    }
+
+    #[test]
+    fn cell_to_page_coord_centered_page_at_zero_zoom_one() {
+        // viewport_w=100, fit_width_px=100 → no centering offset.
+        // image area starts at (0,0) for clean math; cell_size 1×1 px.
+        let layout = layout_for(3, 100);  // page 0 height = 200
+        let area = Rect { x: 0, y: 0, width: 100, height: 200 };
+        let cell_size = (1u16, 1u16);
+        let viewport = (100u32, 200u32);
+
+        // Click at (50, 100) → page 0, nx=0.5, ny=0.5.
+        let r = cell_to_page_coord_pure(50, 100, area, cell_size, viewport, 0.0, 0, &layout, 3);
+        let (p, nx, ny) = r.expect("center hit must land on page 0");
+        assert_eq!(p, 0);
+        assert!((nx - 0.5).abs() < 1e-3);
+        assert!((ny - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn cell_to_page_coord_inside_inter_page_gap_is_none() {
+        // Page 0 ends at y=200; gap [200,208); page 1 starts at 208.
+        let layout = layout_for(3, 100);
+        let area = Rect { x: 0, y: 0, width: 100, height: 250 };
+        let r = cell_to_page_coord_pure(
+            50, 204, area, (1, 1), (100, 250), 0.0, 0, &layout, 3,
+        );
+        assert!(r.is_none(), "click in gap should be None, got {r:?}");
+    }
+
+    #[test]
+    fn cell_to_page_coord_past_end_is_none() {
+        // 3 pages, scrolled past total — click at top of viewport
+        // is past doc end.
+        let layout = layout_for(3, 100);
+        let area = Rect { x: 0, y: 0, width: 100, height: 50 };
+        // Total = 200*3 + 8*2 = 616. Scroll well past it.
+        let r = cell_to_page_coord_pure(
+            50, 0, area, (1, 1), (100, 50), 0.0, 9999, &layout, 3,
+        );
+        assert!(r.is_none(), "past-end click should be None");
+    }
+
+    #[test]
+    fn cell_to_page_coord_horizontal_centering_when_zoomed_out() {
+        // fit_width = 50, viewport_w = 100 → page strip centered with
+        // 25px of bg on each side. A click at viewport_x=10 sits in
+        // the left bg → None. Click at viewport_x=50 (center) → nx=0.5.
+        let layout = layout_for(3, 50);
+        let area = Rect { x: 0, y: 0, width: 100, height: 100 };
+        let viewport = (100u32, 100u32);
+        let cell = (1u16, 1u16);
+
+        let r_bg = cell_to_page_coord_pure(10, 10, area, cell, viewport, 0.0, 0, &layout, 3);
+        assert!(r_bg.is_none(), "click in centering bg must be None");
+
+        let r = cell_to_page_coord_pure(50, 10, area, cell, viewport, 0.0, 0, &layout, 3);
+        let (_, nx, _) = r.expect("center click must hit page 0");
+        assert!((nx - 0.5).abs() < 1e-2, "nx was {nx}");
+    }
+
+    #[test]
+    fn cell_to_page_coord_horizontal_scroll_when_zoomed_in() {
+        // fit_width=200, viewport_w=100 → 100px of horizontal
+        // overflow. scroll_x=0.5 → page strip starts at viewport_x=-50.
+        // Click at viewport_x=50 → page_x = 50 - (-50) = 100; fw=200
+        // → nx = 0.5.
+        let layout = layout_for(3, 200);
+        let area = Rect { x: 0, y: 0, width: 100, height: 200 };
+        let viewport = (100u32, 200u32);
+        let cell = (1u16, 1u16);
+
+        let r = cell_to_page_coord_pure(50, 100, area, cell, viewport, 0.5, 0, &layout, 3);
+        let (_, nx, _) = r.expect("center click must hit page 0");
+        assert!((nx - 0.5).abs() < 1e-2, "nx was {nx}");
+    }
 
     #[test]
     fn nudge_rect_slides_within_bounds() {

@@ -214,7 +214,7 @@ pub fn dispatch_mouse(app: &mut App<'_>, m: MouseEvent) -> Result<()> {
     Ok(())
 }
 
-fn parse_count(pending: &str) -> Option<usize> {
+pub fn parse_count(pending: &str) -> Option<usize> {
     if pending.is_empty() {
         return None;
     }
@@ -223,4 +223,38 @@ fn parse_count(pending: &str) -> Option<usize> {
         return None;
     }
     digits.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_count;
+
+    #[test]
+    fn parse_count_empty_is_none() {
+        assert_eq!(parse_count(""), None);
+    }
+
+    #[test]
+    fn parse_count_digits_only() {
+        assert_eq!(parse_count("42"), Some(42));
+    }
+
+    #[test]
+    fn parse_count_pure_letters_is_none() {
+        // `gg` first-stroke buffers a 'g'; parse_count must say "no count".
+        assert_eq!(parse_count("g"), None);
+    }
+
+    #[test]
+    fn parse_count_strips_letters_around_digits() {
+        // `5g` (illegal sequence today, but make the filter contract
+        // explicit so future refactors don't drift): the digits are
+        // extracted, letters dropped.
+        assert_eq!(parse_count("5g"), Some(5));
+    }
+
+    #[test]
+    fn parse_count_overflow_is_none() {
+        assert_eq!(parse_count("999999999999999999999"), None);
+    }
 }
