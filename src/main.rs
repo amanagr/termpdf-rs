@@ -20,6 +20,7 @@ mod compose;
 mod dark;
 mod highlight;
 mod keys;
+mod layout;
 mod pdf;
 mod session;
 mod ui;
@@ -143,12 +144,11 @@ fn probe(
     out: &std::path::Path,
 ) -> Result<()> {
     use ratatui::layout::Rect;
-    // `halfblocks()` is the only Picker constructor that doesn't query
-    // the terminal. We don't actually render with it — we just need the
-    // font_size for pdfium's pixel-target math. (10×20 px per cell.)
     let picker = Picker::halfblocks();
     let area = Rect { x: 0, y: 0, width: 80, height: 40 };
-    let img = pdf::render_page(document, page, area, &picker, zoom)?;
+    let (cell_w, _cell_h) = picker.font_size();
+    let target_w = (((area.width as u32) * (cell_w as u32)) as f32 * zoom) as u32;
+    let img = pdf::render_page_at_width(document, page, target_w.max(1))?;
     let img = if dark {
         image::DynamicImage::ImageRgba8(dark::invert_luminance(&img))
     } else {
@@ -179,7 +179,7 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
         if event::poll(Duration::from_millis(250))? {
             match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => keys::dispatch(app, k)?,
-                Event::Resize(_, _) => app.invalidate(),
+                Event::Resize(_, _) => app.invalidate_compose(),
                 Event::Mouse(m) => keys::dispatch_mouse(app, m)?,
                 _ => {}
             }

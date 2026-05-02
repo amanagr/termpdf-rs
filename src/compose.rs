@@ -22,6 +22,11 @@ pub fn norm_to_pixels(r: Rect01, w: u32, h: u32) -> (u32, u32, u32, u32) {
 /// the visible viewport out of a full-size pixmap. `scroll_*` is in
 /// 0..=1; the result is clamped so scroll values just outside the
 /// range still yield a valid crop.
+///
+/// Reserved for the per-page crop fast-path (a future zoom-aware
+/// optimisation) and exercised by unit tests; current continuous
+/// renderer uses `blit_clipped` instead.
+#[allow(dead_code)]
 pub fn crop_rect(
     full_w: u32,
     full_h: u32,

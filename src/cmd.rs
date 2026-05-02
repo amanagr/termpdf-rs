@@ -25,11 +25,11 @@ pub fn execute(app: &mut App<'_>, line: &str) {
                 match opt {
                     "dark" => {
                         app.dark = true;
-                        app.invalidate();
+                        app.invalidate_compose();
                     }
                     "nodark" => {
                         app.dark = false;
-                        app.invalidate();
+                        app.invalidate_compose();
                     }
                     _ => app.status = format!("unknown :set option: {opt}"),
                 }

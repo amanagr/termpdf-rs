@@ -1,32 +1,28 @@
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 use crate::app::{App, Mode};
 use crate::cmd;
 
-/// Step sizes (fraction of a screen / page) for scrolling and
-/// selection moves. Tuned for "feels responsive but not jumpy".
-const SCROLL_STEP: f32 = 0.10;
+/// Step sizes. Scroll steps are in fractions of a viewport screen
+/// (continuous mode operates in pixels under the hood, but the UX
+/// is "how much of a screen does this key move me").
+const SCROLL_LINE: f32 = 0.05;
 const SCROLL_HALF: f32 = 0.50;
 const SELECTION_STEP: f32 = 0.02;
 
 pub fn dispatch(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
     if app.show_help {
-        // In help-overlay mode any key (Esc, q, ?) just dismisses it.
         if matches!(
             k.code,
             KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q')
         ) {
             app.show_help = false;
-            // The kitty-graphics protocol writes a row's full escape
-            // sequence into the first cell of each image row and marks
-            // every other cell `set_skip(true)`. When the help overlay
-            // drew text over those skip-cells, ratatui's diff engine
-            // never repaints them on the next frame (skip=true == "don't
-            // emit"), so help-text glyphs stay until the next page flip.
-            // Invalidating forces a full re-encode → fresh transmit
-            // sequence → the terminal repaints the entire image area.
-            app.invalidate();
+            // Force a full re-encode so the kitty-graphics skip-cells
+            // covered by the popup get repainted.
+            app.invalidate_compose();
         }
         return Ok(());
     }
@@ -47,39 +43,31 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('?') => app.show_help = !app.show_help,
 
-        // Page navigation. Space falls through to scroll-then-page so
-        // you can scroll a tall page and roll into the next one with
-        // the same key, the way zathura/evince behave.
+        // Page-boundary jumps.
         KeyCode::Char('j') => {
             app.next_page(count.unwrap_or(1));
             app.pending.clear();
         }
-        KeyCode::Char('k') | KeyCode::Char('b') => {
+        KeyCode::Char('k') => {
             app.prev_page(count.unwrap_or(1));
             app.pending.clear();
         }
-        KeyCode::Char(' ') => {
-            // Scroll one screen; if already at bottom, advance page.
-            let before = app.scroll_y;
-            app.scroll_by(0.0, SCROLL_HALF);
-            if (app.scroll_y - before).abs() < f32::EPSILON {
-                app.next_page(1);
-            }
-        }
+        KeyCode::Char('b') => app.prev_page(count.unwrap_or(1)),
+        KeyCode::Char(' ') => app.scroll_by_screens(SCROLL_HALF),
 
-        // Within-page scroll. Arrows for fine, Ctrl-d/u for half-page.
-        KeyCode::Down => app.scroll_by(0.0, SCROLL_STEP),
-        KeyCode::Up => app.scroll_by(0.0, -SCROLL_STEP),
-        KeyCode::Left => app.scroll_by(-SCROLL_STEP, 0.0),
-        KeyCode::Right => app.scroll_by(SCROLL_STEP, 0.0),
-        KeyCode::Char('d') if ctrl => app.scroll_by(0.0, SCROLL_HALF),
-        KeyCode::Char('u') if ctrl => app.scroll_by(0.0, -SCROLL_HALF),
+        // Within-document scroll. Arrows for fine; Ctrl-d/u for
+        // half-screen jumps.
+        KeyCode::Down => app.scroll_by_screens(SCROLL_LINE),
+        KeyCode::Up => app.scroll_by_screens(-SCROLL_LINE),
+        KeyCode::Left => app.scroll_x_by(-SCROLL_LINE),
+        KeyCode::Right => app.scroll_x_by(SCROLL_LINE),
+        KeyCode::Char('d') if ctrl => app.scroll_by_screens(SCROLL_HALF),
+        KeyCode::Char('u') if ctrl => app.scroll_by_screens(-SCROLL_HALF),
+        KeyCode::Char('h') if !ctrl => app.scroll_x_by(-SCROLL_LINE),
+        KeyCode::Char('l') if !ctrl => app.scroll_x_by(SCROLL_LINE),
         KeyCode::Char('d') => app.toggle_dark(),
-        KeyCode::Char('h') if !ctrl => app.scroll_by(-SCROLL_STEP, 0.0),
-        KeyCode::Char('l') if !ctrl => app.scroll_by(SCROLL_STEP, 0.0),
 
         KeyCode::Char('g') => {
-            // `gg` jumps to first page. The first 'g' just buffers.
             if app.pending == "g" {
                 app.first_page();
                 app.pending.clear();
@@ -88,7 +76,6 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
             }
         }
         KeyCode::Char('G') => {
-            // Bare `G` → last page. With a count prefix, `23G` → 23.
             match count {
                 Some(n) => app.goto_page(n.saturating_sub(1)),
                 None => app.last_page(),
@@ -96,9 +83,6 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
             app.pending.clear();
         }
 
-        // `0` is overloaded vim-style: it's a count digit when
-        // something's already in `pending`, otherwise it's "fit-page"
-        // (zoom = 1.0, scroll reset). Keep it before the 1-9 catchall.
         KeyCode::Char('0') => {
             if app.pending.is_empty() {
                 app.zoom_reset();
@@ -111,9 +95,8 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         KeyCode::Char('+') | KeyCode::Char('=') => app.zoom_by(1.25),
         KeyCode::Char('-') => app.zoom_by(1.0 / 1.25),
 
-        // Highlight management.
         KeyCode::Char('x') => {
-            if app.delete_last_highlight() {
+            if app.delete_last_highlight_on_current_page() {
                 app.status = "removed last highlight on this page".into();
             } else {
                 app.status = "no highlights on this page".into();
@@ -169,10 +152,6 @@ fn visual_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         KeyCode::Char('y') | KeyCode::Enter => app.save_selection(),
         KeyCode::Char('c') => app.cycle_color(),
 
-        // hjkl moves the rectangle; uppercase HJKL resizes from the
-        // bottom-right corner. Crossterm reports the shifted form as
-        // `Char('H')` *and* sets the SHIFT modifier — we match on the
-        // uppercase code so terminals that normalise either way work.
         KeyCode::Char('h') => app.nudge_selection(-SELECTION_STEP, 0.0, false),
         KeyCode::Char('l') => app.nudge_selection(SELECTION_STEP, 0.0, false),
         KeyCode::Char('j') => app.nudge_selection(0.0, SELECTION_STEP, false),
@@ -182,8 +161,6 @@ fn visual_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         KeyCode::Char('J') => app.nudge_selection(0.0, SELECTION_STEP, true),
         KeyCode::Char('K') => app.nudge_selection(0.0, -SELECTION_STEP, true),
 
-        // Arrow keys mirror hjkl for users who haven't internalised
-        // the vim variants yet. Shift+arrow = resize.
         KeyCode::Left => app.nudge_selection(-SELECTION_STEP, 0.0, shift),
         KeyCode::Right => app.nudge_selection(SELECTION_STEP, 0.0, shift),
         KeyCode::Up => app.nudge_selection(0.0, -SELECTION_STEP, shift),
@@ -194,8 +171,6 @@ fn visual_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
 }
 
 fn search_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
-    // v0.1: collect the query but don't actually search yet. Pdfium's
-    // text-extract API lands in v0.2.
     match k.code {
         KeyCode::Esc | KeyCode::Enter => {
             if matches!(k.code, KeyCode::Enter) && !app.cmd_buffer.is_empty() {
@@ -214,16 +189,23 @@ fn search_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
 }
 
 pub fn dispatch_mouse(app: &mut App<'_>, m: MouseEvent) -> Result<()> {
-    // Mouse wheel scrolls the zoomed page. Shift+wheel scrolls
-    // horizontally — same convention as most browsers / GUIs.
     let shift = m.modifiers.contains(KeyModifiers::SHIFT);
     match m.kind {
-        MouseEventKind::ScrollDown if shift => app.scroll_by(SCROLL_STEP, 0.0),
-        MouseEventKind::ScrollUp if shift => app.scroll_by(-SCROLL_STEP, 0.0),
-        MouseEventKind::ScrollDown => app.scroll_by(0.0, SCROLL_STEP),
-        MouseEventKind::ScrollUp => app.scroll_by(0.0, -SCROLL_STEP),
-        MouseEventKind::ScrollRight => app.scroll_by(SCROLL_STEP, 0.0),
-        MouseEventKind::ScrollLeft => app.scroll_by(-SCROLL_STEP, 0.0),
+        // Wheel always scrolls — it works in any mode, including
+        // Visual, where the user might want to drag past a page edge.
+        MouseEventKind::ScrollDown if shift => app.scroll_x_by(SCROLL_LINE),
+        MouseEventKind::ScrollUp if shift => app.scroll_x_by(-SCROLL_LINE),
+        MouseEventKind::ScrollDown => app.scroll_by_screens(SCROLL_LINE),
+        MouseEventKind::ScrollUp => app.scroll_by_screens(-SCROLL_LINE),
+        MouseEventKind::ScrollRight => app.scroll_x_by(SCROLL_LINE),
+        MouseEventKind::ScrollLeft => app.scroll_x_by(-SCROLL_LINE),
+
+        // Left-click drag = highlight. Click without drag = exit
+        // Visual mode (handled by mouse_drag_end's small-rect path).
+        MouseEventKind::Down(MouseButton::Left) => app.mouse_drag_start(m.column, m.row),
+        MouseEventKind::Drag(MouseButton::Left) => app.mouse_drag_to(m.column, m.row),
+        MouseEventKind::Up(MouseButton::Left) => app.mouse_drag_end(),
+
         _ => {}
     }
     Ok(())
