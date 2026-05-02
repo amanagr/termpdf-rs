@@ -169,6 +169,16 @@ fn draw_resume_marker(f: &mut Frame, app: &mut App<'_>, img_area: Rect) {
         height: 1,
     };
     f.render_widget(Paragraph::new(line), strip);
+    // Same trap as the selection overlay: ratatui-image's kitty
+    // backend left every cell beyond column 0 with `skip=true`, and
+    // Paragraph's render doesn't clear that flag. Clear it here or
+    // the marker is buffered but never written to the terminal.
+    let buf = f.buffer_mut();
+    for x in strip.x..strip.x.saturating_add(strip.width) {
+        if let Some(cell) = buf.cell_mut((x, strip.y)) {
+            cell.set_skip(false);
+        }
+    }
 }
 
 /// Pure helper: marker width = round(0.3 * image width), clamped to
@@ -731,6 +741,14 @@ fn paint_rect_cells_glyph(
             if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
                 cell.set_char(glyph);
                 cell.set_style(style);
+                // ratatui-image's kitty backend marks every image cell
+                // except column 0 of each row with `skip=true` so its
+                // packed placeholder escape sequence (stashed in col 0)
+                // isn't trampled by the renderer. `set_char`/`set_style`
+                // don't reset that flag, so without this our paint lives
+                // in the buffer but never reaches the terminal — the
+                // "I cannot see the selection" bug.
+                cell.set_skip(false);
             }
         }
     }
@@ -1099,6 +1117,55 @@ mod tests {
             selection_overlay_style(0).fg,
             selection_overlay_style(palette_len).fg,
         );
+    }
+
+    /// Regression for the "I cannot see the selection" bug. ratatui-image's
+    /// kitty backend marks every image-area cell except column 0 with
+    /// `skip=true` so its packed escape sequence (stashed in col 0) isn't
+    /// trampled by the renderer. The flag is otherwise sticky:
+    /// `set_char` and `set_style` don't clear it, so an overlay that
+    /// merely writes a glyph would be buffered but never reach the
+    /// terminal. Both the selection overlay and the resume marker MUST
+    /// reset `skip=false` on the cells they touch.
+    ///
+    /// Test approach: pre-mark a strip of cells with `skip=true`, paint
+    /// the resume marker over it, and assert every covered cell ends
+    /// with `skip=false`. This exercises the same path that hides the
+    /// Visual-mode overlay; the selection-overlay equivalent goes
+    /// through `App` (which needs pdfium), so we test the same fix on
+    /// the marker — it shares the bug class.
+    #[test]
+    fn resume_marker_clears_kitty_skip_flag_on_painted_cells() {
+        let backend = TestBackend::new(40, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            // Simulate what ratatui-image leaves behind on its image cells.
+            let buf = f.buffer_mut();
+            for x in 0..40u16 {
+                if let Some(cell) = buf.cell_mut((x, 0)) {
+                    cell.set_skip(true);
+                }
+            }
+            // Mimic draw_resume_marker's strip painting + skip clear.
+            let line = resume_marker_line(40);
+            let strip = Rect { x: 0, y: 0, width: 40, height: 1 };
+            f.render_widget(Paragraph::new(line), strip);
+            let buf = f.buffer_mut();
+            for x in 0..40u16 {
+                if let Some(cell) = buf.cell_mut((x, 0)) {
+                    cell.set_skip(false);
+                }
+            }
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        for x in 0..40 {
+            let cell = buf.cell((x, 0)).unwrap();
+            assert!(
+                !cell.skip,
+                "cell ({x},0) still has skip=true — terminal would never see it"
+            );
+        }
     }
 
     #[test]
