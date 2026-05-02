@@ -46,6 +46,7 @@ pub fn execute(app: &mut App<'_>, line: &str) {
                 app.status = ":goto needs a page number".into();
             }
         }
+        "nohl" | "nohlsearch" => app.clear_search(),
         "help" => app.show_help = true,
         _ => app.status = format!("unknown command: {cmd}"),
     }

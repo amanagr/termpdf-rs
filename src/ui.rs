@@ -173,10 +173,24 @@ fn page_overlay_key(app: &App<'_>, page_idx: usize, layout: LayoutKey) -> PageOv
     } else {
         None
     };
+    let (search_revision, has_search_hits, current_hit_on_this_page) = match &app.search {
+        Some(s) => {
+            let any = s.hits.iter().any(|h| h.page == page_idx);
+            let cur = s
+                .current_hit()
+                .map(|h| h.page == page_idx)
+                .unwrap_or(false);
+            (s.revision, any, cur)
+        }
+        None => (0, false, false),
+    };
     PageOverlayKey {
         layout,
         highlight_revision: app.highlight_revision,
         sel_sig,
+        search_revision,
+        has_search_hits,
+        current_hit_on_this_page,
     }
 }
 
@@ -218,6 +232,21 @@ fn ensure_overlay(app: &mut App<'_>, page_idx: usize, layout: LayoutKey) {
             let color = HIGHLIGHT_COLORS[app.selection_color_idx % HIGHLIGHT_COLORS.len()];
             fill_rect_blend(&mut img, rect, color.rgb, 0.30);
             outline_rect(&mut img, rect, color.rgb, 2);
+        }
+    }
+
+    // Search hits on this page → orange translucent fill; the
+    // current hit additionally gets a thicker outline so the user
+    // can see *which* match `n`/`N` is on without reading the count.
+    if let Some(s) = &app.search {
+        let current_idx = s.current;
+        for (i, hit) in s.hits.iter().enumerate().filter(|(_, h)| h.page == page_idx) {
+            let rect = norm_to_pixels(hit.rect, img.width(), img.height());
+            let color = (255u8, 165, 0); // orange
+            fill_rect_blend(&mut img, rect, color, 0.45);
+            if i == current_idx {
+                outline_rect(&mut img, rect, (255, 80, 0), 3);
+            }
         }
     }
 
@@ -376,7 +405,9 @@ fn draw_help(f: &mut Frame, area: Rect) {
         "  click + drag           highlight with the mouse",
         "  x                      delete last highlight on current page",
         "",
-        "  /<query>               search (stub)",
+        "  /<query>               search the document",
+        "  n / N                  next / previous match",
+        "  :nohl                  clear search results",
         "  :<n>  /  :goto N       jump to page n",
         "  :q                     quit",
         "  :set dark | :set nodark",

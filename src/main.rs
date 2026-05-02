@@ -23,6 +23,7 @@ mod highlight;
 mod keys;
 mod layout;
 mod pdf;
+mod search;
 mod session;
 mod text;
 mod ui;

@@ -11,6 +11,7 @@ use ratatui_image::protocol::StatefulProtocol;
 use crate::highlight::{Highlight, HighlightStore, Rect01, HIGHLIGHT_COLORS};
 use crate::layout::PageLayout;
 use crate::pdf::{self, PageMetrics};
+use crate::search::SearchResults;
 use crate::session::Session;
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +46,15 @@ pub struct PageOverlayKey {
     /// resolution so f32 rounding doesn't trigger spurious
     /// rebuilds.
     pub sel_sig: Option<(u32, u32, u32, u32, usize)>,
+    /// Search-results revision (if any). Bumped when a new search
+    /// runs, when the user advances to next/prev hit (so the "current
+    /// hit" outline moves), or when results clear.
+    pub search_revision: u64,
+    /// Whether *this page* has any search hits — saves a per-frame
+    /// scan of the hit list during compose when there are none.
+    pub has_search_hits: bool,
+    /// True if the currently-focused search hit lives on this page.
+    pub current_hit_on_this_page: bool,
 }
 
 /// Cache key for the *compose* tier (stitch visible pages into a
@@ -123,6 +133,13 @@ pub struct App<'doc> {
     /// Bumped on every highlight add/delete so the compose cache
     /// invalidates without re-hashing the store.
     pub highlight_revision: u64,
+
+    /// Active search results, if any. `None` means no `/` query is
+    /// in flight (or the user just `:nohl`d).
+    pub search: Option<SearchResults>,
+    /// Last-run query, restored when the user types `/` then Enter
+    /// with an empty buffer (vim-style "redo last search").
+    pub last_query: Option<String>,
     /// Set by `App::new` when the user passed a starting page (or the
     /// session restored one). Consumed by the first `ensure_layout`
     /// call to compute the initial scroll offset, then cleared.
@@ -181,6 +198,8 @@ impl<'doc> App<'doc> {
             last_compose_key: None,
             highlights,
             highlight_revision: 0,
+            search: None,
+            last_query: None,
             pending_initial_page: if page < page_count { Some(page) } else { None },
             should_quit: false,
         };
@@ -472,6 +491,96 @@ impl<'doc> App<'doc> {
     /// keybinding `y` and the search-helper module both call this.
     pub fn save_selection(&mut self) {
         self.yank_selection(true);
+    }
+
+    /// Run a full-document text search and scroll to the first hit.
+    /// An empty query re-runs `last_query` (vim-style); an empty
+    /// query with no `last_query` clears any active results.
+    pub fn run_search(&mut self, query: &str) {
+        let query = query.trim();
+        let query: String = if query.is_empty() {
+            match &self.last_query {
+                Some(q) => q.clone(),
+                None => {
+                    self.search = None;
+                    self.status.clear();
+                    self.invalidate_compose();
+                    return;
+                }
+            }
+        } else {
+            query.to_string()
+        };
+
+        match crate::search::run_search(&self.document, &self.page_metrics, &query, false) {
+            Ok(results) => {
+                if results.hits.is_empty() {
+                    self.status = format!("no matches for '{}'", query);
+                    self.search = None;
+                } else {
+                    self.status = format!("{}/{} matches for '{}'", 1, results.hits.len(), query);
+                    self.search = Some(results);
+                    self.last_query = Some(query);
+                    self.scroll_to_current_hit();
+                }
+                self.invalidate_compose();
+            }
+            Err(e) => {
+                self.status = format!("search error: {e:#}");
+                self.invalidate_compose();
+            }
+        }
+    }
+
+    /// Move to the next/previous search hit, wrapping at the ends.
+    /// `dir` is +1 or -1.
+    pub fn advance_search(&mut self, dir: i32) {
+        let Some(s) = self.search.as_mut() else {
+            self.status = "no active search (try /pattern)".into();
+            self.invalidate_compose();
+            return;
+        };
+        if s.hits.is_empty() {
+            self.invalidate_compose();
+            return;
+        }
+        s.advance(dir);
+        let cur = s.current + 1;
+        let total = s.hits.len();
+        let q = s.query.clone();
+        self.status = format!("{}/{} matches for '{}'", cur, total, q);
+        self.scroll_to_current_hit();
+        self.invalidate_compose();
+    }
+
+    /// Drop the active search results and overlays. Wired to
+    /// `:nohl` and to a fresh `/` with empty buffer + no last query.
+    pub fn clear_search(&mut self) {
+        if self.search.is_some() {
+            self.search = None;
+            self.status.clear();
+            self.invalidate_compose();
+        }
+    }
+
+    /// Scroll so the currently-focused search hit is visible. Lands
+    /// the hit roughly a third of the way down the viewport — that
+    /// keeps a few lines of context above and matches vim's `zz`-ish
+    /// reading position.
+    fn scroll_to_current_hit(&mut self) {
+        let Some(s) = self.search.as_ref() else {
+            return;
+        };
+        let Some(hit) = s.current_hit() else {
+            return;
+        };
+        let page_y = self.layout.page_y(hit.page);
+        let page_h = self.layout.page_h(hit.page) as i64;
+        let hit_y_in_page = (hit.rect.y * page_h as f32) as i64;
+        let target = page_y + hit_y_in_page - (self.viewport_px.1 as i64 / 3);
+        self.scroll_y_px = self
+            .layout
+            .clamp_scroll(target.max(0), self.viewport_px.1);
     }
 
     pub fn cycle_color(&mut self) {

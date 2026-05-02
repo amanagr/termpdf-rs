@@ -98,6 +98,9 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         KeyCode::Char('+') | KeyCode::Char('=') => app.zoom_by(1.25),
         KeyCode::Char('-') => app.zoom_by(1.0 / 1.25),
 
+        KeyCode::Char('n') => app.advance_search(1),
+        KeyCode::Char('N') => app.advance_search(-1),
+
         KeyCode::Char('x') => {
             if app.delete_last_highlight_on_current_page() {
                 app.status = "removed last highlight on this page".into();
@@ -176,12 +179,15 @@ fn visual_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
 
 fn search_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
     match k.code {
-        KeyCode::Esc | KeyCode::Enter => {
-            if matches!(k.code, KeyCode::Enter) && !app.cmd_buffer.is_empty() {
-                app.status = format!("Search '{}' — not yet implemented", app.cmd_buffer);
-            }
+        KeyCode::Esc => {
             app.mode = Mode::Normal;
             app.cmd_buffer.clear();
+            app.status.clear();
+        }
+        KeyCode::Enter => {
+            let buf = std::mem::take(&mut app.cmd_buffer);
+            app.mode = Mode::Normal;
+            app.run_search(&buf);
         }
         KeyCode::Char(c) => app.cmd_buffer.push(c),
         KeyCode::Backspace => {
