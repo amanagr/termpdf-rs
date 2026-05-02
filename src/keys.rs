@@ -212,6 +212,7 @@ fn visual_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         app.pending.clear();
         if let KeyCode::Char(c) = k.code {
             app.move_head_find_char(c, forward);
+            app.scroll_to_head_if_offscreen();
         }
         return Ok(());
     }
@@ -225,6 +226,7 @@ fn visual_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
             KeyCode::Char('p') => app.select_inner_paragraph(),
             _ => {}
         }
+        app.scroll_to_head_if_offscreen();
         return Ok(());
     }
     // g-pending: previous was `g`. Awaits `g` (page-top) or `y`
@@ -232,12 +234,21 @@ fn visual_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
     if app.pending == "g" {
         app.pending.clear();
         match k.code {
-            KeyCode::Char('g') => app.move_head_page_top(),
+            KeyCode::Char('g') => {
+                app.move_head_page_top();
+                app.scroll_to_head_if_offscreen();
+            }
             KeyCode::Char('y') => app.yank_selection_as_markdown(),
             _ => {}
         }
         return Ok(());
     }
+
+    // Track whether this dispatch moved the head — if so, follow up
+    // with scroll_to_head_if_offscreen so the user always sees what
+    // they're selecting. Captures all caret-motion arms below in one
+    // place rather than scattering the call across each.
+    let mut moved_head = false;
 
     match k.code {
         KeyCode::Esc | KeyCode::Char('q') => app.exit_visual(),
@@ -246,22 +257,22 @@ fn visual_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         KeyCode::Char('c') => app.cycle_color(),
 
         // Char-wise caret motion (vim's `h`/`l`).
-        KeyCode::Char('h') | KeyCode::Left => app.move_head_chars(-1),
-        KeyCode::Char('l') | KeyCode::Right => app.move_head_chars(1),
+        KeyCode::Char('h') | KeyCode::Left => { app.move_head_chars(-1); moved_head = true; }
+        KeyCode::Char('l') | KeyCode::Right => { app.move_head_chars(1); moved_head = true; }
         // Line-wise caret motion (`j`/`k`); column-preserving.
-        KeyCode::Char('j') | KeyCode::Down => app.move_head_lines(1),
-        KeyCode::Char('k') | KeyCode::Up => app.move_head_lines(-1),
+        KeyCode::Char('j') | KeyCode::Down => { app.move_head_lines(1); moved_head = true; }
+        KeyCode::Char('k') | KeyCode::Up => { app.move_head_lines(-1); moved_head = true; }
 
         // Word motions.
-        KeyCode::Char('w') => app.move_head_word_forward(),
-        KeyCode::Char('b') => app.move_head_word_back(),
-        KeyCode::Char('e') => app.move_head_word_end(),
+        KeyCode::Char('w') => { app.move_head_word_forward(); moved_head = true; }
+        KeyCode::Char('b') => { app.move_head_word_back(); moved_head = true; }
+        KeyCode::Char('e') => { app.move_head_word_end(); moved_head = true; }
 
         // Line-extreme + page-extreme motions.
-        KeyCode::Char('0') => app.move_head_line_start(),
-        KeyCode::Char('^') => app.move_head_line_first_nonblank(),
-        KeyCode::Char('$') => app.move_head_line_end(),
-        KeyCode::Char('G') => app.move_head_page_bottom(),
+        KeyCode::Char('0') => { app.move_head_line_start(); moved_head = true; }
+        KeyCode::Char('^') => { app.move_head_line_first_nonblank(); moved_head = true; }
+        KeyCode::Char('$') => { app.move_head_line_end(); moved_head = true; }
+        KeyCode::Char('G') => { app.move_head_page_bottom(); moved_head = true; }
         KeyCode::Char('g') => app.pending.push('g'),
 
         // f<c>/F<c> — start a one-char wait for the target.
@@ -278,6 +289,9 @@ fn visual_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         KeyCode::Char('v') if ctrl => app.enter_visual_block(),
 
         _ => {}
+    }
+    if moved_head {
+        app.scroll_to_head_if_offscreen();
     }
     Ok(())
 }

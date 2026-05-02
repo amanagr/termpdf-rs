@@ -685,10 +685,15 @@ impl<'doc> App<'doc> {
     }
 
     pub fn enter_visual(&mut self) {
-        // Place the caret at the first char of the page currently in
-        // the viewport. If the page has no extractable text (image-
-        // only / scanned PDF), bail with a status hint rather than
-        // sitting in Visual mode with nothing to select.
+        // Place the caret at the first char that's *actually visible*
+        // in the viewport — not at idx 0 (top of page). If the user
+        // is reading mid-page and the anchor lands above the viewport,
+        // every selection rect they grow with hjkl paints in cells
+        // above the visible area, so the live overlay is invisible
+        // until they scroll up — was the "highlights only show after
+        // y" bug. Falls back to idx 0 if nothing on the page is in
+        // view (which only happens when the page header is offscreen
+        // by more than its own height — an unusual layout state).
         let page = self.current_page();
         let metrics = match self.page_metrics.get(page).copied() {
             Some(m) => m,
@@ -705,11 +710,55 @@ impl<'doc> App<'doc> {
             self.status = format!("page {}: no selectable text", page + 1);
             return;
         }
-        let caret = Caret { page, idx: 0 };
+        // Compute viewport-top-in-page-norm BEFORE calling the pure
+        // helper so we don't end up needing both a mutable borrow on
+        // self.text_cache (via pt) and an immutable borrow on self.
+        let page_top_doc = self.layout.page_y(page);
+        let page_h_px = self.layout.page_h(page).max(1) as f32;
+        let viewport_top_norm = ((self.scroll_y_px - page_top_doc) as f32) / page_h_px;
+        let idx = first_visible_char_idx_pure(viewport_top_norm, pt).unwrap_or(0);
+        let caret = Caret { page, idx };
         self.text_selection = Some(TextSelection::new(caret));
         self.mode = Mode::Visual;
         self.pending.clear();
         self.status = "VISUAL — drag to select · y save+copy · Y copy · c color · Esc".into();
+    }
+
+
+    /// If the head caret is outside the current viewport, scroll just
+    /// enough to bring it back into view. Called after every caret-
+    /// motion method so growing the selection past the viewport edge
+    /// drags the page along — otherwise the user mashes `j` and the
+    /// selection keeps growing offscreen.
+    pub fn scroll_to_head_if_offscreen(&mut self) {
+        let Some(sel) = self.text_selection else { return };
+        let Some(pt) = self.text_cache.get(sel.head.page) else { return };
+        let Some(c) = pt.chars.get(sel.head.idx) else { return };
+        let page_top = self.layout.page_y(sel.head.page);
+        let page_h = self.layout.page_h(sel.head.page).max(1) as i64;
+        let head_top_doc = page_top + (c.bbox.y * page_h as f32) as i64;
+        let head_bot_doc = page_top + ((c.bbox.y + c.bbox.h) * page_h as f32) as i64;
+        let vh = self.viewport_px.1 as i64;
+        if vh <= 0 {
+            return;
+        }
+        // Margin of one cell-row so the caret never sits exactly on
+        // the edge — gives a sliver of context above/below.
+        let margin = self.cell_size_px.1 as i64;
+        let viewport_top = self.scroll_y_px;
+        let viewport_bot = viewport_top + vh;
+        let new_scroll = if head_top_doc < viewport_top + margin {
+            head_top_doc - margin
+        } else if head_bot_doc > viewport_bot - margin {
+            head_bot_doc - vh + margin
+        } else {
+            return; // already in view
+        };
+        let clamped = self.layout.clamp_scroll(new_scroll, vh as u32);
+        if clamped != self.scroll_y_px {
+            self.scroll_y_px = clamped;
+            self.invalidate_compose();
+        }
     }
 
     pub fn exit_visual(&mut self) {
@@ -1638,6 +1687,28 @@ fn stable_kitty_id() -> u32 {
 /// waste vertical space.
 pub fn layout_gap_px() -> u32 {
     8
+}
+
+/// Pure version of `App::first_visible_char_idx`. Given the page's
+/// viewport-top in normalised page space (0 = page top, 1 = page
+/// bottom), find the first non-generated char whose top edge sits at
+/// or below the viewport top. Extracted so the bug it fixes — entering
+/// Visual mode at idx 0 when the user has scrolled deep into a page
+/// hides the live selection above the viewport — has a regression
+/// test that doesn't need pdfium loaded.
+pub fn first_visible_char_idx_pure(
+    viewport_top_norm: f32,
+    pt: &crate::textlayout::PageText,
+) -> Option<usize> {
+    for (i, c) in pt.chars.iter().enumerate() {
+        if c.is_generated {
+            continue;
+        }
+        if c.bbox.y >= viewport_top_norm {
+            return Some(i);
+        }
+    }
+    None
 }
 
 /// Pure version of `App::cell_to_page_coord`, extracted so the

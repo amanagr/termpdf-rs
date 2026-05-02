@@ -346,6 +346,121 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// REGRESSION: a Highlight saved via save_to_pdf and immediately
+    /// re-applied (without a save+reload between) must survive the
+    /// in-memory delete-then-recreate that apply_store_to_document
+    /// performs each time. Catches a class of bug where the second
+    /// save would delete the just-created annotation before
+    /// recreating it (idempotency check).
+    #[test]
+    fn double_save_is_idempotent() {
+        let Some(pdfium) = pdfium_or_skip() else { return };
+        let path = temp_path("idempotent");
+        {
+            let mut doc = pdfium.create_new_pdf().expect("new pdf");
+            doc.pages_mut()
+                .create_page_at_end(PdfPagePaperSize::a4())
+                .expect("page");
+            doc.save_to_file(&path).expect("save empty");
+        }
+        let store = HighlightStore {
+            items: vec![Highlight {
+                page: 0,
+                x: 0.10,
+                y: 0.20,
+                w: 0.30,
+                h: 0.05,
+                color: "#aed581".into(),
+                note: None,
+            }],
+        };
+        // Save twice in a row — must not duplicate or lose the entry.
+        {
+            let doc = pdfium.load_pdf_from_file(&path, None).expect("reload");
+            save_to_pdf(&doc, &store, &path).expect("first save");
+        }
+        {
+            let doc = pdfium.load_pdf_from_file(&path, None).expect("reload2");
+            save_to_pdf(&doc, &store, &path).expect("second save");
+        }
+        let doc = pdfium.load_pdf_from_file(&path, None).expect("reload3");
+        let loaded = load_from_pdf(&doc).expect("load");
+        assert_eq!(loaded.items.len(), 1, "double-save must not duplicate");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// REGRESSION: save_to_pdf must preserve foreign Highlight
+    /// annotations (other tools' work) on the same page where we
+    /// also have one of ours. Phase 1's "delete only OUR tagged
+    /// annotations" predicate is what guards this.
+    #[test]
+    fn save_preserves_foreign_highlights_on_same_page() {
+        let Some(pdfium) = pdfium_or_skip() else { return };
+        let path = temp_path("preserve-foreign");
+        // Build a PDF with one foreign Highlight (no Contents tag).
+        {
+            let mut doc = pdfium.create_new_pdf().expect("new pdf");
+            let mut page = doc
+                .pages_mut()
+                .create_page_at_end(PdfPagePaperSize::a4())
+                .expect("page");
+            let bounds = PdfRect::new(
+                PdfPoints::new(500.0),
+                PdfPoints::new(50.0),
+                PdfPoints::new(550.0),
+                PdfPoints::new(200.0),
+            );
+            let mut hl = page
+                .annotations_mut()
+                .create_highlight_annotation()
+                .expect("create");
+            hl.set_bounds(bounds).expect("bounds");
+            // Intentionally no set_contents — this is "foreign."
+            doc.save_to_file(&path).expect("save");
+        }
+
+        // Now add one of OUR highlights via save_to_pdf on the same page.
+        {
+            let doc = pdfium.load_pdf_from_file(&path, None).expect("reload");
+            let store = HighlightStore {
+                items: vec![Highlight {
+                    page: 0,
+                    x: 0.10,
+                    y: 0.10,
+                    w: 0.20,
+                    h: 0.05,
+                    color: "#ffd54f".into(),
+                    note: None,
+                }],
+            };
+            save_to_pdf(&doc, &store, &path).expect("save_to_pdf");
+        }
+
+        // Reopen: the foreign annotation should still be present in
+        // the PDF (count via raw pdfium iteration), and OUR load
+        // should return exactly one tagged highlight.
+        let doc = pdfium.load_pdf_from_file(&path, None).expect("reload2");
+        let total_highlights = {
+            let pages = doc.pages();
+            let page = pages.get(0).expect("page 0");
+            page.annotations()
+                .iter()
+                .filter(|a| a.as_highlight_annotation().is_some())
+                .count()
+        };
+        assert_eq!(
+            total_highlights, 2,
+            "foreign + ours = 2 Highlight annotations on the page"
+        );
+        let store = load_from_pdf(&doc).expect("load");
+        assert_eq!(
+            store.items.len(),
+            1,
+            "load must return ONLY tagged highlights, not foreign ones"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Roundtrip: save a tagged Highlight, reload it, verify all
     /// fields survive. Catches any future change that breaks the
     /// TAG_PREFIX/JSON encoding of color + note metadata.

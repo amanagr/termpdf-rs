@@ -910,4 +910,73 @@ mod tests {
         let s = pt.extract(0, 2);
         assert_eq!(s, "ab");
     }
+
+    /// REGRESSION: pressing `v` on a page the user had scrolled
+    /// halfway through used to anchor the selection at idx 0 (top of
+    /// page). Every subsequent caret motion grew the selection above
+    /// the viewport, so the live overlay was invisible — the user
+    /// only saw a highlight after `y` saved one. Fix: anchor the
+    /// caret on the first char whose top edge sits in (or below) the
+    /// current viewport. This test pins the helper that drives that.
+    #[test]
+    fn first_visible_char_idx_skips_chars_above_viewport() {
+        use crate::app::first_visible_char_idx_pure;
+        // Three rows, top of page at y = 0.05, 0.40, 0.75.
+        let pt = page_with(vec![
+            cell(0, 0.10, 0.05, 0.05, 0.04, 'a'),
+            cell(1, 0.10, 0.40, 0.05, 0.04, 'b'),
+            cell(2, 0.10, 0.75, 0.05, 0.04, 'c'),
+        ]);
+        // Viewport top at 0 → first row (idx 0).
+        assert_eq!(first_visible_char_idx_pure(0.0, &pt), Some(0));
+        // Viewport top at 0.30 → skips row 0, lands on row 1.
+        assert_eq!(first_visible_char_idx_pure(0.30, &pt), Some(1));
+        // Viewport top past last row → None.
+        assert_eq!(first_visible_char_idx_pure(0.90, &pt), None);
+    }
+
+    /// Generated chars (e.g. injected line-end \n) shouldn't anchor
+    /// the caret — they have no real x position.
+    #[test]
+    fn first_visible_char_idx_skips_generated() {
+        use crate::app::first_visible_char_idx_pure;
+        let mut g = cell(0, 0.10, 0.05, 0.05, 0.04, '\n');
+        g.is_generated = true;
+        let pt = page_with(vec![
+            g,
+            cell(1, 0.10, 0.10, 0.05, 0.04, 'a'),
+        ]);
+        assert_eq!(first_visible_char_idx_pure(0.0, &pt), Some(1));
+    }
+
+    /// REGRESSION: the first frame after `v` has anchor==head (single
+    /// char). range_to_rects must produce ONE non-empty rect — earlier
+    /// versions silently returned zero rects when start==end on the
+    /// last char of a single-char line, which would render no live
+    /// overlay until the user moved the caret.
+    #[test]
+    fn range_to_rects_single_char_emits_one_rect() {
+        let pt = page_with(vec![
+            cell(0, 0.10, 0.10, 0.05, 0.04, 'a'),
+            cell(1, 0.16, 0.10, 0.05, 0.04, 'b'),
+        ]);
+        let rects = pt.range_to_rects(0, 0);
+        assert_eq!(rects.len(), 1, "anchor==head should produce one rect");
+        assert!(rects[0].w > 0.0 && rects[0].h > 0.0);
+    }
+
+    /// REGRESSION: the same single-char rect must still appear when
+    /// the chosen char is NOT the first on its line.
+    #[test]
+    fn range_to_rects_single_char_mid_line() {
+        let pt = page_with(vec![
+            cell(0, 0.10, 0.10, 0.05, 0.04, 'a'),
+            cell(1, 0.16, 0.10, 0.05, 0.04, 'b'),
+            cell(2, 0.22, 0.10, 0.05, 0.04, 'c'),
+        ]);
+        let rects = pt.range_to_rects(1, 1);
+        assert_eq!(rects.len(), 1);
+        // The rect should cover roughly the 'b' cell's x position.
+        assert!((rects[0].x - 0.16).abs() < 0.05);
+    }
 }
