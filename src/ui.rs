@@ -144,56 +144,81 @@ fn draw_resume_marker(f: &mut Frame, app: &mut App<'_>, img_area: Rect) {
         return;
     }
 
-    // 30% of the image width, left-anchored. Avoid zero on
-    // pathologically tiny windows.
-    let marker_w = ((img_area.width as f32) * 0.30).round() as u16;
-    let marker_w = marker_w.max(1).min(img_area.width);
-
-    const LABEL: &str = "resume here";
-    // Need: at least 2 cells of `─` on each side + 1 space of padding
-    // around the label. Below this width the label looks crammed and
-    // we drop it.
-    const MIN_LABELED_WIDTH: u16 = (LABEL.len() as u16) + 4 + 2; // 11 + 4 + 2 = 17
-    let dim_yellow = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::DIM);
+    let marker_w = resume_marker_width(img_area.width);
+    let line = resume_marker_line(marker_w);
     let strip = Rect {
         x: img_area.x,
         y: img_area.y + row,
         width: marker_w,
         height: 1,
     };
+    f.render_widget(Paragraph::new(line), strip);
+}
 
+/// Pure helper: marker width = round(0.3 * image width), clamped to
+/// at least 1 cell and at most the image width itself.
+pub fn resume_marker_width(image_w: u16) -> u16 {
+    let w = ((image_w as f32) * 0.30).round() as u16;
+    w.max(1).min(image_w)
+}
+
+/// Pure builder for the resume-marker line content. Returns a fully
+/// styled `Line` so a `TestBackend` snapshot test can inspect every
+/// span (chars + colors + modifiers) without spinning up an `App`.
+///
+/// Layout:
+/// - Below `MIN_LABELED_WIDTH` cells: line-only `────` (dim yellow).
+/// - At or above: `─── resume here ───` with the label centered, bold
+///   yellow on the label and dim yellow on the rule. Odd remainder
+///   goes to the right flank so the visual weight feels left-anchored.
+pub fn resume_marker_line(marker_w: u16) -> Line<'static> {
+    const LABEL: &str = "resume here";
+    // Need: at least 2 cells of `─` each side + 1 space of padding
+    // around the label. Below this width the label looks crammed.
+    const MIN_LABELED_WIDTH: u16 = (LABEL.len() as u16) + 4 + 2;
+    let dim_yellow = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::DIM);
     if marker_w < MIN_LABELED_WIDTH {
-        // Narrow terminal: line-only fallback. A truncated label is
-        // worse than no label.
-        let line: String = std::iter::repeat('─')
-            .take(marker_w as usize)
-            .collect();
-        f.render_widget(Paragraph::new(line).style(dim_yellow), strip);
-        return;
+        let s: String = std::iter::repeat('─').take(marker_w as usize).collect();
+        return Line::from(Span::styled(s, dim_yellow));
     }
-
-    // Distribute rule cells around the label, with 1 cell of padding
-    // each side. Any odd remainder goes to the right flank so the
-    // visual weight still feels left-anchored.
-    let inner = marker_w - LABEL.len() as u16 - 2; // padding on both sides
+    let inner = marker_w - LABEL.len() as u16 - 2;
     let left_rule = inner / 2;
     let right_rule = inner - left_rule;
     let left: String = std::iter::repeat('─').take(left_rule as usize).collect();
     let right: String = std::iter::repeat('─').take(right_rule as usize).collect();
-
-    // The label is the focal point — same hue but bold instead of
-    // dim, so the eye lands on it inside the 3s window.
     let label_style = Style::default()
         .fg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
-    let line = Line::from(vec![
+    Line::from(vec![
         Span::styled(left, dim_yellow),
         Span::styled(format!(" {LABEL} "), label_style),
         Span::styled(right, dim_yellow),
-    ]);
-    f.render_widget(Paragraph::new(line), strip);
+    ])
+}
+
+/// Pure helper: the cell style used to paint a Visual-mode selection
+/// rect. `▒` glyphs are painted in this fg over the kitty image; the
+/// 50%-shade glyph lets the underlying PDF show through. Bold makes
+/// the highlight fg pop against the page bitmap.
+pub fn selection_overlay_style(color_idx: usize) -> Style {
+    let color = HIGHLIGHT_COLORS[color_idx % HIGHLIGHT_COLORS.len()];
+    let (r, g, b) = color.rgb;
+    Style::default()
+        .fg(Color::Rgb(r, g, b))
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Pure helper: the caret cursor style — white fg on the highlight
+/// color bg, bold. Visible against any underlying page bitmap.
+pub fn selection_caret_style(color_idx: usize) -> Style {
+    let color = HIGHLIGHT_COLORS[color_idx % HIGHLIGHT_COLORS.len()];
+    let (r, g, b) = color.rgb;
+    Style::default()
+        .fg(Color::Rgb(255, 255, 255))
+        .bg(Color::Rgb(r, g, b))
+        .add_modifier(Modifier::BOLD)
 }
 
 fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
@@ -474,11 +499,7 @@ fn draw_selection_overlay(f: &mut ratatui::Frame, app: &App<'_>, img_area: Rect)
         return;
     }
 
-    let color = HIGHLIGHT_COLORS[app.selection_color_idx % HIGHLIGHT_COLORS.len()];
-    let (r, g, b) = color.rgb;
-    let style = Style::default()
-        .fg(Color::Rgb(r, g, b))
-        .add_modifier(Modifier::BOLD);
+    let style = selection_overlay_style(app.selection_color_idx);
 
     let (lo, hi) = sel.ordered();
     for page_idx in lo.page..=hi.page {
@@ -518,10 +539,7 @@ fn draw_selection_overlay(f: &mut ratatui::Frame, app: &App<'_>, img_area: Rect)
     // knows where motions are anchored.
     if let Some(pt) = app.text_cache.get(sel.head.page) {
         if let Some(cell) = pt.chars.get(sel.head.idx) {
-            let caret_style = Style::default()
-                .fg(Color::Rgb(255, 255, 255))
-                .bg(Color::Rgb(r, g, b))
-                .add_modifier(Modifier::BOLD);
+            let caret_style = selection_caret_style(app.selection_color_idx);
             paint_rect_cells(f, app, img_area, sel.head.page, cell.bbox, caret_style);
         }
     }
@@ -775,7 +793,32 @@ fn draw_toc(f: &mut Frame, app: &App<'_>, area: Rect) {
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
-    let help_lines: Vec<&str> = vec![
+    let help_lines = help_overlay_lines();
+    let h = (help_lines.len() as u16 + 4).min(area.height);
+    let w = 68u16.min(area.width);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, popup);
+    let para = Paragraph::new(
+        help_lines
+            .into_iter()
+            .map(|s| Line::from(s.to_string()))
+            .collect::<Vec<_>>(),
+    )
+    .block(Block::default().borders(Borders::ALL).title(" ? help "));
+    f.render_widget(para, popup);
+}
+
+/// The full text of the `?` help overlay, exposed as a pure list so
+/// tests can assert specific entries are present (and so the README
+/// key table can be cross-checked against the in-app help by anyone
+/// who wants to write that test).
+pub fn help_overlay_lines() -> Vec<&'static str> {
+    vec![
         "termpdf-rs — continuous-scroll PDF reader",
         "",
         "  j / k                  next / prev page (jump to page boundary)",
@@ -828,24 +871,245 @@ fn draw_help(f: &mut Frame, area: Rect) {
         "  q                      quit",
         "",
         "Press ? or Esc to close",
-    ];
+    ]
+}
 
-    let h = (help_lines.len() as u16 + 4).min(area.height);
-    let w = 68u16.min(area.width);
-    let popup = Rect {
-        x: area.x + area.width.saturating_sub(w) / 2,
-        y: area.y + area.height.saturating_sub(h) / 2,
-        width: w,
-        height: h,
-    };
+#[cfg(test)]
+mod tests {
+    //! Visual / cell-buffer tests for the parts of the renderer that
+    //! don't depend on a live `App` (and therefore on pdfium).
+    //!
+    //! For each widget we either:
+    //! - Inspect the pure builder's output (Line/Style spans), OR
+    //! - Render through ratatui's `TestBackend` and walk the resulting
+    //!   buffer cell-by-cell to assert the chars + styles that would
+    //!   actually hit a real terminal.
+    //!
+    //! These catch the class of regression where a refactor silently
+    //! changes a color, a glyph, or the help-overlay copy.
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+    use ratatui::Terminal;
 
-    f.render_widget(Clear, popup);
-    let para = Paragraph::new(
-        help_lines
-            .into_iter()
-            .map(|s| Line::from(s.to_string()))
-            .collect::<Vec<_>>(),
-    )
-    .block(Block::default().borders(Borders::ALL).title(" ? help "));
-    f.render_widget(para, popup);
+    // ---- Resume-marker pure builder ---------------------------------
+
+    #[test]
+    fn resume_marker_width_is_30_percent() {
+        assert_eq!(resume_marker_width(100), 30);
+        assert_eq!(resume_marker_width(80), 24);
+        assert_eq!(resume_marker_width(50), 15);
+        // Tiny terminals: clamped to ≥ 1 cell.
+        assert_eq!(resume_marker_width(1), 1);
+        assert_eq!(resume_marker_width(2), 1);
+    }
+
+    #[test]
+    fn resume_marker_line_full_width_has_label() {
+        let line = resume_marker_line(40);
+        // 3 spans expected: left rule, " resume here ", right rule.
+        let spans: Vec<&Span<'_>> = line.spans.iter().collect();
+        assert_eq!(spans.len(), 3, "expected 3 spans, got {:?}", spans);
+        assert!(spans[0].content.chars().all(|c| c == '─'));
+        assert_eq!(spans[1].content, " resume here ");
+        assert!(spans[2].content.chars().all(|c| c == '─'));
+        // Total width must equal what we asked for.
+        let total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        assert_eq!(total, 40);
+    }
+
+    #[test]
+    fn resume_marker_line_label_is_bold_yellow() {
+        let line = resume_marker_line(40);
+        let label_span = &line.spans[1];
+        assert_eq!(label_span.style.fg, Some(Color::Yellow));
+        assert!(
+            label_span.style.add_modifier.contains(Modifier::BOLD),
+            "label must be bold so the eye lands on it"
+        );
+    }
+
+    #[test]
+    fn resume_marker_line_rules_are_dim_yellow() {
+        let line = resume_marker_line(40);
+        for (i, span) in [&line.spans[0], &line.spans[2]].iter().enumerate() {
+            assert_eq!(span.style.fg, Some(Color::Yellow), "rule span {i}");
+            assert!(
+                span.style.add_modifier.contains(Modifier::DIM),
+                "rule span {i} should be DIM (label is the focal point)"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_marker_line_narrow_falls_back_to_line_only() {
+        // Anything below 17 cells should drop the label.
+        let line = resume_marker_line(10);
+        assert_eq!(line.spans.len(), 1, "narrow fallback = single span");
+        assert!(line.spans[0].content.chars().all(|c| c == '─'));
+        assert_eq!(line.spans[0].content.chars().count(), 10);
+        // Still dim yellow — same hue, just no label.
+        assert_eq!(line.spans[0].style.fg, Some(Color::Yellow));
+    }
+
+    /// Render the marker through a real (test) backend and walk the
+    /// resulting cell buffer. This is the closest thing to "did the
+    /// terminal get the right bytes" that we can write headlessly.
+    #[test]
+    fn resume_marker_renders_to_buffer_with_correct_chars_and_colors() {
+        let backend = TestBackend::new(40, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            let line = resume_marker_line(40);
+            f.render_widget(
+                Paragraph::new(line),
+                Rect { x: 0, y: 0, width: 40, height: 1 },
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        // Reconstruct the rendered line by walking cells.
+        let mut rendered = String::new();
+        let mut yellow_cells = 0;
+        let mut bold_cells = 0;
+        for x in 0..40 {
+            let cell = buf.cell((x, 0)).unwrap();
+            rendered.push_str(cell.symbol());
+            if cell.fg == Color::Yellow {
+                yellow_cells += 1;
+            }
+            if cell.modifier.contains(Modifier::BOLD) {
+                bold_cells += 1;
+            }
+        }
+        assert!(
+            rendered.contains("resume here"),
+            "rendered cells must contain the label, got {rendered:?}"
+        );
+        assert!(
+            rendered.starts_with('─') && rendered.ends_with('─'),
+            "rendered cells should start and end with rule glyphs, got {rendered:?}"
+        );
+        // Every cell of the marker should be yellow (rule + label).
+        assert_eq!(
+            yellow_cells, 40,
+            "every cell must be yellow; got {yellow_cells} yellow cells"
+        );
+        // The label span (" resume here " = 13 chars) should be bold;
+        // the rules should not. Total bold cells = 13.
+        assert_eq!(
+            bold_cells, 13,
+            "exactly the 13-cell label should be bold"
+        );
+    }
+
+    // ---- Selection overlay style ------------------------------------
+
+    #[test]
+    fn selection_overlay_style_uses_bold_and_palette_color() {
+        let s = selection_overlay_style(0); // yellow (idx 0)
+        assert_eq!(s.fg, Some(Color::Rgb(0xff, 0xd5, 0x4f)));
+        assert!(s.add_modifier.contains(Modifier::BOLD));
+        // No background — `▒` lets the underlying PDF show through.
+        assert_eq!(s.bg, None);
+    }
+
+    #[test]
+    fn selection_overlay_style_cycles_through_palette() {
+        // Each idx should map to a distinct palette entry; the whole
+        // table is len() = 5 (yellow, green, blue, pink, orange).
+        let palette_len = HIGHLIGHT_COLORS.len();
+        let mut seen: std::collections::HashSet<Color> =
+            std::collections::HashSet::new();
+        for i in 0..palette_len {
+            let s = selection_overlay_style(i);
+            assert!(seen.insert(s.fg.unwrap()), "duplicate fg at idx {i}");
+        }
+        // Indices past the end wrap (mod palette_len).
+        assert_eq!(
+            selection_overlay_style(0).fg,
+            selection_overlay_style(palette_len).fg,
+        );
+    }
+
+    #[test]
+    fn selection_caret_style_is_white_on_palette_color() {
+        let s = selection_caret_style(0);
+        assert_eq!(s.fg, Some(Color::Rgb(255, 255, 255)));
+        assert_eq!(s.bg, Some(Color::Rgb(0xff, 0xd5, 0x4f)));
+        assert!(s.add_modifier.contains(Modifier::BOLD));
+    }
+
+    // ---- Help overlay text ------------------------------------------
+
+    #[test]
+    fn help_overlay_documents_all_documented_keys() {
+        let lines = help_overlay_lines();
+        let body = lines.join("\n");
+        // Spot-check every keybinding the README also documents. If a
+        // future refactor renames or drops one of these, BOTH the
+        // help and this test should change in the same PR.
+        for needed in [
+            "j / k",
+            "Space / b",
+            "Ctrl-d / Ctrl-u",
+            "gg / G",
+            "m{a-z} / '{a-z}",
+            "Ctrl-o / Ctrl-i",
+            "v",
+            "iw / is / ip",
+            "y / Enter",
+            "gy",
+            "/<query>",
+            ":nohl",
+            "o  /  :toc",
+            ":export",
+            ":q",
+            "?",
+        ] {
+            assert!(
+                body.contains(needed),
+                "help overlay missing entry: {needed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_overlay_mentions_resume_marker() {
+        let body = help_overlay_lines().join("\n");
+        assert!(
+            body.contains("resume here"),
+            "Space-marker feature should be documented in the help overlay"
+        );
+    }
+
+    #[test]
+    fn help_overlay_renders_within_a_terminal_height() {
+        // Pop the help in a minimum-size area; it should not panic
+        // and the popup geometry should clamp to fit. Smoke test for
+        // the area math (caught popup-overflow bug previously).
+        let backend = TestBackend::new(50, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            draw_help(
+                f,
+                Rect { x: 0, y: 0, width: 50, height: 20 },
+            );
+        })
+        .unwrap();
+        // Walk the buffer and confirm the help title appears
+        // somewhere — proves the popup actually rendered.
+        let buf = term.backend().buffer();
+        let mut content = String::new();
+        for y in 0..20 {
+            for x in 0..50 {
+                content.push_str(buf.cell((x, y)).unwrap().symbol());
+            }
+            content.push('\n');
+        }
+        assert!(
+            content.contains("? help"),
+            "help title not rendered: contents=\n{content}"
+        );
+    }
 }
