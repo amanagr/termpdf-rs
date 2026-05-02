@@ -131,6 +131,22 @@ fn apply_store_to_document(
     let pages = document.pages();
     let total = pages.len() as i32;
 
+    // Surface — rather than silently drop — highlights that point past
+    // the end of the document (e.g. a session restored from a longer
+    // version of the same file).
+    let total_usize = total.max(0) as usize;
+    let orphans = store
+        .items
+        .iter()
+        .filter(|h| h.page >= total_usize)
+        .count();
+    if orphans > 0 {
+        eprintln!(
+            "warning: {orphans} highlight(s) reference page(s) past the end of \
+             the PDF and will not be saved (document has {total_usize} page(s))"
+        );
+    }
+
     for page_idx in 0..total {
         let mut page = pages
             .get(page_idx)
@@ -209,8 +225,12 @@ fn apply_store_to_document(
 /// Write the document to `path` via a sibling temp file, then
 /// rename. Pdfium's `save_to_file` writes directly; doing it in
 /// two steps means the original PDF stays intact if pdfium dies
-/// mid-write. We restrict the temp file to 0600 on Unix until
-/// rename so any inline notes aren't briefly world-readable.
+/// mid-write.
+///
+/// On Unix the temp file is pre-created with 0600 BEFORE pdfium
+/// writes to it. pdfium's `open(path, O_WRONLY|O_TRUNC)` preserves
+/// the existing inode's mode, so the file is never briefly world-
+/// readable — a chmod-after-write was racy on shared filesystems.
 fn save_atomic(document: &PdfDocument<'_>, path: &Path) -> Result<()> {
     let parent = path
         .parent()
@@ -222,15 +242,25 @@ fn save_atomic(document: &PdfDocument<'_>, path: &Path) -> Result<()> {
         .unwrap_or("doc");
     let tmp_path = parent.join(format!(".{stem}.termpdf-tmp"));
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Wipe any stale temp from a prior crash so create_new succeeds
+        // with our mode rather than reusing leftover permissions.
+        let _ = fs::remove_file(&tmp_path);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .with_context(|| {
+                format!("creating private temp file {}", tmp_path.display())
+            })?;
+    }
+
     document
         .save_to_file(&tmp_path)
         .with_context(|| format!("writing temp PDF to {}", tmp_path.display()))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
-    }
 
     fs::rename(&tmp_path, path)
         .with_context(|| format!("renaming {} → {}", tmp_path.display(), path.display()))?;

@@ -99,12 +99,14 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
 
     f.render_widget(status_line(app), status_area);
 
+    // Confine popups to the image area so their bottom border doesn't
+    // overpaint the 1-row status line below it.
     if app.show_toc {
-        draw_toc(f, app, area);
+        draw_toc(f, app, img_area);
     }
 
     if app.show_help {
-        draw_help(f, area);
+        draw_help(f, img_area);
     }
 }
 

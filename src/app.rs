@@ -362,12 +362,17 @@ impl<'doc> App<'doc> {
         self.page_cache_lru.retain(|&k| k >= lo && k < hi);
         // The text-layout cache holds char bbox + line index per page;
         // a few hundred KB per page in dense documents. Drop any entry
-        // outside the visible window unless it's anchoring the active
-        // selection (in which case keep it so motion stays valid).
-        let anchor_page = self.text_selection.map(|s| s.anchor.page);
-        let head_page = self.text_selection.map(|s| s.head.page);
+        // outside the visible window unless it's part of the active
+        // selection — pin the FULL anchor..=head range so a multi-page
+        // yank doesn't silently lose middle pages whose layout was
+        // evicted while the user dragged across them.
+        let pin_range = self.text_selection.map(|s| {
+            let (a, b) = s.ordered();
+            a.page..=b.page
+        });
         self.text_cache.retain(|page| {
-            (page >= lo && page < hi) || Some(page) == anchor_page || Some(page) == head_page
+            (page >= lo && page < hi)
+                || pin_range.as_ref().map_or(false, |r| r.contains(&page))
         });
     }
 
@@ -601,6 +606,9 @@ impl<'doc> App<'doc> {
         self.mouse_dragging = false;
         self.mode = Mode::Normal;
         self.status.clear();
+        // Clear leftover pending-key bytes (e.g. partial `g` from `gg`)
+        // so the next Normal-mode keypress isn't misinterpreted.
+        self.pending.clear();
     }
 
     /// Yank the active Visual-mode selection: extract its text,
@@ -635,10 +643,17 @@ impl<'doc> App<'doc> {
             } else {
                 pt.chars.len().saturating_sub(1)
             };
-            if !combined.is_empty() {
-                combined.push_str("\n\n");
+            // Extract first; only emit a page separator if this page
+            // actually contributed text. Otherwise an image-only page
+            // mid-selection would leave dangling `\n\n\n\n` runs, and
+            // an evicted page would silently fuse its neighbours.
+            let s = pt.extract(start, end);
+            if !s.is_empty() {
+                if !combined.is_empty() {
+                    combined.push_str("\n\n");
+                }
+                combined.push_str(&s);
             }
-            combined.push_str(&pt.extract(start, end));
             if save {
                 per_page_rects.push((page_idx, pt.range_to_rects(start, end)));
             }
