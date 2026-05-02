@@ -118,12 +118,18 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
     }
 }
 
-/// Paint the "you were reading here" marker if one is active and
+/// Paint the "resume reading here" marker if one is active and
 /// within the current viewport. Expires the marker if its TTL has
 /// elapsed. The marker lives in document-pixel space so zoom and
 /// scroll changes leave it where the user expects; if it has scrolled
 /// out of view we just skip drawing (it'll reappear if the user
 /// scrolls back within its TTL).
+///
+/// Layout: occupies the LEFT 30% of the image area (so the rest of
+/// the row stays untouched and the underlying PDF text remains
+/// readable). Content is a centered bold "resume here" label flanked
+/// by `─` rules: `─── resume here ───`. Below a narrow-terminal
+/// threshold the label is dropped and only the rule renders.
 fn draw_resume_marker(f: &mut Frame, app: &mut App<'_>, img_area: Rect) {
     app.expire_resume_marker();
     let Some(marker) = app.resume_marker else { return };
@@ -137,25 +143,57 @@ fn draw_resume_marker(f: &mut Frame, app: &mut App<'_>, img_area: Rect) {
     if row >= img_area.height {
         return;
     }
-    // Yellow fg, no background — visible on both light and dark page
-    // bitmaps without obscuring the underlying glyphs the way a fill
-    // band would. `─` (U+2500) tiles into a continuous line across
-    // adjacent cells.
-    let line: String = std::iter::repeat('─')
-        .take(img_area.width as usize)
-        .collect();
-    let para = Paragraph::new(line).style(
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::DIM),
-    );
+
+    // 30% of the image width, left-anchored. Avoid zero on
+    // pathologically tiny windows.
+    let marker_w = ((img_area.width as f32) * 0.30).round() as u16;
+    let marker_w = marker_w.max(1).min(img_area.width);
+
+    const LABEL: &str = "resume here";
+    // Need: at least 2 cells of `─` on each side + 1 space of padding
+    // around the label. Below this width the label looks crammed and
+    // we drop it.
+    const MIN_LABELED_WIDTH: u16 = (LABEL.len() as u16) + 4 + 2; // 11 + 4 + 2 = 17
+    let dim_yellow = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::DIM);
     let strip = Rect {
         x: img_area.x,
         y: img_area.y + row,
-        width: img_area.width,
+        width: marker_w,
         height: 1,
     };
-    f.render_widget(para, strip);
+
+    if marker_w < MIN_LABELED_WIDTH {
+        // Narrow terminal: line-only fallback. A truncated label is
+        // worse than no label.
+        let line: String = std::iter::repeat('─')
+            .take(marker_w as usize)
+            .collect();
+        f.render_widget(Paragraph::new(line).style(dim_yellow), strip);
+        return;
+    }
+
+    // Distribute rule cells around the label, with 1 cell of padding
+    // each side. Any odd remainder goes to the right flank so the
+    // visual weight still feels left-anchored.
+    let inner = marker_w - LABEL.len() as u16 - 2; // padding on both sides
+    let left_rule = inner / 2;
+    let right_rule = inner - left_rule;
+    let left: String = std::iter::repeat('─').take(left_rule as usize).collect();
+    let right: String = std::iter::repeat('─').take(right_rule as usize).collect();
+
+    // The label is the focal point — same hue but bold instead of
+    // dim, so the eye lands on it inside the 3s window.
+    let label_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let line = Line::from(vec![
+        Span::styled(left, dim_yellow),
+        Span::styled(format!(" {LABEL} "), label_style),
+        Span::styled(right, dim_yellow),
+    ]);
+    f.render_widget(Paragraph::new(line), strip);
 }
 
 fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
@@ -743,7 +781,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         "  j / k                  next / prev page (jump to page boundary)",
         "  N j  /  N k            jump N pages forward / back",
         "  Space / b              scroll one screen down / up (less-style)",
-        "                         (Space drops a 3s resume line at your last bottom)",
+        "                         (Space drops a 3s 'resume here' line at your last bottom)",
         "  Ctrl-d / Ctrl-u        scroll a half-screen down / up",
         "  gg / G                 doc top / bottom",
         "  N G                    jump to page N",
