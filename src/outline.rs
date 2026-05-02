@@ -21,6 +21,19 @@ pub struct OutlineEntry {
     pub page: Option<usize>,
 }
 
+/// Cap how many entries a single document can contribute. Bookmark
+/// trees in real PDFs are tens to a few hundred deep; a value in the
+/// tens of thousands suggests either an unusually massive reference
+/// work or a malicious file. Either way, refusing to grow the panel
+/// past this cap protects memory and the sibling-loop runtime.
+const MAX_OUTLINE_ENTRIES: usize = 50_000;
+
+/// Cap on bookmark tree depth. Real outlines never exceed ~10; the
+/// indent rendering already caps display at 6. The hard cap here
+/// protects the recursive `walk_children` against pathological PDFs
+/// that nest first_child arbitrarily deep.
+const MAX_OUTLINE_DEPTH: u8 = 64;
+
 /// Walk the bookmark tree depth-first, producing a flat, depth-
 /// tagged list. Returns an empty Vec for documents with no outline.
 pub fn load(document: &PdfDocument<'_>) -> Result<Vec<OutlineEntry>> {
@@ -37,23 +50,34 @@ pub fn load(document: &PdfDocument<'_>) -> Result<Vec<OutlineEntry>> {
     Ok(out)
 }
 
-fn walk(b: PdfBookmark<'_>, depth: u8, out: &mut Vec<OutlineEntry>) {
-    if let Some(title) = b.title() {
-        let page = b
-            .destination()
-            .and_then(|d| d.page_index().ok())
-            .map(|p| p as usize);
-        out.push(OutlineEntry {
-            title,
-            depth,
-            page,
-        });
-    }
-    if let Some(child) = b.first_child() {
-        walk(child, depth.saturating_add(1), out);
-    }
-    if let Some(sibling) = b.next_sibling() {
-        walk(sibling, depth, out);
+fn walk(start: PdfBookmark<'_>, depth: u8, out: &mut Vec<OutlineEntry>) {
+    // Iterate the sibling chain instead of recursing into it. PDFs
+    // with very long sibling chains (10k+, occasionally seen in
+    // adversarial files or auto-generated reference indexes) would
+    // otherwise blow the stack. Children stay recursive — depths are
+    // small and capped by MAX_OUTLINE_DEPTH.
+    let mut cur = Some(start);
+    while let Some(b) = cur {
+        if out.len() >= MAX_OUTLINE_ENTRIES {
+            return;
+        }
+        if let Some(title) = b.title() {
+            let page = b
+                .destination()
+                .and_then(|d| d.page_index().ok())
+                .map(|p| p as usize);
+            out.push(OutlineEntry {
+                title,
+                depth,
+                page,
+            });
+        }
+        if depth < MAX_OUTLINE_DEPTH {
+            if let Some(child) = b.first_child() {
+                walk(child, depth.saturating_add(1), out);
+            }
+        }
+        cur = b.next_sibling();
     }
 }
 

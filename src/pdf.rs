@@ -11,12 +11,13 @@
 use std::env;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use image::DynamicImage;
 use pdfium_render::prelude::*;
 
 pub fn bindings(lib_path: &str) -> Result<Box<dyn PdfiumLibraryBindings>> {
-    Ok(Pdfium::bind_to_library(lib_path)?)
+    Pdfium::bind_to_library(lib_path)
+        .with_context(|| format!("dlopen failed for {lib_path}"))
 }
 
 /// Search known locations for `libpdfium.so`:
@@ -27,6 +28,41 @@ pub fn bindings(lib_path: &str) -> Result<Box<dyn PdfiumLibraryBindings>> {
 ///   3. Fixed dev path + system locations.
 pub fn find_libpdfium() -> Result<String> {
     if let Ok(p) = env::var("TERMPDF_PDFIUM") {
+        // Validate the override before handing it to dlopen. An
+        // unchecked $TERMPDF_PDFIUM lets a hostile environment (e.g.
+        // a forwarded shell session, a sourced .env) point us at any
+        // shared library on the box, which Pdfium::bind_to_library
+        // would then dlopen and execute initialisers from. Require
+        // the file to exist and have a recognisable shared-lib
+        // extension — the latter is a defence in depth, not a real
+        // sandbox, but it kicks out the trivial cases.
+        let path = Path::new(&p);
+        if !path.exists() {
+            anyhow::bail!("$TERMPDF_PDFIUM={p} does not exist");
+        }
+        let ext_ok = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| {
+                let e = e.to_ascii_lowercase();
+                e == "so" || e == "dylib" || e == "dll"
+            })
+            .unwrap_or(false);
+        let name_match = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| {
+                // Allow versioned names like libpdfium.so.1 too.
+                let lower = n.to_ascii_lowercase();
+                lower.starts_with("libpdfium.") || lower.starts_with("pdfium.")
+            })
+            .unwrap_or(false);
+        if !ext_ok && !name_match {
+            anyhow::bail!(
+                "$TERMPDF_PDFIUM={p} doesn't look like a pdfium shared library \
+                 (expected libpdfium.{{so,dylib,dll}} or similar)"
+            );
+        }
         return Ok(p);
     }
 

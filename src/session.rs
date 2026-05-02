@@ -27,10 +27,11 @@ impl Session {
             .ok_or_else(|| anyhow::anyhow!("$XDG_DATA_HOME not set and no fallback"))?
             .join("termpdf-rs");
         fs::create_dir_all(&dir)?;
-        let stem = pdf
+        let raw_stem = pdf
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("unknown");
+        let stem = crate::highlight::sanitize_stem_pub(raw_stem);
         let canon = fs::canonicalize(pdf).unwrap_or_else(|_| pdf.to_path_buf());
         let hash = fnv1a64(canon.to_string_lossy().as_bytes());
         Ok(dir.join(format!("{}.{:016x}.session.json", stem, hash)))
@@ -55,9 +56,42 @@ impl Session {
 
     pub fn save(&self, pdf: &Path) -> Result<()> {
         let p = Self::store_path(pdf)?;
-        fs::write(p, serde_json::to_string_pretty(self)?)?;
-        Ok(())
+        let body = serde_json::to_string_pretty(self)?;
+        write_private_session(&p, body.as_bytes())
     }
+}
+
+/// Same atomic 0600 write as highlight.rs::write_private; duplicated
+/// instead of pub-exposed to keep highlight.rs internals private and
+/// because session.rs predates the security hardening.
+fn write_private_session(path: &Path, data: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = parent.join(format!(
+        ".{}.tmp",
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("session")
+    ));
+    {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            std::io::Write::write_all(&mut f, data)?;
+            f.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        {
+            fs::write(&tmp, data)?;
+        }
+    }
+    fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {

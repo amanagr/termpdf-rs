@@ -18,6 +18,13 @@ use pdfium_render::prelude::*;
 use crate::highlight::Rect01;
 use crate::pdf::PageMetrics;
 
+/// Hard cap on total search hits in one query. A query like "e" on a
+/// 1000-page book would otherwise allocate millions of `SearchHit`
+/// entries — both a UX problem (can't navigate them) and a memory-
+/// pressure / DoS surface against a hostile PDF. We stop collecting
+/// once the cap is reached and surface a hint in the status line.
+const MAX_SEARCH_HITS: usize = 5_000;
+
 #[derive(Debug, Clone, Copy)]
 pub struct SearchHit {
     pub page: usize,
@@ -77,7 +84,7 @@ pub fn run_search(
     let pages = document.pages();
     let opts = PdfSearchOptions::new().match_case(case_sensitive);
 
-    for (page_idx, m) in page_metrics.iter().enumerate() {
+    'pages: for (page_idx, m) in page_metrics.iter().enumerate() {
         let Ok(page) = pages.get(page_idx as i32) else {
             continue;
         };
@@ -87,6 +94,9 @@ pub fn run_search(
         // segments are visual lines (one rect per line).
         for match_segments in search.iter(PdfSearchDirection::SearchForward) {
             for seg in match_segments.iter() {
+                if hits.len() >= MAX_SEARCH_HITS {
+                    break 'pages;
+                }
                 let r = seg.bounds();
                 hits.push(SearchHit {
                     page: page_idx,
