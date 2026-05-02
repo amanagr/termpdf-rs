@@ -902,13 +902,12 @@ mod tests {
 
     #[test]
     fn extract_skips_generated_chars() {
-        let mut a = cell(0, 0.10, 0.10, 0.05, 0.04, 'a');
+        let a = cell(0, 0.10, 0.10, 0.05, 0.04, 'a');
         let mut g = cell(1, 0.16, 0.10, 0.05, 0.04, 'X');
         g.is_generated = true;
         let b = cell(2, 0.22, 0.10, 0.05, 0.04, 'b');
-        let pt = page_with(vec![a.clone(), g, b]);
+        let pt = page_with(vec![a, g, b]);
         let s = pt.extract(0, 2);
         assert_eq!(s, "ab");
-        let _ = a;
     }
 }

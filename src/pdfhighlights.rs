@@ -58,8 +58,23 @@ pub fn load_from_pdf(document: &PdfDocument<'_>) -> Result<HighlightStore> {
             let Some(hl) = annotation.as_highlight_annotation() else {
                 continue;
             };
-            // Bounds: pdfium gives PDF-space (bottom-left origin, points).
-            // Convert back to top-left normalised 0..1.
+            // Read our metadata FIRST. If this annotation wasn't
+            // authored by termpdf-rs, skip it entirely — we never need
+            // to query bounds/colour on a foreign highlight, and some
+            // PDF authors (notably Adobe's) emit Highlight annotations
+            // without an InteriorColor entry, which makes
+            // pdfium-render's `fill_color()` segfault on certain
+            // builds. Skipping foreign highlights also matches user
+            // intent: those are already painted into the page bitmap
+            // by pdfium's own renderer, so they're still visible.
+            let contents = hl.contents();
+            let Some(meta) = contents
+                .as_deref()
+                .filter(|s| s.starts_with(TAG_PREFIX))
+                .and_then(|s| serde_json::from_str::<AnnotMeta>(&s[TAG_PREFIX.len()..]).ok())
+            else {
+                continue;
+            };
             let Ok(bounds) = hl.bounds() else { continue };
             let left = bounds.left().value.max(0.0);
             let bottom = bounds.bottom().value.max(0.0);
@@ -71,33 +86,14 @@ pub fn load_from_pdf(document: &PdfDocument<'_>) -> Result<HighlightStore> {
             let y = ((page_h - top) / page_h).clamp(0.0, 1.0);
             let h = ((top - bottom) / page_h).clamp(0.0, 1.0);
 
-            let color_hex = match hl.fill_color() {
-                Ok(c) => format!("#{:02x}{:02x}{:02x}", c.red(), c.green(), c.blue()),
-                Err(_) => "#ffd54f".to_string(),
-            };
-
-            // Try to recover our metadata from Contents. Foreign
-            // highlights without our prefix get a default note: None.
-            let (color_name, note) = match hl.contents() {
-                Some(s) if s.starts_with(TAG_PREFIX) => {
-                    let json_str = &s[TAG_PREFIX.len()..];
-                    match serde_json::from_str::<AnnotMeta>(json_str) {
-                        Ok(meta) => (meta.color, meta.note),
-                        Err(_) => (color_hex.clone(), Some(s.clone())),
-                    }
-                }
-                Some(s) => (color_hex.clone(), Some(s)),
-                None => (color_hex.clone(), None),
-            };
-
             items.push(Highlight {
                 page: page_idx as usize,
                 x,
                 y,
                 w,
                 h,
-                color: color_name,
-                note,
+                color: meta.color,
+                note: meta.note,
             });
         }
     }
@@ -265,4 +261,140 @@ fn save_atomic(document: &PdfDocument<'_>, path: &Path) -> Result<()> {
     fs::rename(&tmp_path, path)
         .with_context(|| format!("renaming {} → {}", tmp_path.display(), path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression tests for the PDF-annotation highlight pipeline.
+    //!
+    //! These need a real libpdfium loaded — `setup.sh` stages one in
+    //! `vendor/`. If pdfium can't be located (e.g. CI before
+    //! `setup.sh` ran), the tests skip via `eprintln` rather than
+    //! failing, so a clean `cargo test` on a fresh checkout still
+    //! tells the developer what to do.
+    use super::*;
+    use crate::highlight::{Highlight, HighlightStore};
+    use std::path::PathBuf;
+
+    fn pdfium_or_skip() -> Option<pdfium_render::prelude::Pdfium> {
+        let lib = match crate::pdf::find_libpdfium() {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("skipping: libpdfium not found (run ./setup.sh)");
+                return None;
+            }
+        };
+        let bindings = crate::pdf::bindings(&lib).ok()?;
+        Some(pdfium_render::prelude::Pdfium::new(bindings))
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("termpdf-test-{}-{}.pdf", std::process::id(), name));
+        p
+    }
+
+    /// REGRESSION: a Highlight annotation authored by Adobe (or any
+    /// other tool) that omits the InteriorColor entry caused
+    /// `pdfium-render`'s `fill_color()` to segfault under our 0.9
+    /// build — `load_from_pdf` would crash mid-iteration on a real
+    /// 600-page book. Skipping foreign annotations entirely avoids
+    /// the broken call and matches user intent (those annotations
+    /// are already painted by pdfium's own renderer).
+    #[test]
+    fn load_skips_foreign_highlights_without_segfault() {
+        let Some(pdfium) = pdfium_or_skip() else { return };
+        let path = temp_path("foreign");
+
+        // Build a one-page PDF with a Highlight annotation that
+        // intentionally has NO Contents tag (so it's "foreign") and
+        // NO fill_color set (mimicking Adobe's emission). Save then
+        // reload so the annotation goes through pdfium's parser.
+        {
+            let mut doc = pdfium.create_new_pdf().expect("new pdf");
+            let mut page = doc
+                .pages_mut()
+                .create_page_at_end(PdfPagePaperSize::a4())
+                .expect("page");
+            let bounds = PdfRect::new(
+                PdfPoints::new(100.0),
+                PdfPoints::new(100.0),
+                PdfPoints::new(150.0),
+                PdfPoints::new(300.0),
+            );
+            let mut hl = page
+                .annotations_mut()
+                .create_highlight_annotation()
+                .expect("create highlight");
+            hl.set_bounds(bounds).expect("set bounds");
+            // No set_fill_color, no set_contents — this is the shape
+            // that crashed on load.
+            doc.save_to_file(&path).expect("save");
+        }
+
+        let doc = pdfium
+            .load_pdf_from_file(&path, None)
+            .expect("reload");
+        // The bug was a segfault here; reaching the assert is the win.
+        let store = load_from_pdf(&doc).expect("load_from_pdf");
+        assert_eq!(
+            store.items.len(),
+            0,
+            "foreign highlights must be skipped (pdfium fill_color is unsafe on Adobe-style annotations)"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Roundtrip: save a tagged Highlight, reload it, verify all
+    /// fields survive. Catches any future change that breaks the
+    /// TAG_PREFIX/JSON encoding of color + note metadata.
+    #[test]
+    fn save_then_load_roundtrips_metadata() {
+        let Some(pdfium) = pdfium_or_skip() else { return };
+        let path = temp_path("roundtrip");
+
+        // Start with an empty 1-page PDF.
+        {
+            let mut doc = pdfium.create_new_pdf().expect("new pdf");
+            doc.pages_mut()
+                .create_page_at_end(PdfPagePaperSize::a4())
+                .expect("page");
+            doc.save_to_file(&path).expect("save empty");
+        }
+
+        // Open the saved file and drop one of our highlights into it.
+        {
+            let doc = pdfium.load_pdf_from_file(&path, None).expect("reload");
+            let store = HighlightStore {
+                items: vec![Highlight {
+                    page: 0,
+                    x: 0.10,
+                    y: 0.20,
+                    w: 0.30,
+                    h: 0.05,
+                    color: "#ffd54f".into(),
+                    note: Some("hello".into()),
+                }],
+            };
+            save_to_pdf(&doc, &store, &path).expect("save_to_pdf");
+        }
+
+        // Reopen and verify our metadata round-tripped.
+        let doc = pdfium.load_pdf_from_file(&path, None).expect("reload2");
+        let store = load_from_pdf(&doc).expect("load_from_pdf");
+        assert_eq!(store.items.len(), 1);
+        let h = &store.items[0];
+        assert_eq!(h.page, 0);
+        assert_eq!(h.color, "#ffd54f");
+        assert_eq!(h.note.as_deref(), Some("hello"));
+        // Coordinates should round-trip within ~0.5% (PDF point grid
+        // is 1/72in, so a few pt of rounding noise is expected).
+        assert!((h.x - 0.10).abs() < 0.01, "x: got {}", h.x);
+        assert!((h.y - 0.20).abs() < 0.01, "y: got {}", h.y);
+        assert!((h.w - 0.30).abs() < 0.01, "w: got {}", h.w);
+        assert!((h.h - 0.05).abs() < 0.01, "h: got {}", h.h);
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
