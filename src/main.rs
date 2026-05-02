@@ -27,7 +27,7 @@ mod pdf;
 mod pdfhighlights;
 mod search;
 mod session;
-mod text;
+mod textlayout;
 mod ui;
 
 use std::io;

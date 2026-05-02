@@ -16,6 +16,7 @@ use crate::pdf::{self, PageMetrics};
 use crate::pdfhighlights;
 use crate::search::SearchResults;
 use crate::session::Session;
+use crate::textlayout::{Caret, TextCache, TextSelection};
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -111,14 +112,20 @@ pub struct App<'doc> {
     pub layout: PageLayout,
     pub last_layout_key: Option<LayoutKey>,
 
-    /// Active selection rectangle in normalised PDF page coords
-    /// (0..1, top-left origin), bound to a specific page.
-    pub selection: Option<Rect01>,
-    pub selection_page: usize,
+    /// Vim-style text selection: anchor + head carets pointing at
+    /// chars in the document's text layer. `None` outside Visual
+    /// mode. The carets address pages (page idx) and chars within a
+    /// page (idx into the page's `PageText.chars`). `text_cache`
+    /// holds the per-page char geometry these carets reference.
+    pub text_selection: Option<TextSelection>,
     pub selection_color_idx: usize,
-    /// Mouse-drag anchor point in normalised page coords; set on
-    /// left-click, updated on drag, consumed on release.
-    pub drag_anchor: Option<(usize, f32, f32)>,
+    /// Per-page text-layout cache, lazily populated when the user
+    /// enters Visual mode or starts a mouse drag. LRU-evicted along
+    /// with the page bitmap cache.
+    pub text_cache: TextCache,
+    /// True while a mouse drag is in progress — `mouse_drag_to` only
+    /// updates `text_selection.head` when this is set.
+    pub mouse_dragging: bool,
 
     pub picker: Picker,
     /// Stable per-process kitty image ID. Every kitty graphics
@@ -261,10 +268,10 @@ impl<'doc> App<'doc> {
             cell_size_px: picker.font_size(),
             layout,
             last_layout_key: None,
-            selection: None,
-            selection_page: 0,
+            text_selection: None,
             selection_color_idx: 0,
-            drag_anchor: None,
+            text_cache: TextCache::default(),
+            mouse_dragging: false,
             picker,
             kitty_image_id: stable_kitty_id(),
             is_tmux: std::env::var("TMUX").is_ok(),
@@ -353,6 +360,15 @@ impl<'doc> App<'doc> {
         self.page_cache.retain(|&k, _| k >= lo && k < hi);
         self.overlay_cache.retain(|&k, _| k >= lo && k < hi);
         self.page_cache_lru.retain(|&k| k >= lo && k < hi);
+        // The text-layout cache holds char bbox + line index per page;
+        // a few hundred KB per page in dense documents. Drop any entry
+        // outside the visible window unless it's anchoring the active
+        // selection (in which case keep it so motion stays valid).
+        let anchor_page = self.text_selection.map(|s| s.anchor.page);
+        let head_page = self.text_selection.map(|s| s.head.page);
+        self.text_cache.retain(|page| {
+            (page >= lo && page < hi) || Some(page) == anchor_page || Some(page) == head_page
+        });
     }
 
     /// Mark a page as the most-recently-used. Called every time
@@ -553,32 +569,38 @@ impl<'doc> App<'doc> {
     }
 
     pub fn enter_visual(&mut self) {
-        // Anchor the selection to the page currently in the viewport
-        // center, with a small default rectangle.
+        // Place the caret at the first char of the page currently in
+        // the viewport. If the page has no extractable text (image-
+        // only / scanned PDF), bail with a status hint rather than
+        // sitting in Visual mode with nothing to select.
         let page = self.current_page();
-        let cx: f32 = 0.5;
-        let cy: f32 = 0.5;
-        let w: f32 = 0.25;
-        let h: f32 = 0.10;
-        self.selection = Some(Rect01 {
-            x: (cx - w / 2.0).clamp(0.0, 1.0 - w),
-            y: (cy - h / 2.0).clamp(0.0, 1.0 - h),
-            w,
-            h,
-        });
-        self.selection_page = page;
+        let metrics = match self.page_metrics.get(page).copied() {
+            Some(m) => m,
+            None => return,
+        };
+        let pt = match self.text_cache.get_or_load(&self.document, page, &metrics) {
+            Ok(pt) => pt,
+            Err(e) => {
+                self.status = format!("page {}: cannot read text ({e:#})", page + 1);
+                return;
+            }
+        };
+        if pt.chars.is_empty() {
+            self.status = format!("page {}: no selectable text", page + 1);
+            return;
+        }
+        let caret = Caret { page, idx: 0 };
+        self.text_selection = Some(TextSelection::new(caret));
         self.mode = Mode::Visual;
         self.pending.clear();
-        self.status = "VISUAL — hjkl/arrows move, HJKL resize, drag mouse, y save, Esc".into();
-        self.invalidate_compose();
+        self.status = "VISUAL — drag to select · y save+copy · Y copy · c color · Esc".into();
     }
 
     pub fn exit_visual(&mut self) {
-        self.selection = None;
-        self.drag_anchor = None;
+        self.text_selection = None;
+        self.mouse_dragging = false;
         self.mode = Mode::Normal;
         self.status.clear();
-        self.invalidate_compose();
     }
 
     /// Yank the active Visual-mode selection: extract its text,
@@ -591,22 +613,37 @@ impl<'doc> App<'doc> {
     /// surfaced in the status line rather than silently swallowed —
     /// users want to know if their quote didn't actually land.
     pub fn yank_selection(&mut self, save: bool) {
-        let Some(sel) = self.selection.take() else {
+        let Some(sel) = self.text_selection.take() else {
             self.mode = Mode::Normal;
             return;
         };
         let color = HIGHLIGHT_COLORS[self.selection_color_idx % HIGHLIGHT_COLORS.len()];
-        let metrics = self.page_metrics.get(self.selection_page).copied();
 
-        // Try to extract text; an Err here is a real pdfium failure
-        // (corrupt page), distinct from "empty rect" which returns
-        // Ok("").
-        let text = match metrics {
-            Some(m) => crate::text::extract_rect(&self.document, self.selection_page, sel, &m)
-                .unwrap_or_default(),
-            None => String::new(),
-        };
-        let text = text.trim();
+        // Walk pages in document order, asking each page's text
+        // layout for the substring of its char range that's inside
+        // the selection. Concatenate with `\n\n` between pages.
+        let (lo, hi) = sel.ordered();
+        let mut combined = String::new();
+        let mut per_page_rects: Vec<(usize, Vec<Rect01>)> = Vec::new();
+        for page_idx in lo.page..=hi.page {
+            let Some(pt) = self.text_cache.get(page_idx) else {
+                continue;
+            };
+            let start = if page_idx == lo.page { lo.idx } else { 0 };
+            let end = if page_idx == hi.page {
+                hi.idx
+            } else {
+                pt.chars.len().saturating_sub(1)
+            };
+            if !combined.is_empty() {
+                combined.push_str("\n\n");
+            }
+            combined.push_str(&pt.extract(start, end));
+            if save {
+                per_page_rects.push((page_idx, pt.range_to_rects(start, end)));
+            }
+        }
+        let text = combined.trim();
 
         let copy_outcome = if !text.is_empty() {
             Some(crate::clipboard::copy(text))
@@ -615,28 +652,35 @@ impl<'doc> App<'doc> {
         };
 
         if save {
-            self.highlights.add(Highlight {
-                page: self.selection_page,
-                x: sel.x,
-                y: sel.y,
-                w: sel.w,
-                h: sel.h,
-                color: color.hex.into(),
-                note: None,
-            });
+            // One Highlight entry per visual line, so multi-line
+            // selections highlight by line shape (the "3-band" model)
+            // instead of one giant bounding rect across all of them.
+            for (page_idx, rects) in per_page_rects {
+                for r in rects {
+                    if r.w < 1e-4 || r.h < 1e-4 {
+                        continue;
+                    }
+                    self.highlights.add(Highlight {
+                        page: page_idx,
+                        x: r.x,
+                        y: r.y,
+                        w: r.w,
+                        h: r.h,
+                        color: color.hex.into(),
+                        note: None,
+                    });
+                }
+            }
             self.highlight_revision += 1;
+            self.invalidate_compose();
         }
 
-        // Status message: tell the user what actually happened.
         self.status = match (save, copy_outcome) {
             (true, Some(o)) if o.truncated => {
                 format!("highlight saved + copied {} bytes (truncated)", o.bytes)
             }
             (true, Some(o)) => format!("highlight saved + copied {} bytes", o.bytes),
-            (true, None) => format!(
-                "highlight saved on page {} (no text in selection)",
-                self.selection_page + 1
-            ),
+            (true, None) => "highlight saved (no extractable text)".into(),
             (false, Some(o)) if o.truncated => {
                 format!("copied {} bytes (truncated)", o.bytes)
             }
@@ -644,9 +688,8 @@ impl<'doc> App<'doc> {
             (false, None) => "no text in selection".into(),
         };
 
-        self.drag_anchor = None;
+        self.mouse_dragging = false;
         self.mode = Mode::Normal;
-        self.invalidate_compose();
     }
 
     /// Backwards-compatible name for `y` (save + copy). Visual-mode
@@ -856,12 +899,47 @@ impl<'doc> App<'doc> {
         self.invalidate_compose();
     }
 
-    /// Move/resize the active Visual-mode selection in normalised
-    /// page-space (0..1).
-    pub fn nudge_selection(&mut self, dx: f32, dy: f32, resize: bool) {
-        if let Some(sel) = self.selection.as_mut() {
-            *sel = nudge_rect(*sel, dx, dy, resize);
-            self.invalidate_compose();
+    /// Move the head caret by `delta` chars within the current page.
+    /// Negative deltas walk backwards. Phase 1 stays on a single
+    /// page; cross-page motion lands in Phase 3 along with `gj`/`gk`.
+    pub fn move_head_chars(&mut self, delta: i32) {
+        if let Some(sel) = self.text_selection.as_mut() {
+            let Some(pt) = self.text_cache.get(sel.head.page) else {
+                return;
+            };
+            let n = pt.chars.len() as i32;
+            if n == 0 {
+                return;
+            }
+            let new = ((sel.head.idx as i32) + delta).clamp(0, n - 1);
+            sel.head.idx = new as usize;
+        }
+    }
+
+    /// Move the head caret to the previous/next visual line, keeping
+    /// roughly the same x-column (vim's `j`/`k` over wrapped lines).
+    pub fn move_head_lines(&mut self, delta: i32) {
+        if let Some(sel) = self.text_selection.as_mut() {
+            let Some(pt) = self.text_cache.get(sel.head.page) else {
+                return;
+            };
+            let cur_line = match pt.line_of(sel.head.idx) {
+                Some(l) => l as i32,
+                None => return,
+            };
+            let new_line = (cur_line + delta).clamp(0, pt.lines.len() as i32 - 1) as usize;
+            // Pick the char on the new line whose origin_x is nearest
+            // to the current caret's origin_x.
+            let target_x = pt.chars[sel.head.idx].origin_x;
+            let span = &pt.lines[new_line];
+            let mut best = (span.start_idx, f32::MAX);
+            for i in span.start_idx..=span.end_idx {
+                let dx = (pt.chars[i].origin_x - target_x).abs();
+                if dx < best.1 {
+                    best = (i, dx);
+                }
+            }
+            sel.head.idx = best.0;
         }
     }
 
@@ -902,60 +980,68 @@ impl<'doc> App<'doc> {
         )
     }
 
-    /// Begin a mouse-drag highlight at `(col, row)`. Switches into
-    /// Visual mode with a zero-size selection at the click point.
+    /// Begin a mouse-drag text selection. Loads the page's text
+    /// layout if not cached, finds the char nearest the click point,
+    /// and anchors the selection there. Cross-page drag is supported
+    /// — the head simply moves to whichever page the cursor hovers.
     pub fn mouse_drag_start(&mut self, col: u16, row: u16) {
-        if let Some((page, nx, ny)) = self.cell_to_page_coord(col, row) {
-            self.drag_anchor = Some((page, nx, ny));
-            self.selection_page = page;
-            self.selection = Some(Rect01 { x: nx, y: ny, w: 0.0, h: 0.0 });
-            self.mode = Mode::Visual;
-            self.status = "Drag to select · release to save · Esc to cancel".into();
-            self.invalidate_compose();
-        }
+        let Some((page, nx, ny)) = self.cell_to_page_coord(col, row) else {
+            return;
+        };
+        let Some(metrics) = self.page_metrics.get(page).copied() else {
+            return;
+        };
+        let pt = match self.text_cache.get_or_load(&self.document, page, &metrics) {
+            Ok(pt) => pt,
+            Err(_) => return,
+        };
+        let Some(idx) = pt.char_at_point(nx, ny) else {
+            return;
+        };
+        let caret = Caret { page, idx };
+        self.text_selection = Some(TextSelection::new(caret));
+        self.mouse_dragging = true;
+        self.mode = Mode::Visual;
+        self.status = "Drag to select · release to save · Esc to cancel".into();
     }
 
-    /// Update the in-progress mouse-drag selection. No-op if no drag
-    /// is active or the cursor moved off the page strip.
+    /// Update the head caret while the mouse is held. Crosses pages
+    /// freely — `range_to_rects` + `extract` handle multi-page spans.
     pub fn mouse_drag_to(&mut self, col: u16, row: u16) {
-        let Some((anchor_page, ax, ay)) = self.drag_anchor else {
-            return;
-        };
-        let Some((cur_page, nx, ny)) = self.cell_to_page_coord(col, row) else {
-            return;
-        };
-        // Confine the selection to the anchor page — cross-page
-        // selection isn't representable in the highlight store, and
-        // clamping to the anchor page keeps the rectangle visible.
-        if cur_page != anchor_page {
+        if !self.mouse_dragging {
             return;
         }
-        let x0 = ax.min(nx);
-        let y0 = ay.min(ny);
-        let x1 = ax.max(nx);
-        let y1 = ay.max(ny);
-        self.selection = Some(Rect01 {
-            x: x0,
-            y: y0,
-            w: (x1 - x0).max(0.001),
-            h: (y1 - y0).max(0.001),
-        });
-        self.selection_page = anchor_page;
-        self.invalidate_compose();
-    }
-
-    /// Finalise a mouse-drag selection. Saves if the rectangle is
-    /// large enough to be a real highlight, otherwise just discards
-    /// it (treats single click as "exit Visual mode without saving").
-    pub fn mouse_drag_end(&mut self) {
-        let Some(_) = self.drag_anchor.take() else {
+        let Some((page, nx, ny)) = self.cell_to_page_coord(col, row) else {
             return;
         };
-        let big_enough = self
-            .selection
-            .map(|s| s.w >= 0.01 && s.h >= 0.01)
+        let Some(metrics) = self.page_metrics.get(page).copied() else {
+            return;
+        };
+        let pt = match self.text_cache.get_or_load(&self.document, page, &metrics) {
+            Ok(pt) => pt,
+            Err(_) => return,
+        };
+        let Some(idx) = pt.char_at_point(nx, ny) else {
+            return;
+        };
+        if let Some(sel) = self.text_selection.as_mut() {
+            sel.head = Caret { page, idx };
+        }
+    }
+
+    /// Finalise a mouse-drag selection. Treats a click-without-drag
+    /// (anchor == head) as "exit Visual mode without saving"; any
+    /// real range commits as a highlight + clipboard yank.
+    pub fn mouse_drag_end(&mut self) {
+        if !self.mouse_dragging {
+            return;
+        }
+        self.mouse_dragging = false;
+        let real = self
+            .text_selection
+            .map(|s| s.anchor != s.head)
             .unwrap_or(false);
-        if big_enough {
+        if real {
             self.save_selection();
         } else {
             self.exit_visual();
@@ -1088,6 +1174,11 @@ pub fn cell_to_page_coord_pure(
 /// mode hjkl/HJKL keypress. Sliding leaves size fixed; resizing
 /// grows/shrinks from the bottom-right corner. Both modes clamp to
 /// stay inside the page and never collapse below 1% × 1%.
+///
+/// Kept around (with tests) as the reference implementation for the
+/// future visual-block (`<C-v>`) rectangular-selection mode that
+/// lands in Phase 4.
+#[allow(dead_code)]
 pub fn nudge_rect(sel: Rect01, dx: f32, dy: f32, resize: bool) -> Rect01 {
     if resize {
         Rect01 {

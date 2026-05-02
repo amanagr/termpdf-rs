@@ -1,0 +1,588 @@
+//! Per-page text geometry: char positions, line clustering, word
+//! boundaries. Built lazily from pdfium's `PdfPageText` once per page,
+//! cached as long as the page is kept alive.
+//!
+//! This is the data layer for vim-style caret motions (`hjkl`, `w`,
+//! `b`, `e`, `0`, `$`, `f<c>`, …). Selection lives as a pair of
+//! `Caret { page, char_idx }`s; rendering goes through pdfium's
+//! `segments_subset` so a multi-line selection is drawn as one rect
+//! per visual line — the same "3-band" model okular and mupdf use.
+
+use std::collections::HashMap;
+
+use anyhow::{Context, Result};
+use pdfium_render::prelude::*;
+
+use crate::highlight::Rect01;
+use crate::pdf::PageMetrics;
+
+/// Position of a single caret in the document: a page index plus a
+/// char index inside that page's stream (`PageText.chars[idx]`).
+/// Carets are addresses into a *visible* page's text — anything off-
+/// page is `None` rather than encoded here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Caret {
+    pub page: usize,
+    pub idx: usize,
+}
+
+/// Vim-style visual-mode selection: anchor stays where Visual was
+/// entered; head follows motion / drag. The selection covers
+/// `min(anchor, head) ..= max(anchor, head)` in document order
+/// (page-major, then char-index-major).
+#[derive(Debug, Clone, Copy)]
+pub struct TextSelection {
+    pub anchor: Caret,
+    pub head: Caret,
+    /// Selection flavour. Phase 1 only constructs `Charwise`; the
+    /// other variants are wired in Phase 4 (`V` and `<C-v>`).
+    #[allow(dead_code)]
+    pub mode: SelMode,
+}
+
+/// vim's three visual flavours. `Charwise` is `v`, `Linewise` is `V`,
+/// `Blockwise` is `<C-v>`. Phase 1 wires only `Charwise`; the others
+/// land in Phase 4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum SelMode {
+    Charwise,
+    Linewise,
+    Blockwise,
+}
+
+impl TextSelection {
+    pub fn new(at: Caret) -> Self {
+        Self { anchor: at, head: at, mode: SelMode::Charwise }
+    }
+
+    /// Lower (earlier in reading order) and upper carets.
+    pub fn ordered(&self) -> (Caret, Caret) {
+        if (self.anchor.page, self.anchor.idx) <= (self.head.page, self.head.idx) {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+}
+
+/// A single character on a page: its index inside pdfium's text run,
+/// the unicode codepoint (`None` for invalid / generated chars), the
+/// loose-bounds bbox in normalised top-left page coords, and the
+/// visual line it belongs to. The `origin_x` is kept verbatim
+/// (normalised 0..1) so vertical motion `j`/`k` can re-pin the caret
+/// to the same column in the next/previous line.
+#[derive(Debug, Clone)]
+pub struct CharCell {
+    /// Pdfium's stream-order index. Phase 4 rect-mode selection will
+    /// use this to ask pdfium for `segments_subset(start, count)`
+    /// rect lists; today's geometric path doesn't need it.
+    #[allow(dead_code)]
+    pub idx: usize,
+    pub ch: Option<char>,
+    pub bbox: Rect01,
+    pub line: usize,
+    pub origin_x: f32,
+    pub is_generated: bool,
+}
+
+/// One visual line on a page: char-index range plus per-line word
+/// boundaries (indices into `PageText.chars`). Word boundaries use
+/// a cheap unicode-aware whitespace heuristic — sufficient for
+/// `w`/`b`/`e` motions; can graduate to `unicode-segmentation` if
+/// users hit edge cases with CJK or punctuation runs.
+#[derive(Debug, Clone)]
+pub struct LineSpan {
+    pub y_top: f32,
+    pub y_bot: f32,
+    pub start_idx: usize,
+    pub end_idx: usize,
+    pub word_starts: Vec<usize>,
+}
+
+/// Whole-page geometry.
+#[derive(Debug, Clone)]
+pub struct PageText {
+    /// Page index this layout belongs to. Used by upcoming phases
+    /// (cross-page caret motion) and for diagnostic logging.
+    #[allow(dead_code)]
+    pub page_idx: usize,
+    pub chars: Vec<CharCell>,
+    pub lines: Vec<LineSpan>,
+    /// Page dimensions in PDF points — kept so a future "selection
+    /// → PDF coords" pass can convert without a `PageMetrics` round-trip.
+    #[allow(dead_code)]
+    pub width_pts: f32,
+    #[allow(dead_code)]
+    pub height_pts: f32,
+}
+
+impl PageText {
+    /// Eagerly walk every char on the page; build `CharCell`s in
+    /// stream order, then cluster into visual lines by Y-band.
+    pub fn load(
+        document: &PdfDocument<'_>,
+        page_idx: usize,
+        metrics: &PageMetrics,
+    ) -> Result<Self> {
+        let pages = document.pages();
+        let page = pages
+            .get(page_idx as i32)
+            .with_context(|| format!("opening page {} for text layout", page_idx + 1))?;
+        let text = page
+            .text()
+            .with_context(|| format!("loading text page {}", page_idx + 1))?;
+
+        let w = metrics.width_pts.max(1.0);
+        let h = metrics.height_pts.max(1.0);
+
+        let mut chars: Vec<CharCell> = Vec::new();
+        for ch in text.chars().iter() {
+            let bbox = match ch.loose_bounds() {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            // Y flip: pdfium PdfRect is bottom-left; we want top-left.
+            let x = (bbox.left().value / w).clamp(0.0, 1.0);
+            let right = (bbox.right().value / w).clamp(0.0, 1.0);
+            let top = ((h - bbox.top().value) / h).clamp(0.0, 1.0);
+            let bot = ((h - bbox.bottom().value) / h).clamp(0.0, 1.0);
+            chars.push(CharCell {
+                idx: ch.index() as usize,
+                ch: ch.unicode_char(),
+                bbox: Rect01 {
+                    x,
+                    y: top,
+                    w: (right - x).max(0.0),
+                    h: (bot - top).max(0.0),
+                },
+                line: 0, // filled in by line clustering below
+                origin_x: x,
+                is_generated: ch.is_generated().unwrap_or(false),
+            });
+        }
+
+        let lines = cluster_lines(&mut chars);
+
+        Ok(Self {
+            page_idx,
+            chars,
+            lines,
+            width_pts: w,
+            height_pts: h,
+        })
+    }
+
+    /// Find the index of the char nearest `(nx, ny)` in normalised
+    /// page coords, or `None` if the page has no chars at all.
+    /// Prefers exact-hit (point inside the bbox) but falls back to
+    /// the nearest-by-centre when the click lands in whitespace.
+    pub fn char_at_point(&self, nx: f32, ny: f32) -> Option<usize> {
+        if self.chars.is_empty() {
+            return None;
+        }
+        // Exact hit first.
+        for (i, c) in self.chars.iter().enumerate() {
+            if nx >= c.bbox.x
+                && nx <= c.bbox.x + c.bbox.w
+                && ny >= c.bbox.y
+                && ny <= c.bbox.y + c.bbox.h
+            {
+                return Some(i);
+            }
+        }
+        // Snap to nearest-by-center on the closest line.
+        let mut best = (0usize, f32::MAX);
+        for (i, c) in self.chars.iter().enumerate() {
+            let cx = c.bbox.x + c.bbox.w * 0.5;
+            let cy = c.bbox.y + c.bbox.h * 0.5;
+            let dy = (cy - ny).abs();
+            // Heavily penalise off-line distance — clicking in a gap
+            // between lines should snap to the nearer line, not jump
+            // far away in X.
+            let d = dy * 4.0 + (cx - nx).abs();
+            if d < best.1 {
+                best = (i, d);
+            }
+        }
+        Some(best.0)
+    }
+
+    /// Line index containing `char_idx`, if any. Generated/space
+    /// chars carry the `line` of the line they belong to (see
+    /// `cluster_lines`).
+    pub fn line_of(&self, char_idx: usize) -> Option<usize> {
+        self.chars.get(char_idx).map(|c| c.line)
+    }
+
+    /// First char index on `line`. `None` for empty/missing lines.
+    /// Used by Phase 3's `0` / `^` motions.
+    #[allow(dead_code)]
+    pub fn line_start(&self, line: usize) -> Option<usize> {
+        self.lines.get(line).map(|l| l.start_idx)
+    }
+
+    /// Last char index on `line` (inclusive). Used by Phase 3's `$`.
+    #[allow(dead_code)]
+    pub fn line_end(&self, line: usize) -> Option<usize> {
+        self.lines.get(line).map(|l| l.end_idx)
+    }
+
+    /// Per-visual-line rectangles covering the inclusive char range
+    /// `[start, end]`. Implements the textbook 3-band model: tail of
+    /// the start line, full bands of inner lines, head of the end
+    /// line. Returns one rect per line, in top-to-bottom order.
+    pub fn range_to_rects(&self, start: usize, end: usize) -> Vec<Rect01> {
+        if self.chars.is_empty() {
+            return Vec::new();
+        }
+        let (lo, hi) = if start <= end { (start, end) } else { (end, start) };
+        let lo = lo.min(self.chars.len() - 1);
+        let hi = hi.min(self.chars.len() - 1);
+        let line_lo = self.chars[lo].line;
+        let line_hi = self.chars[hi].line;
+
+        let mut out: Vec<Rect01> = Vec::new();
+        for line_idx in line_lo..=line_hi {
+            let Some(span) = self.lines.get(line_idx) else { continue };
+            // Determine the char range covering THIS line within the
+            // selection — the start of the selection on the first
+            // line, the end of the selection on the last line, and
+            // the full line's width on intermediate lines.
+            let first = if line_idx == line_lo {
+                lo
+            } else {
+                span.start_idx
+            };
+            let last = if line_idx == line_hi {
+                hi
+            } else {
+                span.end_idx
+            };
+            // Compute the line rect from the bbox union of the
+            // selected chars on that line. Skip lines whose chars
+            // have zero width (empty/blank).
+            let mut rect: Option<Rect01> = None;
+            for c in &self.chars[first..=last.min(self.chars.len() - 1)] {
+                if c.line != line_idx {
+                    continue;
+                }
+                if c.bbox.w < 1e-6 || c.bbox.h < 1e-6 {
+                    continue;
+                }
+                rect = Some(match rect {
+                    Some(prev) => union_rect(prev, c.bbox),
+                    None => c.bbox,
+                });
+            }
+            if let Some(r) = rect {
+                out.push(r);
+            }
+        }
+        out
+    }
+
+    /// Extract text for the inclusive char range as a string.
+    /// Inserts a `\n` between visual lines so paragraph breaks are
+    /// preserved in the clipboard payload.
+    pub fn extract(&self, start: usize, end: usize) -> String {
+        if self.chars.is_empty() {
+            return String::new();
+        }
+        let (lo, hi) = if start <= end { (start, end) } else { (end, start) };
+        let lo = lo.min(self.chars.len() - 1);
+        let hi = hi.min(self.chars.len() - 1);
+        let mut out = String::new();
+        let mut last_line = self.chars[lo].line;
+        for c in &self.chars[lo..=hi] {
+            if c.is_generated {
+                continue;
+            }
+            if c.line != last_line {
+                out.push('\n');
+                last_line = c.line;
+            }
+            if let Some(ch) = c.ch {
+                out.push(ch);
+            }
+        }
+        out
+    }
+}
+
+/// Cluster `chars` (in pdfium stream order) into visual lines by Y
+/// band. Mutates each `CharCell::line` to point at its line index.
+/// Returns `LineSpan`s in top-to-bottom order.
+///
+/// The clustering uses a tolerance proportional to the median char
+/// height: a char joins the current line if its Y centre is within
+/// half a line-height of the running mean Y centre. Stream order is
+/// usually close to reading order for body text — multi-column or
+/// tabular layouts may need a smarter pass later.
+fn cluster_lines(chars: &mut [CharCell]) -> Vec<LineSpan> {
+    if chars.is_empty() {
+        return Vec::new();
+    }
+
+    // Build (idx, y_center, h) triples and sort by Y so we walk
+    // top-to-bottom regardless of pdfium's stream order.
+    let mut order: Vec<(usize, f32, f32)> = chars
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i, c.bbox.y + c.bbox.h * 0.5, c.bbox.h.max(1e-6)))
+        .collect();
+    order.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Median height as the line-band tolerance.
+    let mut heights: Vec<f32> = order.iter().map(|t| t.2).collect();
+    heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let med_h = heights[heights.len() / 2].max(1e-4);
+    let tol = med_h * 0.55;
+
+    // First pass: walk in Y order, group chars into lines.
+    let mut line_id: usize = 0;
+    let mut line_y_sum = 0.0f32;
+    let mut line_count = 0u32;
+    let mut char_lines: Vec<usize> = vec![0; chars.len()];
+    let mut last_centre = order[0].1;
+
+    for (i, y, _h) in order.iter() {
+        let mean = if line_count > 0 {
+            line_y_sum / line_count as f32
+        } else {
+            *y
+        };
+        if (y - mean).abs() > tol && line_count > 0 {
+            line_id += 1;
+            line_y_sum = 0.0;
+            line_count = 0;
+        }
+        line_y_sum += y;
+        line_count += 1;
+        last_centre = *y;
+        char_lines[*i] = line_id;
+    }
+    let _ = last_centre;
+
+    // Apply line ids back to chars.
+    for (i, c) in chars.iter_mut().enumerate() {
+        c.line = char_lines[i];
+    }
+
+    // Second pass: build LineSpan ranges. We need stream-order
+    // contiguity to use start_idx..=end_idx as a range, so we sort
+    // chars within each line by stream idx and emit min/max.
+    let line_count_total = line_id + 1;
+    let mut spans: Vec<LineSpan> = (0..line_count_total)
+        .map(|_| LineSpan {
+            y_top: f32::MAX,
+            y_bot: 0.0,
+            start_idx: usize::MAX,
+            end_idx: 0,
+            word_starts: Vec::new(),
+        })
+        .collect();
+    for (i, c) in chars.iter().enumerate() {
+        let s = &mut spans[c.line];
+        if c.bbox.y < s.y_top {
+            s.y_top = c.bbox.y;
+        }
+        let bot = c.bbox.y + c.bbox.h;
+        if bot > s.y_bot {
+            s.y_bot = bot;
+        }
+        if i < s.start_idx {
+            s.start_idx = i;
+        }
+        if i > s.end_idx {
+            s.end_idx = i;
+        }
+    }
+
+    // Third pass: per-line word boundaries via simple Unicode
+    // whitespace transitions over the chars in stream order on that
+    // line. A char is a "word start" if it's a non-space and the
+    // previous char on the same line was a space (or this is the
+    // first char on the line).
+    for span in spans.iter_mut() {
+        let mut prev_was_space = true;
+        for i in span.start_idx..=span.end_idx {
+            let c = &chars[i];
+            if c.line != chars[span.start_idx].line {
+                continue;
+            }
+            let is_space = c
+                .ch
+                .map(|ch| ch.is_whitespace())
+                .unwrap_or(true);
+            if !is_space && prev_was_space {
+                span.word_starts.push(i);
+            }
+            prev_was_space = is_space;
+        }
+    }
+
+    spans
+}
+
+fn union_rect(a: Rect01, b: Rect01) -> Rect01 {
+    let x0 = a.x.min(b.x);
+    let y0 = a.y.min(b.y);
+    let x1 = (a.x + a.w).max(b.x + b.w);
+    let y1 = (a.y + a.h).max(b.y + b.h);
+    Rect01 {
+        x: x0,
+        y: y0,
+        w: (x1 - x0).max(0.0),
+        h: (y1 - y0).max(0.0),
+    }
+}
+
+/// LRU-style cache: holds `PageText` for any page the user has
+/// touched while in select mode. Drop entries via `evict_far` when
+/// the visible window moves so memory stays bounded.
+#[derive(Default)]
+pub struct TextCache {
+    map: HashMap<usize, PageText>,
+}
+
+impl TextCache {
+    pub fn get_or_load(
+        &mut self,
+        document: &PdfDocument<'_>,
+        page_idx: usize,
+        metrics: &PageMetrics,
+    ) -> Result<&PageText> {
+        if !self.map.contains_key(&page_idx) {
+            let pt = PageText::load(document, page_idx, metrics)?;
+            self.map.insert(page_idx, pt);
+        }
+        Ok(self.map.get(&page_idx).unwrap())
+    }
+
+    pub fn get(&self, page_idx: usize) -> Option<&PageText> {
+        self.map.get(&page_idx)
+    }
+
+    pub fn retain<F: FnMut(usize) -> bool>(&mut self, mut keep: F) {
+        self.map.retain(|&k, _| keep(k));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cell(idx: usize, x: f32, y: f32, w: f32, h: f32, ch: char) -> CharCell {
+        CharCell {
+            idx,
+            ch: Some(ch),
+            bbox: Rect01 { x, y, w, h },
+            line: 0,
+            origin_x: x,
+            is_generated: false,
+        }
+    }
+
+    fn page_with(chars: Vec<CharCell>) -> PageText {
+        let mut chars = chars;
+        let lines = cluster_lines(&mut chars);
+        PageText {
+            page_idx: 0,
+            chars,
+            lines,
+            width_pts: 100.0,
+            height_pts: 200.0,
+        }
+    }
+
+    #[test]
+    fn clusters_two_visual_lines() {
+        // Three chars on line A (y=0.1), three on line B (y=0.3).
+        let pt = page_with(vec![
+            cell(0, 0.10, 0.10, 0.05, 0.04, 'a'),
+            cell(1, 0.16, 0.10, 0.05, 0.04, 'b'),
+            cell(2, 0.22, 0.10, 0.05, 0.04, 'c'),
+            cell(3, 0.10, 0.30, 0.05, 0.04, 'd'),
+            cell(4, 0.16, 0.30, 0.05, 0.04, 'e'),
+            cell(5, 0.22, 0.30, 0.05, 0.04, 'f'),
+        ]);
+        assert_eq!(pt.lines.len(), 2);
+        assert_eq!(pt.line_of(0), Some(0));
+        assert_eq!(pt.line_of(5), Some(1));
+        assert_eq!(pt.line_start(1), Some(3));
+        assert_eq!(pt.line_end(1), Some(5));
+    }
+
+    #[test]
+    fn range_to_rects_emits_one_rect_per_line() {
+        let pt = page_with(vec![
+            cell(0, 0.10, 0.10, 0.05, 0.04, 'a'),
+            cell(1, 0.16, 0.10, 0.05, 0.04, 'b'),
+            cell(2, 0.10, 0.30, 0.05, 0.04, 'c'),
+            cell(3, 0.16, 0.30, 0.05, 0.04, 'd'),
+        ]);
+        // Selection from char 0 (line 0) through char 3 (line 1).
+        let rects = pt.range_to_rects(0, 3);
+        assert_eq!(rects.len(), 2, "got {rects:?}");
+    }
+
+    #[test]
+    fn char_at_point_exact_hit() {
+        let pt = page_with(vec![
+            cell(0, 0.10, 0.10, 0.05, 0.04, 'a'),
+            cell(1, 0.30, 0.10, 0.05, 0.04, 'b'),
+        ]);
+        assert_eq!(pt.char_at_point(0.12, 0.12), Some(0));
+        assert_eq!(pt.char_at_point(0.32, 0.12), Some(1));
+    }
+
+    #[test]
+    fn char_at_point_snaps_in_whitespace() {
+        // Click between two chars; should snap to nearer one.
+        let pt = page_with(vec![
+            cell(0, 0.10, 0.10, 0.05, 0.04, 'a'),
+            cell(1, 0.30, 0.10, 0.05, 0.04, 'b'),
+        ]);
+        // Closer to 'a'.
+        assert_eq!(pt.char_at_point(0.18, 0.12), Some(0));
+        // Closer to 'b'.
+        assert_eq!(pt.char_at_point(0.27, 0.12), Some(1));
+    }
+
+    #[test]
+    fn extract_inserts_newline_between_lines() {
+        let pt = page_with(vec![
+            cell(0, 0.10, 0.10, 0.05, 0.04, 'a'),
+            cell(1, 0.16, 0.10, 0.05, 0.04, 'b'),
+            cell(2, 0.10, 0.30, 0.05, 0.04, 'c'),
+        ]);
+        let s = pt.extract(0, 2);
+        assert_eq!(s, "ab\nc");
+    }
+
+    #[test]
+    fn word_starts_split_on_whitespace() {
+        // "ab cd" on one line.
+        let pt = page_with(vec![
+            cell(0, 0.10, 0.10, 0.05, 0.04, 'a'),
+            cell(1, 0.16, 0.10, 0.05, 0.04, 'b'),
+            cell(2, 0.22, 0.10, 0.05, 0.04, ' '),
+            cell(3, 0.28, 0.10, 0.05, 0.04, 'c'),
+            cell(4, 0.34, 0.10, 0.05, 0.04, 'd'),
+        ]);
+        assert_eq!(pt.lines[0].word_starts, vec![0, 3]);
+    }
+
+    #[test]
+    fn extract_skips_generated_chars() {
+        let mut a = cell(0, 0.10, 0.10, 0.05, 0.04, 'a');
+        let mut g = cell(1, 0.16, 0.10, 0.05, 0.04, 'X');
+        g.is_generated = true;
+        let b = cell(2, 0.22, 0.10, 0.05, 0.04, 'b');
+        let pt = page_with(vec![a.clone(), g, b]);
+        let s = pt.extract(0, 2);
+        assert_eq!(s, "ab");
+        let _ = a;
+    }
+}

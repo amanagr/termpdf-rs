@@ -15,7 +15,6 @@ use crate::cmd;
 const SCROLL_LINE: f32 = 0.05;
 const SCROLL_HALF: f32 = 0.50;
 const SCROLL_SCREEN: f32 = 0.85;
-const SELECTION_STEP: f32 = 0.02;
 
 pub fn dispatch(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
     if app.show_help {
@@ -170,26 +169,23 @@ fn cmd_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
 }
 
 fn visual_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
-    let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+    let _ = k.modifiers.contains(KeyModifiers::SHIFT);
     match k.code {
         KeyCode::Esc | KeyCode::Char('q') => app.exit_visual(),
         KeyCode::Char('y') | KeyCode::Enter => app.yank_selection(true),
         KeyCode::Char('Y') => app.yank_selection(false),
         KeyCode::Char('c') => app.cycle_color(),
 
-        KeyCode::Char('h') => app.nudge_selection(-SELECTION_STEP, 0.0, false),
-        KeyCode::Char('l') => app.nudge_selection(SELECTION_STEP, 0.0, false),
-        KeyCode::Char('j') => app.nudge_selection(0.0, SELECTION_STEP, false),
-        KeyCode::Char('k') => app.nudge_selection(0.0, -SELECTION_STEP, false),
-        KeyCode::Char('H') => app.nudge_selection(-SELECTION_STEP, 0.0, true),
-        KeyCode::Char('L') => app.nudge_selection(SELECTION_STEP, 0.0, true),
-        KeyCode::Char('J') => app.nudge_selection(0.0, SELECTION_STEP, true),
-        KeyCode::Char('K') => app.nudge_selection(0.0, -SELECTION_STEP, true),
+        // Char-wise caret motion (vim's `h`/`l`).
+        KeyCode::Char('h') | KeyCode::Left => app.move_head_chars(-1),
+        KeyCode::Char('l') | KeyCode::Right => app.move_head_chars(1),
+        // Line-wise caret motion (`j`/`k`); column-preserving.
+        KeyCode::Char('j') | KeyCode::Down => app.move_head_lines(1),
+        KeyCode::Char('k') | KeyCode::Up => app.move_head_lines(-1),
 
-        KeyCode::Left => app.nudge_selection(-SELECTION_STEP, 0.0, shift),
-        KeyCode::Right => app.nudge_selection(SELECTION_STEP, 0.0, shift),
-        KeyCode::Up => app.nudge_selection(0.0, -SELECTION_STEP, shift),
-        KeyCode::Down => app.nudge_selection(0.0, SELECTION_STEP, shift),
+        // Word motions (Phase 3) and line-extreme motions land here
+        // in upcoming commits; the old HJKL "resize" keys have no
+        // text-selection equivalent and are deliberately freed up.
         _ => {}
     }
     Ok(())

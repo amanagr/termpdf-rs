@@ -25,7 +25,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use ratatui_image::protocol::StatefulProtocol;
-use ratatui_image::{Resize, StatefulImage};
+use ratatui_image::StatefulImage;
 
 use crate::app::{App, ComposeKey, LayoutKey, Mode, PageOverlayKey};
 use crate::compose::{fill_rect_blend, norm_to_pixels, outline_rect};
@@ -77,17 +77,17 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
         );
     } else if let Some(proto) = app.image_proto.as_mut() {
         // The composed image is exactly viewport-sized (we already
-        // centered/cropped while painting), so we just hand it to
-        // ratatui-image at the image area unchanged.
-        let fit = Resize::Fit(None);
-        let render_size = proto.size_for(fit, img_area);
-        let placed = Rect {
-            x: img_area.x,
-            y: img_area.y,
-            width: render_size.width.min(img_area.width),
-            height: img_area.height,
-        };
-        f.render_stateful_widget(StatefulImage::<StatefulProtocol>::new(), placed, proto);
+        // centered/cropped while painting), so render it across the
+        // full image area. Previously we trimmed the placed width to
+        // `render_size.width.min(img_area.width)`, which left a strip
+        // of cells on the right with no kitty placeholders — the
+        // terminal painted those as default-bg black, most visibly
+        // when the help popup was open and the user could see them.
+        f.render_stateful_widget(
+            StatefulImage::<StatefulProtocol>::new(),
+            img_area,
+            proto,
+        );
     }
 
     // Selection overlay paints AFTER the kitty image so it overwrites
@@ -375,7 +375,7 @@ fn draw_selection_overlay(f: &mut ratatui::Frame, app: &App<'_>, img_area: Rect)
     if app.mode != Mode::Visual {
         return;
     }
-    let Some(sel) = app.selection else {
+    let Some(sel) = app.text_selection else {
         return;
     };
 
@@ -385,6 +385,41 @@ fn draw_selection_overlay(f: &mut ratatui::Frame, app: &App<'_>, img_area: Rect)
         return;
     }
 
+    let color = HIGHLIGHT_COLORS[app.selection_color_idx % HIGHLIGHT_COLORS.len()];
+    let (r, g, b) = color.rgb;
+    let style = Style::default()
+        .fg(Color::Rgb(r, g, b))
+        .add_modifier(Modifier::BOLD);
+
+    let (lo, hi) = sel.ordered();
+    for page_idx in lo.page..=hi.page {
+        let Some(pt) = app.text_cache.get(page_idx) else { continue };
+        let start = if page_idx == lo.page { lo.idx } else { 0 };
+        let end = if page_idx == hi.page {
+            hi.idx
+        } else {
+            pt.chars.len().saturating_sub(1)
+        };
+        let rects = pt.range_to_rects(start, end);
+        for r01 in rects {
+            paint_rect_cells(f, app, img_area, page_idx, r01, style);
+        }
+    }
+}
+
+/// Paint a normalised page rect as terminal cells (half-shade `▒`)
+/// over the kitty image area. Shared between `draw_selection_overlay`
+/// (any number of per-line rects) and any future caret cursor.
+fn paint_rect_cells(
+    f: &mut ratatui::Frame,
+    app: &App<'_>,
+    img_area: Rect,
+    page_idx: usize,
+    rect: Rect01,
+    style: Style,
+) {
+    let (cell_w, cell_h) = app.cell_size_px;
+    let (vw, _) = app.viewport_px;
     let fit_width_px = app.layout.fit_width_px;
     let page_x_origin: i64 = if fit_width_px <= vw {
         ((vw - fit_width_px) / 2) as i64
@@ -392,17 +427,15 @@ fn draw_selection_overlay(f: &mut ratatui::Frame, app: &App<'_>, img_area: Rect)
         -(((fit_width_px - vw) as f32) * app.scroll_x).round() as i64
     };
 
-    let page_y = app.layout.page_y(app.selection_page);
-    let page_h = app.layout.page_h(app.selection_page) as f32;
+    let page_y = app.layout.page_y(page_idx);
+    let page_h = app.layout.page_h(page_idx) as f32;
     let page_top_in_viewport = page_y - app.scroll_y_px;
 
-    let rect_left = page_x_origin + (sel.x * fit_width_px as f32) as i64;
-    let rect_top = page_top_in_viewport + (sel.y * page_h) as i64;
-    let rect_right = page_x_origin + ((sel.x + sel.w) * fit_width_px as f32) as i64;
-    let rect_bot = page_top_in_viewport + ((sel.y + sel.h) * page_h) as i64;
+    let rect_left = page_x_origin + (rect.x * fit_width_px as f32) as i64;
+    let rect_top = page_top_in_viewport + (rect.y * page_h) as i64;
+    let rect_right = page_x_origin + ((rect.x + rect.w) * fit_width_px as f32) as i64;
+    let rect_bot = page_top_in_viewport + ((rect.y + rect.h) * page_h) as i64;
 
-    // Convert pixel bounds → cell bounds, expanding outward so a
-    // partially-covered cell still paints.
     let cw = cell_w as i64;
     let ch = cell_h as i64;
     let cell_x0 = rect_left.div_euclid(cw);
@@ -423,17 +456,9 @@ fn draw_selection_overlay(f: &mut ratatui::Frame, app: &App<'_>, img_area: Rect)
         return;
     }
 
-    let color = HIGHLIGHT_COLORS[app.selection_color_idx % HIGHLIGHT_COLORS.len()];
-    let (r, g, b) = color.rgb;
-    let style = Style::default()
-        .fg(Color::Rgb(r, g, b))
-        .add_modifier(Modifier::BOLD);
-
     let buf = f.buffer_mut();
     for y in abs_y0..abs_y1 {
         for x in abs_x0..abs_x1 {
-            // `cell_mut` returns None for out-of-bounds; should never
-            // fire here thanks to the clamp above, but treat defensively.
             if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
                 cell.set_char('▒');
                 cell.set_style(style);
