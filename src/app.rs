@@ -2,11 +2,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use image::{DynamicImage, RgbaImage};
+use image::{DynamicImage, Rgba, RgbaImage};
 use pdfium_render::prelude::PdfDocument;
 use ratatui::layout::Rect;
-use ratatui_image::picker::Picker;
-use ratatui_image::protocol::StatefulProtocol;
+use ratatui_image::picker::{Picker, ProtocolType};
+use ratatui_image::protocol::{ImageSource, StatefulProtocol, StatefulProtocolType};
+use ratatui_image::protocol::kitty::StatefulKitty;
 
 use crate::highlight::{Highlight, HighlightStore, Rect01, HIGHLIGHT_COLORS};
 use crate::layout::PageLayout;
@@ -38,15 +39,15 @@ pub struct LayoutKey {
 /// this so a mouse-drag selection only rebuilds the bitmap of the
 /// page the selection lives on — everything else keeps its
 /// already-overlaid copy across frames.
+///
+/// The active Visual-mode selection is NOT in this key — it's drawn
+/// on top of the kitty image as ratatui cells (see
+/// `ui::draw_selection_overlay`), so nudging the selection never
+/// touches the page bitmap or triggers a kitty graphics re-upload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageOverlayKey {
     pub layout: LayoutKey,
     pub highlight_revision: u64,
-    /// `None` unless the active Visual-mode selection lives on
-    /// this page. Encodes (x, y, w, h, color_idx) at 1/10000th
-    /// resolution so f32 rounding doesn't trigger spurious
-    /// rebuilds.
-    pub sel_sig: Option<(u32, u32, u32, u32, usize)>,
     /// Search-results revision (if any). Bumped when a new search
     /// runs, when the user advances to next/prev hit (so the "current
     /// hit" outline moves), or when results clear.
@@ -61,6 +62,10 @@ pub struct PageOverlayKey {
 /// Cache key for the *compose* tier (stitch visible pages into a
 /// viewport-sized canvas, blend overlays). Cheap; we still cache it
 /// so a still frame doesn't pointlessly re-blit.
+///
+/// Like `PageOverlayKey`, the live selection is intentionally absent:
+/// the selection lives in a separate cell-overlay layer, so its
+/// motion doesn't invalidate the kitty-encoded image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ComposeKey {
     pub layout: LayoutKey,
@@ -68,8 +73,6 @@ pub struct ComposeKey {
     pub viewport_h: u32,
     pub scroll_y_px: i64,
     pub scroll_x_milli: u32,
-    pub selection: Option<(usize, u32, u32, u32, u32)>,
-    pub selection_color_idx: usize,
     pub highlight_revision: u64,
 }
 
@@ -117,6 +120,18 @@ pub struct App<'doc> {
     pub drag_anchor: Option<(usize, f32, f32)>,
 
     pub picker: Picker,
+    /// Stable per-process kitty image ID. Every kitty graphics
+    /// transmission reuses this ID so the terminal *replaces* the
+    /// previous image data instead of appending a fresh image to
+    /// its store. Without this, every scroll/zoom/highlight change
+    /// allocates a new image in the terminal's memory; Ghostty
+    /// crashed at ~10–20 such allocations because ratatui-image's
+    /// default `new_resize_protocol` randomises the ID per call.
+    pub kitty_image_id: u32,
+    /// Cached `is_tmux` flag — picker's own field is private, but
+    /// the same `$TMUX` heuristic ratatui-image uses is good enough
+    /// for kitty passthrough wrapping.
+    pub is_tmux: bool,
     /// Per-page rendered bitmap (no overlays applied). Bounded by
     /// both a sliding window around the visible range *and* a hard
     /// byte budget — whichever is tighter wins. Insertion order is
@@ -227,6 +242,8 @@ impl<'doc> App<'doc> {
             selection_color_idx: 0,
             drag_anchor: None,
             picker,
+            kitty_image_id: stable_kitty_id(),
+            is_tmux: std::env::var("TMUX").is_ok(),
             page_cache: HashMap::new(),
             page_cache_lru: Vec::new(),
             last_scroll_dir: 0,
@@ -925,6 +942,33 @@ impl<'doc> App<'doc> {
         self.highlights.save(&self.path)
     }
 
+    /// Build a `StatefulProtocol` for the supplied canvas. For the
+    /// kitty protocol we bypass `picker.new_resize_protocol` so we
+    /// can hand-pick a stable image ID — this is the fix for the
+    /// Ghostty crash at ~10–20 keystrokes (every random ID stayed
+    /// resident in the terminal's image store).
+    pub fn build_protocol(&self, canvas: DynamicImage) -> StatefulProtocol {
+        match self.picker.protocol_type() {
+            ProtocolType::Kitty => {
+                let source = ImageSource::new(
+                    canvas,
+                    self.picker.font_size(),
+                    Rgba([0, 0, 0, 0]),
+                );
+                let kitty = StatefulKitty::new(self.kitty_image_id, self.is_tmux);
+                StatefulProtocol::new(
+                    source,
+                    self.picker.font_size(),
+                    StatefulProtocolType::Kitty(kitty),
+                )
+            }
+            // Other protocols don't have the same image-id-namespace
+            // problem (sixel/iterm2 stream the bytes inline; halfblocks
+            // is just text). Use the picker's stock builder.
+            _ => self.picker.new_resize_protocol(canvas),
+        }
+    }
+
     pub fn persist_session(&self) -> Result<()> {
         Session {
             page: self.current_page(),
@@ -932,6 +976,19 @@ impl<'doc> App<'doc> {
         }
         .save(&self.path)
     }
+}
+
+/// Pick a stable, per-process kitty image ID. We just need *an* ID
+/// that won't collide with whatever else might already be live in
+/// the user's terminal — ratatui-image's default uses `random()`,
+/// which is fine for one-shot creation but defeats reuse-by-ID.
+/// Process ID hashed with the golden-ratio constant gives us a
+/// well-spread u32 without pulling in `rand`. Kitty IDs are 1..=u32::MAX;
+/// we bump 0 to 1 just in case.
+fn stable_kitty_id() -> u32 {
+    let mixed = (std::process::id() as u64).wrapping_mul(0x9E37_79B1_185E_BCA1);
+    let id = ((mixed >> 32) ^ mixed) as u32;
+    id.max(1)
 }
 
 /// Inter-page gap in pixels. Small but visible — large enough that

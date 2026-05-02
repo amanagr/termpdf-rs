@@ -251,16 +251,32 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
     while !app.should_quit {
         term.draw(|f| ui::draw(f, app))?;
 
-        // 250 ms tick so a future "auto-reload on file change" or an
-        // animated cursor in command mode just slot into the same loop.
+        // Block once for the next event (250 ms tick), then drain the
+        // queue without redrawing in between. Two reasons:
+        //   1. Mouse-drag fires 30–100 events/sec; a redraw per event
+        //      thrashes the kitty graphics pipeline. Coalescing keeps
+        //      only the *latest* drag position before the next paint.
+        //   2. Buffered keystrokes (user mashing Space) collapse into
+        //      one redraw — the user just sees the final scroll position
+        //      instead of a slow staircase of full re-encodes.
         if event::poll(Duration::from_millis(250))? {
-            match event::read()? {
-                Event::Key(k) if k.kind == KeyEventKind::Press => keys::dispatch(app, k)?,
-                Event::Resize(_, _) => app.invalidate_compose(),
-                Event::Mouse(m) => keys::dispatch_mouse(app, m)?,
-                _ => {}
+            dispatch_event(app, event::read()?)?;
+            // Drain any other pending events (poll(0) returns immediately).
+            // Stop early on quit so we don't keep dispatching after a `:q`.
+            while !app.should_quit && event::poll(Duration::ZERO)? {
+                dispatch_event(app, event::read()?)?;
             }
         }
+    }
+    Ok(())
+}
+
+fn dispatch_event(app: &mut App<'_>, ev: Event) -> Result<()> {
+    match ev {
+        Event::Key(k) if k.kind == KeyEventKind::Press => keys::dispatch(app, k)?,
+        Event::Resize(_, _) => app.invalidate_compose(),
+        Event::Mouse(m) => keys::dispatch_mouse(app, m)?,
+        _ => {}
     }
     Ok(())
 }

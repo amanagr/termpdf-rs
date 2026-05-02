@@ -90,6 +90,12 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
         f.render_stateful_widget(StatefulImage::<StatefulProtocol>::new(), placed, proto);
     }
 
+    // Selection overlay paints AFTER the kitty image so it overwrites
+    // the image-fragment placeholder cells with our colored blocks.
+    // Crucially, the selection lives entirely in the cell layer — no
+    // bitmap rebuild, no kitty re-encode, no terminal-side image churn.
+    draw_selection_overlay(f, app, img_area);
+
     f.render_widget(status_line(app), status_area);
 
     if app.show_toc {
@@ -140,25 +146,17 @@ fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
     app.evict_far_pages(visible.clone());
     app.enforce_byte_budget(page_cache_budget_bytes(), visible.clone());
 
-    // Compose key: changes to scroll, selection, highlight count, or
-    // viewport invalidate the cached canvas.
-    let sel_key = app.selection.map(|s| {
-        (
-            app.selection_page,
-            (s.x * 10000.0) as u32,
-            (s.y * 10000.0) as u32,
-            (s.w * 10000.0) as u32,
-            (s.h * 10000.0) as u32,
-        )
-    });
+    // Compose key: changes to scroll, highlight count, or viewport
+    // invalidate the cached canvas. The active Visual-mode selection
+    // is intentionally absent — it's drawn as a separate cell overlay
+    // (see `draw_selection_overlay`), so nudging the selection doesn't
+    // touch the kitty image at all.
     let compose_key = ComposeKey {
         layout: layout_key,
         viewport_w,
         viewport_h,
         scroll_y_px: app.scroll_y_px,
         scroll_x_milli: (app.scroll_x * 10000.0) as u32,
-        selection: sel_key,
-        selection_color_idx: app.selection_color_idx,
         highlight_revision: app.highlight_revision,
     };
     if app.last_compose_key == Some(compose_key) && app.image_proto.is_some() {
@@ -173,7 +171,7 @@ fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
     }
 
     let canvas = compose_viewport(app, viewport_w, viewport_h);
-    app.image_proto = Some(app.picker.new_resize_protocol(DynamicImage::ImageRgba8(canvas)));
+    app.image_proto = Some(app.build_protocol(DynamicImage::ImageRgba8(canvas)));
     app.last_compose_key = Some(compose_key);
     Ok(())
 }
@@ -221,19 +219,6 @@ fn ensure_page_rendered(
 }
 
 fn page_overlay_key(app: &App<'_>, page_idx: usize, layout: LayoutKey) -> PageOverlayKey {
-    let sel_sig = if app.selection_page == page_idx {
-        app.selection.map(|s| {
-            (
-                (s.x * 10000.0) as u32,
-                (s.y * 10000.0) as u32,
-                (s.w * 10000.0) as u32,
-                (s.h * 10000.0) as u32,
-                app.selection_color_idx,
-            )
-        })
-    } else {
-        None
-    };
     let (search_revision, has_search_hits, current_hit_on_this_page) = match &app.search {
         Some(s) => {
             let any = s.hits.iter().any(|h| h.page == page_idx);
@@ -248,7 +233,6 @@ fn page_overlay_key(app: &App<'_>, page_idx: usize, layout: LayoutKey) -> PageOv
     PageOverlayKey {
         layout,
         highlight_revision: app.highlight_revision,
-        sel_sig,
         search_revision,
         has_search_hits,
         current_hit_on_this_page,
@@ -286,15 +270,9 @@ fn ensure_overlay(app: &mut App<'_>, page_idx: usize, layout: LayoutKey) {
         let rgb = rgb_from_hex(&h.color);
         fill_rect_blend(&mut img, rect, rgb, 0.35);
     }
-    // Active Visual-mode selection if it lives on this page.
-    if app.selection_page == page_idx {
-        if let Some(sel) = app.selection {
-            let rect = norm_to_pixels(sel, img.width(), img.height());
-            let color = HIGHLIGHT_COLORS[app.selection_color_idx % HIGHLIGHT_COLORS.len()];
-            fill_rect_blend(&mut img, rect, color.rgb, 0.30);
-            outline_rect(&mut img, rect, color.rgb, 2);
-        }
-    }
+    // The active Visual-mode selection is NOT baked here. It paints
+    // over the kitty image as a cell overlay in `draw_selection_overlay`,
+    // so motion is independent of the page bitmap and the kitty re-encode.
 
     // Search hits on this page → orange translucent fill; the
     // current hit additionally gets a thicker outline so the user
@@ -379,6 +357,88 @@ fn blit_clipped(dst: &mut RgbaImage, dst_x: i64, dst_y: i64, src: &RgbaImage) {
         let dst_off = dst_y_row * dst_w * 4 + dst_x_off * 4;
         dst_buf[dst_off..dst_off + row_bytes]
             .copy_from_slice(&src_buf[src_off..src_off + row_bytes]);
+    }
+}
+
+/// Paint the active Visual-mode selection as a translucent block over
+/// the kitty image area. Snaps to terminal cells (the only granular
+/// unit ratatui can paint), which is intentional: pixel-precise
+/// selection feedback would require re-rendering and re-uploading the
+/// kitty image on every keystroke — the very thing that crashed
+/// Ghostty in the previous design.
+///
+/// We use a half-shade glyph (`▒`) with the highlight colour as fg
+/// rather than a solid bg-coloured space. Solid bg masks the page
+/// content under the selection; the shade leaves ~50% of the cell
+/// transparent so the user can still read what they're selecting.
+fn draw_selection_overlay(f: &mut ratatui::Frame, app: &App<'_>, img_area: Rect) {
+    if app.mode != Mode::Visual {
+        return;
+    }
+    let Some(sel) = app.selection else {
+        return;
+    };
+
+    let (cell_w, cell_h) = app.cell_size_px;
+    let (vw, vh) = app.viewport_px;
+    if cell_w == 0 || cell_h == 0 || vw == 0 || vh == 0 {
+        return;
+    }
+
+    let fit_width_px = app.layout.fit_width_px;
+    let page_x_origin: i64 = if fit_width_px <= vw {
+        ((vw - fit_width_px) / 2) as i64
+    } else {
+        -(((fit_width_px - vw) as f32) * app.scroll_x).round() as i64
+    };
+
+    let page_y = app.layout.page_y(app.selection_page);
+    let page_h = app.layout.page_h(app.selection_page) as f32;
+    let page_top_in_viewport = page_y - app.scroll_y_px;
+
+    let rect_left = page_x_origin + (sel.x * fit_width_px as f32) as i64;
+    let rect_top = page_top_in_viewport + (sel.y * page_h) as i64;
+    let rect_right = page_x_origin + ((sel.x + sel.w) * fit_width_px as f32) as i64;
+    let rect_bot = page_top_in_viewport + ((sel.y + sel.h) * page_h) as i64;
+
+    // Convert pixel bounds → cell bounds, expanding outward so a
+    // partially-covered cell still paints.
+    let cw = cell_w as i64;
+    let ch = cell_h as i64;
+    let cell_x0 = rect_left.div_euclid(cw);
+    let cell_y0 = rect_top.div_euclid(ch);
+    let cell_x1 = (rect_right + cw - 1).div_euclid(cw);
+    let cell_y1 = (rect_bot + ch - 1).div_euclid(ch);
+
+    let area_x0 = img_area.x as i64;
+    let area_y0 = img_area.y as i64;
+    let area_x1 = (img_area.x + img_area.width) as i64;
+    let area_y1 = (img_area.y + img_area.height) as i64;
+
+    let abs_x0 = (area_x0 + cell_x0).clamp(area_x0, area_x1);
+    let abs_y0 = (area_y0 + cell_y0).clamp(area_y0, area_y1);
+    let abs_x1 = (area_x0 + cell_x1).clamp(area_x0, area_x1);
+    let abs_y1 = (area_y0 + cell_y1).clamp(area_y0, area_y1);
+    if abs_x1 <= abs_x0 || abs_y1 <= abs_y0 {
+        return;
+    }
+
+    let color = HIGHLIGHT_COLORS[app.selection_color_idx % HIGHLIGHT_COLORS.len()];
+    let (r, g, b) = color.rgb;
+    let style = Style::default()
+        .fg(Color::Rgb(r, g, b))
+        .add_modifier(Modifier::BOLD);
+
+    let buf = f.buffer_mut();
+    for y in abs_y0..abs_y1 {
+        for x in abs_x0..abs_x1 {
+            // `cell_mut` returns None for out-of-bounds; should never
+            // fire here thanks to the clamp above, but treat defensively.
+            if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
+                cell.set_char('▒');
+                cell.set_style(style);
+            }
+        }
     }
 }
 
