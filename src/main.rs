@@ -41,12 +41,23 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use ratatui_image::picker::Picker;
+use ratatui_image::picker::{Picker, ProtocolType};
 
 use crate::app::App;
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum ProtocolChoice {
+    /// Probe the terminal; fall back to halfblocks if no answer.
+    Auto,
+    Kitty,
+    Sixel,
+    Iterm2,
+    /// Always-works fallback. Text is essentially unreadable.
+    Halfblocks,
+}
+
 #[derive(Parser, Debug)]
-#[command(version, about = "Terminal PDF reader (Kitty graphics + dark mode)")]
+#[command(version, about = "Terminal PDF reader (kitty/sixel/halfblocks)")]
 struct Args {
     /// Path to the PDF file.
     path: PathBuf,
@@ -56,6 +67,11 @@ struct Args {
     /// Start in dark mode (luminance-only inversion).
     #[arg(short, long)]
     dark: bool,
+    /// Force a specific terminal graphics protocol. `auto` (default)
+    /// probes the terminal and falls back to halfblocks. May also be
+    /// set via `$TERMPDF_PROTOCOL`.
+    #[arg(long, value_enum, default_value_t = ProtocolChoice::Auto)]
+    protocol: ProtocolChoice,
     /// Smoke test: render the requested page once (no TUI, no terminal
     /// query) and write the result PNG to the given path. Useful for CI
     /// or for sanity-checking pdfium + dark inversion without a TTY.
@@ -65,6 +81,67 @@ struct Args {
     /// Lets the rendering path under zoom be exercised headlessly.
     #[arg(long, default_value_t = 1.0)]
     probe_zoom: f32,
+}
+
+/// Resolve the effective protocol given the CLI flag and
+/// `$TERMPDF_PROTOCOL`, then build a `Picker`. CLI flag wins; env
+/// only kicks in when the flag is left at its default `auto`.
+fn pick_protocol(cli: ProtocolChoice) -> Picker {
+    let resolved = if cli != ProtocolChoice::Auto {
+        cli
+    } else {
+        match std::env::var("TERMPDF_PROTOCOL").ok().as_deref() {
+            Some("kitty") => ProtocolChoice::Kitty,
+            Some("sixel") => ProtocolChoice::Sixel,
+            Some("iterm2") => ProtocolChoice::Iterm2,
+            Some("halfblocks") => ProtocolChoice::Halfblocks,
+            _ => ProtocolChoice::Auto,
+        }
+    };
+
+    if resolved == ProtocolChoice::Auto {
+        // Probe; degrade to halfblocks when the terminal answers
+        // nothing (xterm without sixel, basic Windows Terminal, …).
+        match Picker::from_query_stdio() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "warning: terminal didn't advertise a graphics protocol ({e}). \
+                     Falling back to halfblocks — text will be illegible. \
+                     Try `--protocol sixel` or run inside Kitty/Ghostty/WezTerm."
+                );
+                Picker::halfblocks()
+            }
+        }
+    } else {
+        // Try probing first to get an accurate font_size; if that
+        // fails, halfblocks() supplies a sensible default. Then pin
+        // the requested protocol on top.
+        let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+        let target = match resolved {
+            ProtocolChoice::Kitty => ProtocolType::Kitty,
+            ProtocolChoice::Sixel => ProtocolType::Sixel,
+            ProtocolChoice::Iterm2 => ProtocolType::Iterm2,
+            ProtocolChoice::Halfblocks => ProtocolType::Halfblocks,
+            ProtocolChoice::Auto => unreachable!(),
+        };
+        picker.set_protocol_type(target);
+        picker
+    }
+}
+
+/// One-line stderr hint when running inside tmux without
+/// `allow-passthrough` configured. We can't reliably detect the
+/// passthrough flag, so we always print the hint when `$TMUX` is set
+/// (suppressible via `$TERMPDF_NO_TMUX_HINT`).
+fn tmux_passthrough_hint() {
+    if std::env::var("TMUX").is_ok() && std::env::var("TERMPDF_NO_TMUX_HINT").is_err() {
+        eprintln!(
+            "note: running inside tmux. If images don't render, run\n  \
+             tmux set -g allow-passthrough on\n  \
+             (silence with TERMPDF_NO_TMUX_HINT=1)"
+        );
+    }
 }
 
 fn main() -> Result<()> {
@@ -98,12 +175,8 @@ fn main() -> Result<()> {
         return probe(&document, start_page, start_dark, args.probe_zoom, &out);
     }
 
-    // ratatui-image probes the terminal at startup to figure out which
-    // graphics protocol it can speak (kitty, sixel, halfblocks). On
-    // Ghostty this lands on the Kitty protocol; we don't have to
-    // hand-encode the escape sequences ourselves.
-    let picker = Picker::from_query_stdio()
-        .context("querying terminal for graphics protocol — is this a Kitty/Ghostty/WezTerm?")?;
+    tmux_passthrough_hint();
+    let picker = pick_protocol(args.protocol);
 
     let mut app = App::new(document, &args.path, start_page, start_dark, picker)?;
 
