@@ -84,7 +84,14 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         // a duplicate of `k` (prev page boundary); the new binding
         // is what users coming from `less`/`man` expect.
         KeyCode::Char(' ') => {
-            app.scroll_by_screens(SCROLL_SCREEN);
+            // Capture a "you were reading here" marker before the
+            // jump (only if 10s+ since last Space — bursts of paging
+            // don't repaint it). Counted form captures once.
+            app.note_space_scroll();
+            let n = count.unwrap_or(1).max(1);
+            for _ in 0..n {
+                app.scroll_by_screens(SCROLL_SCREEN);
+            }
             app.pending.clear();
         }
         KeyCode::Char('b') => {

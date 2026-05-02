@@ -97,6 +97,14 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
     // bitmap rebuild, no kitty re-encode, no terminal-side image churn.
     draw_selection_overlay(f, app, img_area);
 
+    // Resume-reading marker: a single dim row of `─` at the position
+    // where the viewport bottom was *before* the last `<Space>` jump.
+    // Suppressed while a popup is up so the marker doesn't bleed at
+    // the popup edges.
+    if !app.show_help && !app.show_toc {
+        draw_resume_marker(f, app, img_area);
+    }
+
     f.render_widget(status_line(app), status_area);
 
     // Confine popups to the image area so their bottom border doesn't
@@ -108,6 +116,46 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
     if app.show_help {
         draw_help(f, img_area);
     }
+}
+
+/// Paint the "you were reading here" marker if one is active and
+/// within the current viewport. Expires the marker if its TTL has
+/// elapsed. The marker lives in document-pixel space so zoom and
+/// scroll changes leave it where the user expects; if it has scrolled
+/// out of view we just skip drawing (it'll reappear if the user
+/// scrolls back within its TTL).
+fn draw_resume_marker(f: &mut Frame, app: &mut App<'_>, img_area: Rect) {
+    app.expire_resume_marker();
+    let Some(marker) = app.resume_marker else { return };
+    let cell_h = app.cell_size_px.1.max(1) as i64;
+    let viewport_top = app.scroll_y_px;
+    let rel_px = marker.doc_y_px - viewport_top;
+    if rel_px < 0 || rel_px >= app.viewport_px.1 as i64 {
+        return;
+    }
+    let row = (rel_px / cell_h) as u16;
+    if row >= img_area.height {
+        return;
+    }
+    // Yellow fg, no background — visible on both light and dark page
+    // bitmaps without obscuring the underlying glyphs the way a fill
+    // band would. `─` (U+2500) tiles into a continuous line across
+    // adjacent cells.
+    let line: String = std::iter::repeat('─')
+        .take(img_area.width as usize)
+        .collect();
+    let para = Paragraph::new(line).style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::DIM),
+    );
+    let strip = Rect {
+        x: img_area.x,
+        y: img_area.y + row,
+        width: img_area.width,
+        height: 1,
+    };
+    f.render_widget(para, strip);
 }
 
 fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
@@ -695,6 +743,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         "  j / k                  next / prev page (jump to page boundary)",
         "  N j  /  N k            jump N pages forward / back",
         "  Space / b              scroll one screen down / up (less-style)",
+        "                         (Space drops a 3s resume line at your last bottom)",
         "  Ctrl-d / Ctrl-u        scroll a half-screen down / up",
         "  gg / G                 doc top / bottom",
         "  N G                    jump to page N",
