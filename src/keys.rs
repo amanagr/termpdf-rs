@@ -43,6 +43,28 @@ pub fn dispatch(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
 }
 
 fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
+    // Highlight-delete confirm: `x` stages, the very next keypress
+    // either confirms with `y` or cancels with anything else.
+    // Handled BEFORE mode dispatch so the confirm-`y` doesn't fall
+    // through to other `y` bindings later.
+    if app.awaiting_highlight_delete_confirm {
+        if matches!(k.code, KeyCode::Char('y')) {
+            let removed = app.confirm_delete_last_highlight();
+            app.status = if removed > 0 {
+                format!(
+                    "deleted highlight ({removed} rect{})",
+                    if removed == 1 { "" } else { "s" }
+                )
+            } else {
+                "nothing deleted".into()
+            };
+        } else {
+            app.cancel_delete_last_highlight();
+            app.status = "delete cancelled".into();
+        }
+        return Ok(());
+    }
+
     // Mark-set / mark-jump consume the very next keystroke as the
     // mark name. Handled before the regular dispatch so a literal
     // `j`/`k`/`q` here lands in the BTreeMap instead of moving pages.
@@ -147,10 +169,19 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         KeyCode::Char('N') => app.advance_search(-1),
 
         KeyCode::Char('x') => {
-            if app.delete_last_highlight_on_current_page() {
-                app.status = "removed last highlight on this page".into();
-            } else {
+            // Two-stroke confirm: first `x` stages the delete and
+            // shows the count in the status line. The next keypress
+            // either confirms with `y` or cancels with anything else.
+            // Prevents the foot-cannon where one stray `x` wipes a
+            // multi-line highlight the user just made.
+            let n = app.request_delete_last_highlight();
+            if n == 0 {
                 app.status = "no highlights on this page".into();
+            } else {
+                app.status = format!(
+                    "delete highlight ({n} rect{})? press y to confirm, any other key cancels",
+                    if n == 1 { "" } else { "s" }
+                );
             }
         }
 

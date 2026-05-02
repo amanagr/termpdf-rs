@@ -35,6 +35,14 @@ pub struct Highlight {
     /// noisy `"note": null` for every highlight.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// All Highlight entries created in a single user action share
+    /// the same `group_id`. A multi-line selection saved with `y`
+    /// becomes N rects on disk but ONE group; `x` deletes the whole
+    /// group instead of leaving the user mashing `x` to clear what
+    /// they made in one go. None on legacy / migrated highlights —
+    /// those still delete one-rect-at-a-time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<u64>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

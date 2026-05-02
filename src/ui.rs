@@ -70,7 +70,27 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
     app.image_area = img_area;
     app.cell_size_px = app.picker.font_size();
 
-    if let Err(e) = ensure_image(app, img_area) {
+    // Suppress the kitty image entirely while help/TOC popups are
+    // open. The kitty graphics protocol re-flows around any cell we
+    // paint over (the popup `Clear`), and on some terminals that
+    // breaks the unicode-placeholder mapping for the cells OUTSIDE
+    // the popup too — the user saw the right-of-popup region go
+    // blank. With the image suppressed, the popup paints onto a
+    // clean default background and reading resumes correctly when
+    // the popup closes (the next ensure_image rebuilds the protocol).
+    let popup_open = app.show_help || app.show_toc;
+    if popup_open {
+        // Drop the cached protocol so the next paint after the popup
+        // closes uploads a fresh image.
+        app.image_proto = None;
+        app.last_compose_key = None;
+        // Fill the image area with a soft background so the popup's
+        // surroundings aren't stark black.
+        f.render_widget(
+            Block::default().style(Style::default().bg(Color::Black)),
+            img_area,
+        );
+    } else if let Err(e) = ensure_image(app, img_area) {
         f.render_widget(
             Paragraph::new(format!("render error: {e:#}"))
                 .style(Style::default().fg(Color::Red)),
@@ -79,11 +99,7 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
     } else if let Some(proto) = app.image_proto.as_mut() {
         // The composed image is exactly viewport-sized (we already
         // centered/cropped while painting), so render it across the
-        // full image area. Previously we trimmed the placed width to
-        // `render_size.width.min(img_area.width)`, which left a strip
-        // of cells on the right with no kitty placeholders — the
-        // terminal painted those as default-bg black, most visibly
-        // when the help popup was open and the user could see them.
+        // full image area.
         f.render_stateful_widget(
             StatefulImage::<StatefulProtocol>::new(),
             img_area,
@@ -167,34 +183,40 @@ pub fn resume_marker_width(image_w: u16) -> u16 {
 /// span (chars + colors + modifiers) without spinning up an `App`.
 ///
 /// Layout:
-/// - Below `MIN_LABELED_WIDTH` cells: line-only `────` (dim yellow).
-/// - At or above: `─── resume here ───` with the label centered, bold
-///   yellow on the label and dim yellow on the rule. Odd remainder
-///   goes to the right flank so the visual weight feels left-anchored.
+/// - Below `MIN_LABELED_WIDTH` cells: line-only `────` (yellow).
+/// - At or above: `─── resume here ───` with the label centered.
+///   Label = bold black on yellow background (pops against any PDF
+///   page bitmap regardless of dark mode). Rules = plain yellow.
+///   Odd remainder goes to the right flank so the weight feels
+///   left-anchored.
+///
+/// The earlier version used `Modifier::DIM` for both rule and label;
+/// some terminals render DIM as ~transparent, which made the label
+/// invisible. Solid colours instead.
 pub fn resume_marker_line(marker_w: u16) -> Line<'static> {
     const LABEL: &str = "resume here";
-    // Need: at least 2 cells of `─` each side + 1 space of padding
-    // around the label. Below this width the label looks crammed.
     const MIN_LABELED_WIDTH: u16 = (LABEL.len() as u16) + 4 + 2;
-    let dim_yellow = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::DIM);
+    let rule_style = Style::default().fg(Color::Yellow);
     if marker_w < MIN_LABELED_WIDTH {
         let s: String = std::iter::repeat('─').take(marker_w as usize).collect();
-        return Line::from(Span::styled(s, dim_yellow));
+        return Line::from(Span::styled(s, rule_style));
     }
     let inner = marker_w - LABEL.len() as u16 - 2;
     let left_rule = inner / 2;
     let right_rule = inner - left_rule;
     let left: String = std::iter::repeat('─').take(left_rule as usize).collect();
     let right: String = std::iter::repeat('─').take(right_rule as usize).collect();
+    // Black-on-yellow tag style for the label — guaranteed visible
+    // on top of either a light or dark PDF render. BOLD reinforces
+    // the focal-point role.
     let label_style = Style::default()
-        .fg(Color::Yellow)
+        .fg(Color::Black)
+        .bg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
     Line::from(vec![
-        Span::styled(left, dim_yellow),
+        Span::styled(left, rule_style),
         Span::styled(format!(" {LABEL} "), label_style),
-        Span::styled(right, dim_yellow),
+        Span::styled(right, rule_style),
     ])
 }
 
@@ -535,12 +557,23 @@ fn draw_selection_overlay(f: &mut ratatui::Frame, app: &App<'_>, img_area: Rect)
         }
     }
 
-    // Caret cursor at the head, painted with a thicker fg so the user
-    // knows where motions are anchored.
+    // Caret cursor at the head — solid `█` block (not `▒`) so it
+    // visually pops above the half-shade selection band, with a 1×1
+    // cell minimum so it's never invisible at low zoom even when the
+    // char's bbox rounds to zero cells.
     if let Some(pt) = app.text_cache.get(sel.head.page) {
         if let Some(cell) = pt.chars.get(sel.head.idx) {
             let caret_style = selection_caret_style(app.selection_color_idx);
-            paint_rect_cells(f, app, img_area, sel.head.page, cell.bbox, caret_style);
+            paint_rect_cells_glyph(
+                f,
+                app,
+                img_area,
+                sel.head.page,
+                cell.bbox,
+                caret_style,
+                '█',
+                true,
+            );
         }
     }
 }
@@ -614,9 +647,10 @@ fn union_rect_pub(a: Rect01, b: Rect01) -> Rect01 {
     }
 }
 
-/// Paint a normalised page rect as terminal cells (half-shade `▒`)
-/// over the kitty image area. Shared between `draw_selection_overlay`
-/// (any number of per-line rects) and any future caret cursor.
+/// Paint a normalised page rect as terminal cells with the given
+/// glyph (`▒` for the half-shade selection band, `█` for the caret).
+/// Shared between `draw_selection_overlay`, the caret cursor, and any
+/// future overlay layer.
 fn paint_rect_cells(
     f: &mut ratatui::Frame,
     app: &App<'_>,
@@ -624,6 +658,22 @@ fn paint_rect_cells(
     page_idx: usize,
     rect: Rect01,
     style: Style,
+) {
+    paint_rect_cells_glyph(f, app, img_area, page_idx, rect, style, '▒', false);
+}
+
+/// Variant that lets the caller pick the glyph and force a 1×1
+/// minimum footprint. The caret needs the minimum because a single
+/// char's bbox can round to zero cells at low zoom and disappear.
+fn paint_rect_cells_glyph(
+    f: &mut ratatui::Frame,
+    app: &App<'_>,
+    img_area: Rect,
+    page_idx: usize,
+    rect: Rect01,
+    style: Style,
+    glyph: char,
+    ensure_min_one_cell: bool,
 ) {
     let (cell_w, cell_h) = app.cell_size_px;
     let (vw, _) = app.viewport_px;
@@ -647,8 +697,20 @@ fn paint_rect_cells(
     let ch = cell_h as i64;
     let cell_x0 = rect_left.div_euclid(cw);
     let cell_y0 = rect_top.div_euclid(ch);
-    let cell_x1 = (rect_right + cw - 1).div_euclid(cw);
-    let cell_y1 = (rect_bot + ch - 1).div_euclid(ch);
+    let mut cell_x1 = (rect_right + cw - 1).div_euclid(cw);
+    let mut cell_y1 = (rect_bot + ch - 1).div_euclid(ch);
+    // Force a 1×1 minimum so a tiny char-bbox (caret at low zoom)
+    // still paints SOMETHING. Without this, a sub-cell bbox rounds
+    // to a zero-area cell range and the caret silently vanishes —
+    // the "I can't see the cursor after `v`" bug.
+    if ensure_min_one_cell {
+        if cell_x1 <= cell_x0 {
+            cell_x1 = cell_x0 + 1;
+        }
+        if cell_y1 <= cell_y0 {
+            cell_y1 = cell_y0 + 1;
+        }
+    }
 
     let area_x0 = img_area.x as i64;
     let area_y0 = img_area.y as i64;
@@ -667,7 +729,7 @@ fn paint_rect_cells(
     for y in abs_y0..abs_y1 {
         for x in abs_x0..abs_x1 {
             if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
-                cell.set_char('▒');
+                cell.set_char(glyph);
                 cell.set_style(style);
             }
         }
@@ -850,7 +912,8 @@ pub fn help_overlay_lines() -> Vec<&'static str> {
         "    gy                   copy as Markdown blockquote with citation",
         "    Esc                  cancel",
         "  click + drag           highlight with the mouse",
-        "  x                      delete last highlight on current page",
+        "  x  then  y             delete last highlight on current page",
+        "                         (whole multi-line group; press anything else to cancel)",
         "",
         "  m{a-z} / '{a-z}        set / jump to mark (persisted per PDF)",
         "  Ctrl-o / Ctrl-i        jumplist back / forward (Tab also forward)",
@@ -919,42 +982,45 @@ mod tests {
     }
 
     #[test]
-    fn resume_marker_line_label_is_bold_yellow() {
+    fn resume_marker_line_label_is_bold_black_on_yellow() {
+        // Black-on-yellow tag style — visible on any PDF page bitmap
+        // regardless of dark mode. Earlier `Modifier::DIM` rendered as
+        // ~transparent on some terminals, hiding the label entirely.
         let line = resume_marker_line(40);
         let label_span = &line.spans[1];
-        assert_eq!(label_span.style.fg, Some(Color::Yellow));
+        assert_eq!(label_span.style.fg, Some(Color::Black));
+        assert_eq!(label_span.style.bg, Some(Color::Yellow));
+        assert!(label_span.style.add_modifier.contains(Modifier::BOLD));
         assert!(
-            label_span.style.add_modifier.contains(Modifier::BOLD),
-            "label must be bold so the eye lands on it"
+            !label_span.style.add_modifier.contains(Modifier::DIM),
+            "DIM is unreliable across terminals; never set it on the label"
         );
     }
 
     #[test]
-    fn resume_marker_line_rules_are_dim_yellow() {
+    fn resume_marker_line_rules_are_solid_yellow() {
         let line = resume_marker_line(40);
         for (i, span) in [&line.spans[0], &line.spans[2]].iter().enumerate() {
             assert_eq!(span.style.fg, Some(Color::Yellow), "rule span {i}");
             assert!(
-                span.style.add_modifier.contains(Modifier::DIM),
-                "rule span {i} should be DIM (label is the focal point)"
+                !span.style.add_modifier.contains(Modifier::DIM),
+                "rule span {i} must not be DIM (terminal-dependent)"
             );
         }
     }
 
     #[test]
     fn resume_marker_line_narrow_falls_back_to_line_only() {
-        // Anything below 17 cells should drop the label.
         let line = resume_marker_line(10);
         assert_eq!(line.spans.len(), 1, "narrow fallback = single span");
         assert!(line.spans[0].content.chars().all(|c| c == '─'));
         assert_eq!(line.spans[0].content.chars().count(), 10);
-        // Still dim yellow — same hue, just no label.
         assert_eq!(line.spans[0].style.fg, Some(Color::Yellow));
     }
 
     /// Render the marker through a real (test) backend and walk the
-    /// resulting cell buffer. This is the closest thing to "did the
-    /// terminal get the right bytes" that we can write headlessly.
+    /// resulting cell buffer. The closest thing to "did the terminal
+    /// get the right bytes" that we can write headlessly.
     #[test]
     fn resume_marker_renders_to_buffer_with_correct_chars_and_colors() {
         let backend = TestBackend::new(40, 1);
@@ -968,15 +1034,18 @@ mod tests {
         })
         .unwrap();
         let buf = term.backend().buffer();
-        // Reconstruct the rendered line by walking cells.
         let mut rendered = String::new();
-        let mut yellow_cells = 0;
+        let mut yellow_bg_cells = 0;
+        let mut yellow_fg_cells = 0;
         let mut bold_cells = 0;
         for x in 0..40 {
             let cell = buf.cell((x, 0)).unwrap();
             rendered.push_str(cell.symbol());
+            if cell.bg == Color::Yellow {
+                yellow_bg_cells += 1;
+            }
             if cell.fg == Color::Yellow {
-                yellow_cells += 1;
+                yellow_fg_cells += 1;
             }
             if cell.modifier.contains(Modifier::BOLD) {
                 bold_cells += 1;
@@ -990,16 +1059,16 @@ mod tests {
             rendered.starts_with('─') && rendered.ends_with('─'),
             "rendered cells should start and end with rule glyphs, got {rendered:?}"
         );
-        // Every cell of the marker should be yellow (rule + label).
+        // Label is the 13-cell tag. Black fg on yellow BG, bold.
         assert_eq!(
-            yellow_cells, 40,
-            "every cell must be yellow; got {yellow_cells} yellow cells"
+            yellow_bg_cells, 13,
+            "exactly the 13-cell label should have yellow background"
         );
-        // The label span (" resume here " = 13 chars) should be bold;
-        // the rules should not. Total bold cells = 13.
+        assert_eq!(bold_cells, 13, "exactly the label should be bold");
+        // Rules are the other 27 cells: yellow FG, no bg.
         assert_eq!(
-            bold_cells, 13,
-            "exactly the 13-cell label should be bold"
+            yellow_fg_cells, 27,
+            "rule cells must be yellow fg (27 = 40 - 13)"
         );
     }
 
@@ -1060,6 +1129,7 @@ mod tests {
             "iw / is / ip",
             "y / Enter",
             "gy",
+            "x  then  y",
             "/<query>",
             ":nohl",
             "o  /  :toc",

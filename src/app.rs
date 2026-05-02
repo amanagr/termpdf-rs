@@ -223,6 +223,16 @@ pub struct App<'doc> {
     /// line flickering on every jump.
     pub last_space_at: Option<Instant>,
 
+    /// Counter for new highlight `group_id`s. All rects from a single
+    /// yank share one id so `x` can delete the whole group at once.
+    /// Seeded from the highest existing group_id in the loaded store
+    /// so reopening a doc doesn't recycle ids.
+    pub next_highlight_group_id: u64,
+    /// Two-stroke confirm for `x` (delete-highlight). When true, the
+    /// next `y` keypress finalises the delete; any other key cancels.
+    /// Cleared on every keypress that isn't the confirm itself.
+    pub awaiting_highlight_delete_confirm: bool,
+
     pub should_quit: bool,
 }
 
@@ -268,6 +278,15 @@ impl<'doc> App<'doc> {
             eprintln!("warning: could not read PDF annotations: {e:#}");
             HighlightStore::default()
         });
+        // Seed the group-id counter past any existing id so a reopen
+        // of a document we previously wrote can't reuse a value.
+        let next_highlight_group_id = highlights
+            .items
+            .iter()
+            .filter_map(|h| h.group_id)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
         // Empty layout — first `ensure_image` call builds a real one
         // once the viewport size is known.
         let layout = PageLayout::build(&[], 0, 0);
@@ -321,6 +340,8 @@ impl<'doc> App<'doc> {
             awaiting_mark_jump: false,
             resume_marker: None,
             last_space_at: None,
+            next_highlight_group_id,
+            awaiting_highlight_delete_confirm: false,
             should_quit: false,
         };
         Ok(app)
@@ -827,9 +848,13 @@ impl<'doc> App<'doc> {
         };
 
         if save {
-            // One Highlight entry per visual line, so multi-line
-            // selections highlight by line shape (the "3-band" model)
-            // instead of one giant bounding rect across all of them.
+            // All rects from a single yank share one group_id so a
+            // later `x` can wipe the whole multi-line highlight in
+            // one keystroke instead of N (the user used to see only
+            // the last band disappear). Counter is monotonic per
+            // process; persisted to AnnotMeta so identity survives
+            // save+reopen.
+            let group_id = self.alloc_highlight_group_id();
             for (page_idx, rects) in per_page_rects {
                 for r in rects {
                     if r.w < 1e-4 || r.h < 1e-4 {
@@ -843,6 +868,7 @@ impl<'doc> App<'doc> {
                         h: r.h,
                         color: color.hex.into(),
                         note: None,
+                        group_id: Some(group_id),
                     });
                 }
             }
@@ -1295,21 +1321,98 @@ impl<'doc> App<'doc> {
         }
     }
 
-    pub fn delete_last_highlight_on_current_page(&mut self) -> bool {
+    /// Allocate the next group id and bump the counter.
+    pub fn alloc_highlight_group_id(&mut self) -> u64 {
+        let id = self.next_highlight_group_id;
+        self.next_highlight_group_id = self.next_highlight_group_id.wrapping_add(1);
+        id
+    }
+
+    /// Step 1 of the two-stroke delete: stage a confirm-prompt and
+    /// return how many highlight rects would be wiped on the current
+    /// page. The keys layer renders the prompt in the status line and
+    /// listens for the confirming `y`. Returns 0 if there's nothing
+    /// to delete on this page (caller surfaces "no highlights here").
+    pub fn request_delete_last_highlight(&mut self) -> usize {
         let page = self.current_page();
-        let pos = self
-            .highlights
-            .items
-            .iter()
-            .rposition(|h| h.page == page);
-        if let Some(idx) = pos {
-            self.highlights.items.remove(idx);
+        let target_group = self.last_highlight_group_on_page(page);
+        let count = match target_group {
+            // Grouped: count all entries on this page sharing the id.
+            Some(g) => self
+                .highlights
+                .items
+                .iter()
+                .filter(|h| h.page == page && h.group_id == Some(g))
+                .count(),
+            // Legacy: there's still SOMETHING here, but no group id —
+            // we'll fall back to deleting just the last entry.
+            None => {
+                if self.highlights.items.iter().any(|h| h.page == page) {
+                    1
+                } else {
+                    0
+                }
+            }
+        };
+        if count == 0 {
+            self.awaiting_highlight_delete_confirm = false;
+        } else {
+            self.awaiting_highlight_delete_confirm = true;
+        }
+        count
+    }
+
+    /// Step 2: actually delete the staged highlight group on the
+    /// current page. Returns the number of rects removed (0 if there
+    /// was nothing to delete or the request was already cancelled).
+    pub fn confirm_delete_last_highlight(&mut self) -> usize {
+        if !self.awaiting_highlight_delete_confirm {
+            return 0;
+        }
+        self.awaiting_highlight_delete_confirm = false;
+        let page = self.current_page();
+        let target_group = self.last_highlight_group_on_page(page);
+        let before = self.highlights.items.len();
+        match target_group {
+            Some(g) => self
+                .highlights
+                .items
+                .retain(|h| !(h.page == page && h.group_id == Some(g))),
+            None => {
+                if let Some(idx) = self
+                    .highlights
+                    .items
+                    .iter()
+                    .rposition(|h| h.page == page)
+                {
+                    self.highlights.items.remove(idx);
+                }
+            }
+        }
+        let removed = before - self.highlights.items.len();
+        if removed > 0 {
             self.highlight_revision += 1;
             self.invalidate_compose();
-            true
-        } else {
-            false
         }
+        removed
+    }
+
+    pub fn cancel_delete_last_highlight(&mut self) {
+        self.awaiting_highlight_delete_confirm = false;
+    }
+
+    /// Find the group_id of the most-recently-added highlight on
+    /// `page`. Walks from the end of the items vec; first match wins.
+    /// Returns None if there's a highlight on the page but it has no
+    /// group_id (legacy / migrated entry — the caller falls back to
+    /// "delete one entry").
+    fn last_highlight_group_on_page(&self, page: usize) -> Option<u64> {
+        for h in self.highlights.items.iter().rev() {
+            if h.page == page {
+                return h.group_id;
+            }
+        }
+        None
     }
 
     /// Convert a terminal (column, row) cell coordinate into

@@ -33,6 +33,8 @@ struct AnnotMeta {
     color: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group_id: Option<u64>,
 }
 
 /// Read every highlight annotation from every page and rebuild a
@@ -94,6 +96,7 @@ pub fn load_from_pdf(document: &PdfDocument<'_>) -> Result<HighlightStore> {
                 h,
                 color: meta.color,
                 note: meta.note,
+                group_id: meta.group_id,
             });
         }
     }
@@ -210,6 +213,7 @@ fn apply_store_to_document(
             let meta = AnnotMeta {
                 color: h.color.clone(),
                 note: h.note.clone(),
+                group_id: h.group_id,
             };
             let body = serde_json::to_string(&meta).unwrap_or_default();
             let _ = hl.set_contents(&format!("{TAG_PREFIX}{body}"));
@@ -346,6 +350,100 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// `group_id` round-trips through the AnnotMeta JSON and is
+    /// available on the loaded highlight — the field that lets `x`
+    /// delete a multi-line highlight as a single unit.
+    #[test]
+    fn group_id_roundtrips_through_save_and_load() {
+        let Some(pdfium) = pdfium_or_skip() else { return };
+        let path = temp_path("group-id");
+        {
+            let mut doc = pdfium.create_new_pdf().expect("new pdf");
+            doc.pages_mut()
+                .create_page_at_end(PdfPagePaperSize::a4())
+                .expect("page");
+            doc.save_to_file(&path).expect("save empty");
+        }
+        // Three rects sharing one group_id (think: a 3-line highlight).
+        let store = HighlightStore {
+            items: vec![
+                Highlight {
+                    page: 0, x: 0.10, y: 0.10, w: 0.20, h: 0.04,
+                    color: "#ffd54f".into(), note: None,
+                    group_id: Some(42),
+                },
+                Highlight {
+                    page: 0, x: 0.10, y: 0.15, w: 0.20, h: 0.04,
+                    color: "#ffd54f".into(), note: None,
+                    group_id: Some(42),
+                },
+                Highlight {
+                    page: 0, x: 0.10, y: 0.20, w: 0.20, h: 0.04,
+                    color: "#ffd54f".into(), note: None,
+                    group_id: Some(42),
+                },
+            ],
+        };
+        {
+            let doc = pdfium.load_pdf_from_file(&path, None).expect("reload");
+            save_to_pdf(&doc, &store, &path).expect("save");
+        }
+        let doc = pdfium.load_pdf_from_file(&path, None).expect("reload2");
+        let loaded = load_from_pdf(&doc).expect("load");
+        assert_eq!(loaded.items.len(), 3);
+        for h in &loaded.items {
+            assert_eq!(
+                h.group_id,
+                Some(42),
+                "group_id must round-trip so x can delete the whole group"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Legacy / migrated highlights without a group_id deserialize
+    /// cleanly as `None` (skip_serializing_if guarantees the JSON
+    /// stays compact for new entries too).
+    #[test]
+    fn missing_group_id_in_contents_loads_as_none() {
+        let Some(pdfium) = pdfium_or_skip() else { return };
+        let path = temp_path("legacy-meta");
+        {
+            let mut doc = pdfium.create_new_pdf().expect("new pdf");
+            let mut page = doc
+                .pages_mut()
+                .create_page_at_end(PdfPagePaperSize::a4())
+                .expect("page");
+            let bounds = PdfRect::new(
+                PdfPoints::new(500.0),
+                PdfPoints::new(50.0),
+                PdfPoints::new(550.0),
+                PdfPoints::new(200.0),
+            );
+            let mut hl = page
+                .annotations_mut()
+                .create_highlight_annotation()
+                .expect("create");
+            hl.set_bounds(bounds).expect("bounds");
+            // Hand-write a TAG_PREFIX'd Contents *without* group_id —
+            // mimics a highlight saved before the field existed.
+            hl.set_fill_color(PdfColor::new(0xff, 0xd5, 0x4f, 0xff))
+                .expect("color");
+            let body = "{\"color\":\"#ffd54f\"}";
+            hl.set_contents(&format!("{}{}", TAG_PREFIX, body))
+                .expect("contents");
+            doc.save_to_file(&path).expect("save");
+        }
+        let doc = pdfium.load_pdf_from_file(&path, None).expect("reload");
+        let loaded = load_from_pdf(&doc).expect("load");
+        assert_eq!(loaded.items.len(), 1);
+        assert!(
+            loaded.items[0].group_id.is_none(),
+            "legacy entries must load with group_id = None"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// REGRESSION: a Highlight saved via save_to_pdf and immediately
     /// re-applied (without a save+reload between) must survive the
     /// in-memory delete-then-recreate that apply_store_to_document
@@ -372,6 +470,7 @@ mod tests {
                 h: 0.05,
                 color: "#aed581".into(),
                 note: None,
+                group_id: None,
             }],
         };
         // Save twice in a row — must not duplicate or lose the entry.
@@ -431,6 +530,7 @@ mod tests {
                     h: 0.05,
                     color: "#ffd54f".into(),
                     note: None,
+                group_id: None,
                 }],
             };
             save_to_pdf(&doc, &store, &path).expect("save_to_pdf");
@@ -490,6 +590,7 @@ mod tests {
                     h: 0.05,
                     color: "#ffd54f".into(),
                     note: Some("hello".into()),
+                    group_id: None,
                 }],
             };
             save_to_pdf(&doc, &store, &path).expect("save_to_pdf");
