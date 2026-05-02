@@ -8,9 +8,13 @@ use crate::cmd;
 
 /// Step sizes. Scroll steps are in fractions of a viewport screen
 /// (continuous mode operates in pixels under the hood, but the UX
-/// is "how much of a screen does this key move me").
+/// is "how much of a screen does this key move me"). `SCROLL_SCREEN`
+/// is intentionally less than 1.0 so the user keeps a sliver of
+/// context across a page-down — same trick Vim's `<C-f>` and less'
+/// `<space>` use.
 const SCROLL_LINE: f32 = 0.05;
 const SCROLL_HALF: f32 = 0.50;
+const SCROLL_SCREEN: f32 = 0.85;
 const SELECTION_STEP: f32 = 0.02;
 
 pub fn dispatch(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
@@ -56,11 +60,20 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
             app.prev_page(count.unwrap_or(1));
             app.pending.clear();
         }
-        KeyCode::Char('b') => {
-            app.prev_page(count.unwrap_or(1));
+        // less-style screen scroll. Space pages forward by ~one
+        // viewport-sized window (with a sliver of overlap so the
+        // user keeps context); b pages back. Pure half-screen jumps
+        // live on Ctrl-d / Ctrl-u, matching vim. Previously `b` was
+        // a duplicate of `k` (prev page boundary); the new binding
+        // is what users coming from `less`/`man` expect.
+        KeyCode::Char(' ') => {
+            app.scroll_by_screens(SCROLL_SCREEN);
             app.pending.clear();
         }
-        KeyCode::Char(' ') => app.scroll_by_screens(SCROLL_HALF),
+        KeyCode::Char('b') => {
+            app.scroll_by_screens(-SCROLL_SCREEN);
+            app.pending.clear();
+        }
 
         // Within-document scroll. Arrows for fine; Ctrl-d/u for
         // half-screen jumps.
