@@ -13,6 +13,7 @@ use crate::highlight::{Highlight, HighlightStore, Rect01, HIGHLIGHT_COLORS};
 use crate::layout::PageLayout;
 use crate::outline::{self, OutlineEntry};
 use crate::pdf::{self, PageMetrics};
+use crate::pdfhighlights;
 use crate::search::SearchResults;
 use crate::session::Session;
 
@@ -207,14 +208,37 @@ impl<'doc> App<'doc> {
             eprintln!("warning: could not load outline: {e:#}");
             Vec::new()
         });
-        // Highlights are an enhancement — a corrupt or unreadable
-        // store shouldn't keep the user from opening the document.
-        // Surface the error to stderr and proceed with an empty
-        // store; the user can move/delete the bad file by hand.
-        let highlights = HighlightStore::load(path).unwrap_or_else(|e| {
-            eprintln!("warning: could not load highlights: {e:#}");
-            HighlightStore::default()
-        });
+        // Highlights now live as native PDF annotations on the
+        // document itself rather than a parallel JSON sidecar — that
+        // way they travel with the file, are visible in any viewer,
+        // and survive the user moving or renaming the PDF. If the
+        // PDF read fails we fall back to the legacy JSON store so a
+        // user upgrading from a sidecar-era version doesn't lose
+        // their work.
+        let highlights = match pdfhighlights::load_from_pdf(&document) {
+            Ok(mut from_pdf) => {
+                // Migration: if a sidecar exists from a prior
+                // version, fold its entries in and let the next save
+                // commit them as PDF annotations.
+                if let Ok(legacy) = HighlightStore::load(path) {
+                    if !legacy.items.is_empty() && from_pdf.items.is_empty() {
+                        eprintln!(
+                            "note: migrated {} highlight(s) from sidecar JSON into the PDF",
+                            legacy.items.len()
+                        );
+                        from_pdf = legacy;
+                    }
+                }
+                from_pdf
+            }
+            Err(e) => {
+                eprintln!("warning: could not read PDF annotations: {e:#}");
+                HighlightStore::load(path).unwrap_or_else(|e| {
+                    eprintln!("warning: could not load legacy sidecar highlights: {e:#}");
+                    HighlightStore::default()
+                })
+            }
+        };
         // Empty layout — first `ensure_image` call builds a real one
         // once the viewport size is known.
         let layout = PageLayout::build(&[], 0, 0);
@@ -939,7 +963,12 @@ impl<'doc> App<'doc> {
     }
 
     pub fn persist_highlights(&self) -> Result<()> {
-        self.highlights.save(&self.path)
+        // Write highlights as PDF annotations on the document itself
+        // (atomic via temp + rename inside save_to_pdf). The legacy
+        // sidecar JSON is no longer the source of truth — but we
+        // leave any existing sidecar alone for one release so a
+        // user who downgrades isn't surprised by missing data.
+        pdfhighlights::save_to_pdf(&self.document, &self.highlights, &self.path)
     }
 
     /// Build a `StatefulProtocol` for the supplied canvas. For the

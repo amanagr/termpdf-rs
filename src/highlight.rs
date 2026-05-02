@@ -95,6 +95,10 @@ impl HighlightStore {
             .map_err(|e| anyhow::anyhow!("parsing {}: {}", p.display(), e))
     }
 
+    /// Legacy sidecar-JSON writer. Kept for one release as a
+    /// fallback for users downgrading from the PDF-annotation path.
+    /// Live saves go through `pdfhighlights::save_to_pdf` instead.
+    #[allow(dead_code)]
     pub fn save(&self, pdf: &Path) -> Result<()> {
         let p = Self::store_path(pdf)?;
         write_private(&p, serde_json::to_string_pretty(self)?.as_bytes())
@@ -151,6 +155,7 @@ fn sanitize_stem(raw: &str) -> String {
 /// world-readable file in $XDG_DATA_HOME is a leak waiting to happen
 /// on shared boxes. Writes via tempfile + rename so a crash mid-
 /// write can't truncate the existing store.
+#[allow(dead_code)]
 fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let tmp = parent.join(format!(

@@ -24,6 +24,7 @@ mod keys;
 mod layout;
 mod outline;
 mod pdf;
+mod pdfhighlights;
 mod search;
 mod session;
 mod text;
