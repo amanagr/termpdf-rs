@@ -22,6 +22,7 @@ mod dark;
 mod highlight;
 mod keys;
 mod layout;
+mod outline;
 mod pdf;
 mod search;
 mod session;

@@ -47,6 +47,7 @@ pub fn execute(app: &mut App<'_>, line: &str) {
             }
         }
         "nohl" | "nohlsearch" => app.clear_search(),
+        "toc" => app.toggle_toc(),
         "help" => app.show_help = true,
         _ => app.status = format!("unknown command: {cmd}"),
     }

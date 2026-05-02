@@ -10,6 +10,7 @@ use ratatui_image::protocol::StatefulProtocol;
 
 use crate::highlight::{Highlight, HighlightStore, Rect01, HIGHLIGHT_COLORS};
 use crate::layout::PageLayout;
+use crate::outline::{self, OutlineEntry};
 use crate::pdf::{self, PageMetrics};
 use crate::search::SearchResults;
 use crate::session::Session;
@@ -140,6 +141,23 @@ pub struct App<'doc> {
     /// Last-run query, restored when the user types `/` then Enter
     /// with an empty buffer (vim-style "redo last search").
     pub last_query: Option<String>,
+
+    /// Document outline, eager-loaded once at startup. Empty Vec
+    /// means "loaded, no outline" (vs `None` which would be "not
+    /// yet loaded" — we avoid that state by loading in `App::new`).
+    pub outline: Vec<OutlineEntry>,
+    /// `true` while the TOC overlay panel is open. Behaves like
+    /// `show_help` — consumed first by `dispatch` so existing
+    /// keybindings stay intact.
+    pub show_toc: bool,
+    /// Index in `outline_filtered` of the currently-selected entry.
+    pub toc_cursor: usize,
+    /// Optional substring filter applied to `outline` to produce
+    /// `outline_filtered_indices`. Empty = no filter.
+    pub toc_filter: String,
+    /// Whether the user is currently editing `toc_filter` (started
+    /// by `/` while the TOC is open).
+    pub toc_filter_editing: bool,
     /// Set by `App::new` when the user passed a starting page (or the
     /// session restored one). Consumed by the first `ensure_layout`
     /// call to compute the initial scroll offset, then cleared.
@@ -157,6 +175,12 @@ impl<'doc> App<'doc> {
     ) -> Result<Self> {
         let page_count = document.pages().len() as usize;
         let page_metrics = pdf::page_metrics(&document)?;
+        // Eager-load the outline. Failure here is non-fatal — most
+        // PDFs have no outline at all and should still open.
+        let outline = outline::load(&document).unwrap_or_else(|e| {
+            eprintln!("warning: could not load outline: {e:#}");
+            Vec::new()
+        });
         // Highlights are an enhancement — a corrupt or unreadable
         // store shouldn't keep the user from opening the document.
         // Surface the error to stderr and proceed with an empty
@@ -200,6 +224,11 @@ impl<'doc> App<'doc> {
             highlight_revision: 0,
             search: None,
             last_query: None,
+            outline,
+            show_toc: false,
+            toc_cursor: 0,
+            toc_filter: String::new(),
+            toc_filter_editing: false,
             pending_initial_page: if page < page_count { Some(page) } else { None },
             should_quit: false,
         };
@@ -581,6 +610,110 @@ impl<'doc> App<'doc> {
         self.scroll_y_px = self
             .layout
             .clamp_scroll(target.max(0), self.viewport_px.1);
+    }
+
+    /// Open the TOC panel. No-op (with a status message) if the
+    /// document has no outline — a popping-up empty popup is
+    /// confusing.
+    pub fn toggle_toc(&mut self) {
+        if self.show_toc {
+            self.show_toc = false;
+            self.toc_filter_editing = false;
+            self.invalidate_compose();
+            return;
+        }
+        if self.outline.is_empty() {
+            self.status = "this document has no outline".into();
+            self.invalidate_compose();
+            return;
+        }
+        self.show_toc = true;
+        self.toc_cursor = 0;
+        self.toc_filter.clear();
+        self.toc_filter_editing = false;
+        self.invalidate_compose();
+    }
+
+    /// Indices of `outline` entries matching the current filter, in
+    /// outline order. Recomputed on demand because filters are
+    /// keystroke-cheap and outlines are small (~30 entries typical).
+    pub fn toc_filtered_indices(&self) -> Vec<usize> {
+        outline::fuzzy_filter(&self.outline, &self.toc_filter)
+    }
+
+    pub fn toc_move(&mut self, delta: i32) {
+        let filtered = self.toc_filtered_indices();
+        if filtered.is_empty() {
+            return;
+        }
+        let n = filtered.len() as i32;
+        let new = ((self.toc_cursor as i32) + delta).clamp(0, n - 1);
+        self.toc_cursor = new as usize;
+        self.invalidate_compose();
+    }
+
+    pub fn toc_jump_to_top(&mut self) {
+        self.toc_cursor = 0;
+        self.invalidate_compose();
+    }
+
+    pub fn toc_jump_to_bottom(&mut self) {
+        let filtered = self.toc_filtered_indices();
+        if let Some(last) = filtered.len().checked_sub(1) {
+            self.toc_cursor = last;
+        }
+        self.invalidate_compose();
+    }
+
+    /// Activate the highlighted TOC entry: jump to its page (if
+    /// resolvable) and close the panel.
+    pub fn toc_activate(&mut self) {
+        let filtered = self.toc_filtered_indices();
+        let Some(&entry_idx) = filtered.get(self.toc_cursor) else {
+            return;
+        };
+        let entry = &self.outline[entry_idx];
+        match entry.page {
+            Some(p) => {
+                self.show_toc = false;
+                self.toc_filter_editing = false;
+                self.goto_page(p);
+            }
+            None => {
+                self.status = "outline entry has no page target".into();
+                self.invalidate_compose();
+            }
+        }
+    }
+
+    pub fn toc_filter_push(&mut self, c: char) {
+        if self.toc_filter_editing {
+            self.toc_filter.push(c);
+            self.toc_cursor = 0;
+            self.invalidate_compose();
+        }
+    }
+
+    pub fn toc_filter_pop(&mut self) {
+        if self.toc_filter_editing {
+            self.toc_filter.pop();
+            self.toc_cursor = 0;
+            self.invalidate_compose();
+        }
+    }
+
+    pub fn toc_filter_start(&mut self) {
+        if self.show_toc {
+            self.toc_filter.clear();
+            self.toc_filter_editing = true;
+            self.toc_cursor = 0;
+            self.invalidate_compose();
+        }
+    }
+
+    pub fn toc_filter_finish(&mut self) {
+        self.toc_filter_editing = false;
+        self.invalidate_compose();
     }
 
     pub fn cycle_color(&mut self) {

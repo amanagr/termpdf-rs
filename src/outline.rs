@@ -1,0 +1,201 @@
+//! Document outline (table of contents) — eager-loaded, flattened
+//! into a depth-tagged list, optionally filterable by substring.
+//!
+//! Pdfium gives us a tree of `PdfBookmark`s with `title()`,
+//! `destination()`, `first_child()`, `next_sibling()`. We flatten
+//! depth-first so the panel can render with simple j/k navigation —
+//! tree expand/collapse is more complexity than the average user
+//! needs, and 99% of papers/books have ≤ 30 entries.
+
+use anyhow::Result;
+use pdfium_render::prelude::*;
+
+#[derive(Debug, Clone)]
+pub struct OutlineEntry {
+    pub title: String,
+    pub depth: u8,
+    /// Resolved page index (0-based). `None` when the bookmark has
+    /// no destination, or the destination doesn't resolve to a page
+    /// in this document — those entries still render (greyed) so the
+    /// document structure is visible, but Enter is a no-op on them.
+    pub page: Option<usize>,
+}
+
+/// Walk the bookmark tree depth-first, producing a flat, depth-
+/// tagged list. Returns an empty Vec for documents with no outline.
+pub fn load(document: &PdfDocument<'_>) -> Result<Vec<OutlineEntry>> {
+    let mut out = Vec::new();
+    let bookmarks = document.bookmarks();
+    if let Some(root) = bookmarks.root() {
+        // The "root" bookmark has no title of its own; iterate its
+        // children. Some PDFs nest everything under a top-level
+        // bookmark (which *does* have a title) — handled the same
+        // way because walk() emits a title-bearing root then
+        // recurses into its children.
+        walk(root, 0, &mut out);
+    }
+    Ok(out)
+}
+
+fn walk(b: PdfBookmark<'_>, depth: u8, out: &mut Vec<OutlineEntry>) {
+    if let Some(title) = b.title() {
+        let page = b
+            .destination()
+            .and_then(|d| d.page_index().ok())
+            .map(|p| p as usize);
+        out.push(OutlineEntry {
+            title,
+            depth,
+            page,
+        });
+    }
+    if let Some(child) = b.first_child() {
+        walk(child, depth.saturating_add(1), out);
+    }
+    if let Some(sibling) = b.next_sibling() {
+        walk(sibling, depth, out);
+    }
+}
+
+/// Filter entries by case-insensitive subsequence match. An empty
+/// query returns every index, in order. Returns indices into
+/// `entries` rather than cloned entries so the panel can render
+/// with `entries[i]` and selection state stays index-based.
+pub fn fuzzy_filter(entries: &[OutlineEntry], query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..entries.len()).collect();
+    }
+    let needle: Vec<char> = query.to_lowercase().chars().collect();
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| {
+            let hay: Vec<char> = e.title.to_lowercase().chars().collect();
+            if is_subsequence(&needle, &hay) {
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn is_subsequence(needle: &[char], hay: &[char]) -> bool {
+    let mut ni = 0;
+    for &c in hay {
+        if ni < needle.len() && needle[ni] == c {
+            ni += 1;
+        }
+    }
+    ni == needle.len()
+}
+
+/// Format an entry for the panel. Caps indent at depth 6 so deeply
+/// nested outlines don't push the title off the right edge of a
+/// narrow panel; deeper entries are still listed, just not further
+/// indented.
+pub fn render_line(entry: &OutlineEntry, max_width: usize) -> String {
+    let indent = "  ".repeat(entry.depth.min(6) as usize);
+    let page_suffix = match entry.page {
+        Some(p) => format!(" p.{}", p + 1),
+        None => "  —".to_string(),
+    };
+    let suffix_len = page_suffix.chars().count();
+    let title_budget = max_width
+        .saturating_sub(indent.chars().count())
+        .saturating_sub(suffix_len)
+        .saturating_sub(1);
+    let title = truncate(&entry.title, title_budget);
+    format!("{indent}{title} {page_suffix}")
+}
+
+fn truncate(s: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_chars {
+        return s.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+    let kept: String = chars[..max_chars - 1].iter().collect();
+    format!("{kept}…")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(title: &str, depth: u8, page: Option<usize>) -> OutlineEntry {
+        OutlineEntry {
+            title: title.into(),
+            depth,
+            page,
+        }
+    }
+
+    #[test]
+    fn fuzzy_filter_empty_query_returns_all() {
+        let v = vec![entry("a", 0, None), entry("b", 0, None)];
+        assert_eq!(fuzzy_filter(&v, ""), vec![0, 1]);
+    }
+
+    #[test]
+    fn fuzzy_filter_subsequence_match_is_case_insensitive() {
+        let v = vec![
+            entry("Introduction", 0, Some(0)),
+            entry("Methods", 0, Some(5)),
+            entry("Results and Discussion", 0, Some(20)),
+        ];
+        // "rd" is a subsequence of both "Introduction" (I-n-t-R-o-D)
+        // and "Results and Discussion" — by design. Filter is loose
+        // matching, like fzf's default scoring.
+        assert_eq!(fuzzy_filter(&v, "rd"), vec![0, 2]);
+        // "in" matches "Introduction" and "Discussion".
+        assert_eq!(fuzzy_filter(&v, "in"), vec![0, 2]);
+        // "method" matches Methods only.
+        assert_eq!(fuzzy_filter(&v, "method"), vec![1]);
+    }
+
+    #[test]
+    fn fuzzy_filter_no_match_returns_empty() {
+        let v = vec![entry("Hello", 0, None)];
+        assert_eq!(fuzzy_filter(&v, "xyz"), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn render_line_truncates_long_titles() {
+        let e = entry(&"x".repeat(100), 0, Some(9));
+        let s = render_line(&e, 30);
+        assert!(s.chars().count() <= 30, "got {} chars: {:?}", s.chars().count(), s);
+        assert!(s.contains('…'));
+        assert!(s.ends_with("p.10"));
+    }
+
+    #[test]
+    fn render_line_indents_by_depth() {
+        let e = entry("section", 2, Some(0));
+        let s = render_line(&e, 80);
+        assert!(s.starts_with("    "), "expected 4-space indent, got {s:?}");
+    }
+
+    #[test]
+    fn render_line_caps_indent_at_six() {
+        let e = entry("deep", 20, Some(0));
+        let s = render_line(&e, 80);
+        // 6 levels × 2 spaces = 12 leading spaces.
+        let leading = s.chars().take_while(|c| *c == ' ').count();
+        assert_eq!(leading, 12);
+    }
+
+    #[test]
+    fn render_line_marks_unresolved_destination() {
+        let e = entry("broken", 0, None);
+        let s = render_line(&e, 80);
+        assert!(s.contains("—"), "got {s:?}");
+    }
+
+    #[test]
+    fn truncate_at_max_one_returns_just_ellipsis() {
+        assert_eq!(truncate("hello", 1), "…");
+    }
+}

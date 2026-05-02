@@ -27,6 +27,10 @@ pub fn dispatch(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         return Ok(());
     }
 
+    if app.show_toc {
+        return toc_keys(app, k);
+    }
+
     match app.mode {
         Mode::Normal => normal_keys(app, k),
         Mode::Command => cmd_keys(app, k),
@@ -119,6 +123,7 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
             app.status = "Search: (typing — Enter to run, Esc to cancel)".into();
         }
         KeyCode::Char('v') => app.enter_visual(),
+        KeyCode::Char('o') => app.toggle_toc(),
 
         KeyCode::Esc => {
             app.pending.clear();
@@ -172,6 +177,37 @@ fn visual_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         KeyCode::Right => app.nudge_selection(SELECTION_STEP, 0.0, shift),
         KeyCode::Up => app.nudge_selection(0.0, -SELECTION_STEP, shift),
         KeyCode::Down => app.nudge_selection(0.0, SELECTION_STEP, shift),
+        _ => {}
+    }
+    Ok(())
+}
+
+fn toc_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
+    // Filter-edit mode: every printable goes into the buffer; Enter
+    // commits the filter, Esc cancels.
+    if app.toc_filter_editing {
+        match k.code {
+            KeyCode::Esc => {
+                app.toc_filter.clear();
+                app.toc_filter_finish();
+            }
+            KeyCode::Enter => app.toc_filter_finish(),
+            KeyCode::Backspace => app.toc_filter_pop(),
+            KeyCode::Char(c) => app.toc_filter_push(c),
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    // Navigation mode.
+    match k.code {
+        KeyCode::Esc | KeyCode::Char('o') | KeyCode::Char('q') => app.toggle_toc(),
+        KeyCode::Char('j') | KeyCode::Down => app.toc_move(1),
+        KeyCode::Char('k') | KeyCode::Up => app.toc_move(-1),
+        KeyCode::Char('g') => app.toc_jump_to_top(),
+        KeyCode::Char('G') => app.toc_jump_to_bottom(),
+        KeyCode::Enter => app.toc_activate(),
+        KeyCode::Char('/') => app.toc_filter_start(),
         _ => {}
     }
     Ok(())

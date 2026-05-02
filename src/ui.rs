@@ -80,6 +80,10 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
 
     f.render_widget(status_line(app), status_area);
 
+    if app.show_toc {
+        draw_toc(f, app, area);
+    }
+
     if app.show_help {
         draw_help(f, area);
     }
@@ -378,6 +382,67 @@ fn status_line(app: &App<'_>) -> Paragraph<'static> {
     Paragraph::new(Line::from(spans))
 }
 
+fn draw_toc(f: &mut Frame, app: &App<'_>, area: Rect) {
+    use ratatui::style::Stylize;
+
+    let panel_w = area.width.saturating_mul(2) / 5;
+    let panel_w = panel_w.clamp(40, 80).min(area.width);
+    let panel_h = area.height;
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(panel_w),
+        y: area.y,
+        width: panel_w,
+        height: panel_h,
+    };
+
+    f.render_widget(Clear, popup);
+
+    let filtered = app.toc_filtered_indices();
+    let inner_w = popup.width.saturating_sub(2) as usize;
+    let body_h = popup.height.saturating_sub(2) as usize;
+
+    // Scroll offset: keep the cursor visible.
+    let cursor = app.toc_cursor;
+    let scroll = cursor.saturating_sub(body_h.saturating_sub(1));
+
+    let mut lines: Vec<Line> = Vec::with_capacity(body_h);
+    if filtered.is_empty() {
+        let msg = if app.toc_filter.is_empty() {
+            "(no entries)"
+        } else {
+            "(no matches)"
+        };
+        lines.push(Line::from(Span::styled(
+            msg.to_string(),
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (display_idx, &entry_idx) in filtered.iter().enumerate().skip(scroll).take(body_h) {
+            let entry = &app.outline[entry_idx];
+            let text = crate::outline::render_line(entry, inner_w);
+            let style = if display_idx == cursor {
+                Style::default().fg(Color::Black).bg(Color::Yellow)
+            } else if entry.page.is_none() {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(text, style)));
+        }
+    }
+
+    let title = if app.toc_filter_editing {
+        format!(" outline · /{}_ ", app.toc_filter)
+    } else if !app.toc_filter.is_empty() {
+        format!(" outline · /{} ", app.toc_filter)
+    } else {
+        " outline (j/k Enter · / filter · Esc close) ".to_string()
+    };
+    let para = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(title.bold()));
+    f.render_widget(para, popup);
+}
+
 fn draw_help(f: &mut Frame, area: Rect) {
     let help_lines: Vec<&str> = vec![
         "termpdf-rs — continuous-scroll PDF reader",
@@ -408,6 +473,11 @@ fn draw_help(f: &mut Frame, area: Rect) {
         "  /<query>               search the document",
         "  n / N                  next / previous match",
         "  :nohl                  clear search results",
+        "",
+        "  o  /  :toc             open outline panel",
+        "    j/k Enter            navigate / jump to entry",
+        "    / type Enter         filter by substring",
+        "    Esc                  close panel",
         "  :<n>  /  :goto N       jump to page n",
         "  :q                     quit",
         "  :set dark | :set nodark",
