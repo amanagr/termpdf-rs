@@ -424,16 +424,27 @@ impl KittyPageRegistry {
 /// useful for A/B testing or if a terminal turns out not to like
 /// PNG transmits in practice.
 fn encode_payload(bitmap: &RgbaImage) -> (u8, Vec<u8>) {
-    let force_raw = std::env::var("TERMPDF_TRANSMIT_RAW")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false);
-    if force_raw {
+    if force_raw_env() {
         return (32, bitmap.as_raw().to_vec());
     }
     match encode_png_fast(bitmap) {
         Ok(png) => (100, png),
         Err(_) => (32, bitmap.as_raw().to_vec()),
     }
+}
+
+/// Cached lookup of `TERMPDF_TRANSMIT_RAW`. The env var is read once
+/// per process — checking it on every page encode (called many times
+/// per session) was paying the syscall to scan environ each call. The
+/// envvar can't change at runtime in any way that matters here.
+fn force_raw_env() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("TERMPDF_TRANSMIT_RAW")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
 }
 
 /// Build the kitty `a=T,U=1` chunked transmit for an already-encoded
