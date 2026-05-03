@@ -56,10 +56,8 @@ pub fn copy(text: &str) -> CopyOutcome {
 
     // Native binary, but skip if we're remote — the user's local
     // clipboard is what matters then, and OSC 52 already handles it.
-    if std::env::var("SSH_CONNECTION").is_err() {
-        if spawn_native(payload).is_ok() {
-            out.native_written = true;
-        }
+    if std::env::var("SSH_CONNECTION").is_err() && spawn_native(payload).is_ok() {
+        out.native_written = true;
     }
 
     out

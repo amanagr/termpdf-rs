@@ -455,11 +455,13 @@ fn build_transmit_string(
     const CHARS_PER_CHUNK: usize = 4096;
     const RAW_PER_CHUNK: usize = (CHARS_PER_CHUNK / 4) * 3;
 
-    let chunks: Vec<&[u8]> = payload.chunks(RAW_PER_CHUNK).collect();
-    let chunk_count = chunks.len().max(1);
+    // Iterate `payload.chunks(RAW_PER_CHUNK)` directly instead of
+    // collecting into a `Vec<&[u8]>` — the Vec was a wasted heap alloc
+    // (~1.4 KB at 250 KB PNGs / 85 chunks) on every page transmit.
+    let chunk_count = payload.len().div_ceil(RAW_PER_CHUNK).max(1);
     let mut data = String::with_capacity(chunk_count * (CHARS_PER_CHUNK + 64));
 
-    for (i, chunk) in chunks.iter().enumerate() {
+    for (i, chunk) in payload.chunks(RAW_PER_CHUNK).enumerate() {
         data.push_str(start);
         write!(data, "{escape}_Gq=2,").unwrap();
         if i == 0 {
