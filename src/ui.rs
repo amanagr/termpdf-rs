@@ -520,7 +520,17 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     // the moment the user lets up.
     if app.is_rapid_scrolling() {
         for b in blits.iter_mut() {
-            if b.need_transmit {
+            if !b.need_transmit {
+                continue;
+            }
+            // Defer ONLY genuinely cold pages — those whose pdfium
+            // bitmap isn't in our cache yet. Pages already cached
+            // (just need a re-encode because the user moved a
+            // selection or edited a highlight) are cheap to transmit;
+            // skipping them would make Visual-mode selection appear
+            // stuck during fast `l`/`h` motion.
+            let is_cold = !app.page_cache.contains_key(&b.page_idx);
+            if is_cold {
                 // Skip placement too — the terminal has no image
                 // cached under this ID yet, so emitting a placeholder
                 // would just render garbled fg-color cells. Setting
