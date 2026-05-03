@@ -378,6 +378,11 @@ pub struct App<'doc> {
     /// Cleared on every keypress that isn't the confirm itself.
     pub awaiting_highlight_delete_confirm: bool,
 
+    /// Per-PDF disk-cache directory, resolved once at session start so
+    /// `ensure_page_rendered` doesn't pay a stat() + env-scan per cold
+    /// page render. `None` when the cache dir can't be determined.
+    pub cache_dir: Option<PathBuf>,
+
     pub should_quit: bool,
 }
 
@@ -452,10 +457,16 @@ impl<'doc> App<'doc> {
         // Empty layout — first `ensure_image` call builds a real one
         // once the viewport size is known.
         let layout = PageLayout::build(&[], 0, 0);
+        // Resolve once: every cold-page render in `ensure_page_rendered`
+        // also wants this dir, and the `pdf_cache_dir` lookup pays a
+        // stat() + env-scan per call. Caching once at session start
+        // skips both on the per-render hot path.
+        let cache_dir = crate::disk_cache::pdf_cache_dir(path);
         // Try to load a previously-built search index from disk.
         // Hit saves ~5 ms × N pages of pdfium text extraction
         // (~3.5 s for a 700-page book on second open).
-        let doc_index = crate::disk_cache::pdf_cache_dir(path)
+        let doc_index = cache_dir
+            .as_ref()
             .map(|d| d.join("index.bin"))
             .and_then(|p| crate::search_index::load(&p, page_count))
             .unwrap_or_else(|| crate::search_index::DocIndex::new(page_count));
@@ -537,6 +548,7 @@ impl<'doc> App<'doc> {
             last_space_at: None,
             next_highlight_group_id,
             awaiting_highlight_delete_confirm: false,
+            cache_dir,
             should_quit: false,
         };
         Ok(app)

@@ -1189,7 +1189,13 @@ pub(crate) fn ensure_page_rendered(
 
     // Disk-cache fast path: hit avoids the ~20 ms pdfium render +
     // ~5 ms dark inversion (we cache the post-inversion image).
-    let cache_path = crate::disk_cache::cache_path(&app.path, page_idx, fit_width_px, app.dark);
+    // `cache_dir` was resolved once at App::new — calling cache_path
+    // here would re-stat the PDF and re-scan environ on every cold
+    // page render.
+    let cache_path = app
+        .cache_dir
+        .as_deref()
+        .map(|d| crate::disk_cache::cache_path_in_dir(d, page_idx, fit_width_px, app.dark));
     if let Some(ref p) = cache_path {
         if let Some(img) = crate::disk_cache::load(p) {
             // Sanity: pdfium-rendered widths should exactly match

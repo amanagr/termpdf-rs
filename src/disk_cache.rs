@@ -67,6 +67,11 @@ const RENDER_VERSION: u32 = 2;
 /// Compose the cache file path for one rendered page. Returns `None`
 /// when no cache directory is available (no `XDG_CACHE_HOME`, no
 /// `$HOME`, etc.) or when the source file's metadata can't be read.
+///
+/// Hot-path callers (per cold-page render) should resolve `pdf_cache_dir`
+/// once at session start and call `cache_path_in_dir` to skip the stat()
+/// + env-scan that this convenience wrapper repeats every call.
+#[allow(dead_code)] // kept for tests + as the convenience wrapper for non-hot callers
 pub fn cache_path(
     pdf_path: &Path,
     page_idx: usize,
@@ -74,11 +79,23 @@ pub fn cache_path(
     dark: bool,
 ) -> Option<PathBuf> {
     let dir = pdf_cache_dir(pdf_path)?;
+    Some(cache_path_in_dir(&dir, page_idx, fit_width_px, dark))
+}
+
+/// Same as `cache_path` but takes a precomputed per-PDF directory so
+/// the caller can amortise the `pdf_cache_dir` cost (one stat + one
+/// env-scan per call) across many cold-page renders.
+pub fn cache_path_in_dir(
+    dir: &Path,
+    page_idx: usize,
+    fit_width_px: u32,
+    dark: bool,
+) -> PathBuf {
     let file = format!(
         "{}_{}_{}_v{}.png",
         page_idx, fit_width_px, dark as u8, RENDER_VERSION
     );
-    Some(dir.join(file))
+    dir.join(file)
 }
 
 /// Try to load a cached page bitmap. `None` on miss or any read /
