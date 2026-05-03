@@ -962,9 +962,14 @@ fn try_selection_only_repaint(
     // practice that's at most one or two pages per Visual-mode
     // motion. The pages we re-blit overwrite their existing rows
     // exactly; pages that didn't change keep their pixels.
-    let touches_now = pages_touched_by_selection(app);
+    //
+    // The selection always spans a contiguous range of pages, so we
+    // store the (lo, hi) bounds rather than allocating a HashSet on
+    // every Visual-mode keystroke.
+    let touched_range = pages_touched_by_selection(app);
     for page_idx in &visible {
-        if !touches_now.contains(page_idx) {
+        let Some((lo, hi)) = touched_range else { break };
+        if *page_idx < lo || *page_idx > hi {
             continue;
         }
         let Some((page_img, _)) = app.overlay_cache.get(page_idx) else {
@@ -978,17 +983,14 @@ fn try_selection_only_repaint(
     Some(canvas)
 }
 
-/// Set of page indices the active selection currently spans. Empty
-/// when there is no selection.
-fn pages_touched_by_selection(app: &App<'_>) -> std::collections::HashSet<usize> {
-    let mut out = std::collections::HashSet::new();
-    if let Some(sel) = app.text_selection {
-        let (lo, hi) = sel.ordered();
-        for p in lo.page..=hi.page {
-            out.insert(p);
-        }
-    }
-    out
+/// Inclusive `(lo_page, hi_page)` range the active selection spans.
+/// Returns `None` when there is no selection. The selection always
+/// covers a contiguous run of pages, so a tuple is sufficient — no
+/// HashSet allocation on the per-frame hot path.
+fn pages_touched_by_selection(app: &App<'_>) -> Option<(usize, usize)> {
+    let sel = app.text_selection?;
+    let (lo, hi) = sel.ordered();
+    Some((lo.page, hi.page))
 }
 
 /// Pure helper: shift the rows of `buf` by `dy` viewport pixels.
