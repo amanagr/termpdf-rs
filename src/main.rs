@@ -316,7 +316,7 @@ fn probe(
     let target_w = (((area.width as u32) * (cell_w as u32)) as f32 * zoom) as u32;
     let img = pdf::render_page_at_width(document, page, target_w.max(1))?;
     let img = if dark {
-        image::DynamicImage::ImageRgba8(dark::invert_luminance(&img))
+        image::DynamicImage::ImageRgba8(dark::invert_luminance(img))
     } else {
         img
     };

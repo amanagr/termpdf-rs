@@ -18,8 +18,13 @@ use palette::{FromColor, Hsl, IntoColor, Srgb};
 /// and skip the conversion — for a typical PDF (mostly black-on-white
 /// text + figures), this hits 90%+ of pixels and cuts cold-render
 /// dark-mode cost from ~50 ms to ~12 ms.
-pub fn invert_luminance(img: &DynamicImage) -> RgbaImage {
-    let mut out = img.to_rgba8();
+///
+/// Takes the input by value: pdfium hands us `DynamicImage::ImageRgba8`,
+/// and `into_rgba8()` extracts that inner buffer without cloning. The
+/// previous `&DynamicImage` signature forced a ~3 MB clone via
+/// `to_rgba8()` per cold render before any inversion work began.
+pub fn invert_luminance(img: DynamicImage) -> RgbaImage {
+    let mut out = img.into_rgba8();
     for px in out.pixels_mut() {
         let [r, g, b, a] = px.0;
         if r == g && g == b {
@@ -52,19 +57,19 @@ mod tests {
 
     #[test]
     fn white_inverts_to_black() {
-        let out = invert_luminance(&solid(2, 2, Rgba([255, 255, 255, 255])));
+        let out = invert_luminance(solid(2, 2, Rgba([255, 255, 255, 255])));
         assert_eq!(out.get_pixel(0, 0).0, [0, 0, 0, 255]);
     }
 
     #[test]
     fn black_inverts_to_white() {
-        let out = invert_luminance(&solid(2, 2, Rgba([0, 0, 0, 255])));
+        let out = invert_luminance(solid(2, 2, Rgba([0, 0, 0, 255])));
         assert_eq!(out.get_pixel(0, 0).0, [255, 255, 255, 255]);
     }
 
     #[test]
     fn mid_gray_inverts_to_mid_gray() {
-        let out = invert_luminance(&solid(2, 2, Rgba([128, 128, 128, 255])));
+        let out = invert_luminance(solid(2, 2, Rgba([128, 128, 128, 255])));
         let p = out.get_pixel(0, 0).0;
         // 255 - 128 = 127. Allow off-by-one.
         for c in 0..3 {
@@ -76,7 +81,7 @@ mod tests {
     /// guard against). Hue should be preserved; only lightness flips.
     #[test]
     fn saturated_red_keeps_red_hue() {
-        let out = invert_luminance(&solid(2, 2, Rgba([220, 30, 30, 255])));
+        let out = invert_luminance(solid(2, 2, Rgba([220, 30, 30, 255])));
         let p = out.get_pixel(0, 0).0;
         // Red channel should still dominate.
         assert!(p[0] > p[1], "red dominance lost: {p:?}");
@@ -86,7 +91,7 @@ mod tests {
     /// Alpha is preserved verbatim through the inversion.
     #[test]
     fn alpha_passes_through_unchanged() {
-        let out = invert_luminance(&solid(2, 2, Rgba([100, 200, 50, 77])));
+        let out = invert_luminance(solid(2, 2, Rgba([100, 200, 50, 77])));
         assert_eq!(out.get_pixel(0, 0).0[3], 77);
     }
 }

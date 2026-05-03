@@ -1199,7 +1199,7 @@ pub(crate) fn ensure_page_rendered(
     match pdf::render_page_at_width(&app.document, page_idx, fit_width_px) {
         Ok(img) => {
             let img = if app.dark {
-                DynamicImage::ImageRgba8(dark::invert_luminance(&img))
+                DynamicImage::ImageRgba8(dark::invert_luminance(img))
             } else {
                 img
             };
