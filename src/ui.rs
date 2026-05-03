@@ -454,10 +454,12 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
         dst_left_cell: u16,
         height_cells: u16,
         src_top_cell: u16,
+        src_left_cell: u16,
         width_cells: u16,
     }
 
     let scroll_y = app.scroll_y_px;
+    let scroll_x = app.scroll_x;
     let area_width_cells = area.width;
     let area_height_cells = area.height;
 
@@ -491,14 +493,23 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
             continue;
         }
 
-        // Center horizontally if the rendered page is narrower than
-        // the viewport (typical for portrait pages with default zoom).
-        let dst_left_cell = if img_w_cells < area_width_cells {
-            (area_width_cells - img_w_cells) / 2
+        // Horizontal placement. Two cases:
+        //   - Image fits in viewport → center it (dst_left_cell offsets
+        //     the placement area; src_left_cell stays 0).
+        //   - Image overflows → no centering; src_left_cell shifts the
+        //     visible window of the image based on app.scroll_x. This
+        //     is what makes Left/Right arrows actually scroll the
+        //     zoomed-in page horizontally on the kitty path.
+        let (dst_left_cell, src_left_cell, width_cells) = if img_w_cells <= area_width_cells {
+            let dl = (area_width_cells - img_w_cells) / 2;
+            (dl, 0u16, img_w_cells)
         } else {
-            0
+            let overflow_cells = img_w_cells - area_width_cells;
+            // scroll_x is 0..=1 over the overflow span; cell-quantize.
+            let src_left = ((overflow_cells as f32) * scroll_x.clamp(0.0, 1.0)).round() as u16;
+            (0u16, src_left, area_width_cells)
         };
-        let width_cells = img_w_cells.min(area_width_cells.saturating_sub(dst_left_cell));
+        let width_cells = width_cells.min(area_width_cells.saturating_sub(dst_left_cell));
         if width_cells == 0 {
             continue;
         }
@@ -519,6 +530,7 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
             dst_left_cell,
             height_cells,
             src_top_cell,
+            src_left_cell,
             width_cells,
         });
     }
@@ -618,6 +630,7 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
             b.dst_top_cell,
             b.height_cells,
             b.src_top_cell,
+            b.src_left_cell,
             b.width_cells,
             t.as_deref(),
         );
@@ -1687,7 +1700,8 @@ pub fn help_overlay_lines() -> Vec<&'static str> {
         "  gg / G                 doc top / bottom",
         "  N G                    jump to page N",
         "",
-        "  arrows / h / l         scroll in pixel-sized steps",
+        "  Up / Down              scroll vertically in fine steps",
+        "  Left / Right / h / l   scroll horizontally (only when zoomed past fit-width)",
         "  mouse wheel            scroll (Shift = horizontal)",
         "",
         "  + / - / 0              zoom in / out / reset",

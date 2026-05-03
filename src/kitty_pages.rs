@@ -490,7 +490,8 @@ fn encode_png_fast(bitmap: &RgbaImage) -> Result<Vec<u8>, image::ImageError> {
 /// Write placeholder cells for the given page into `buf`. The
 /// placement starts at terminal cell `(area.left(), area.top() +
 /// dst_top_cell)` and covers `dst_height_cells` rows × `width_cells`
-/// columns, sourcing rows starting from `src_top_cell` of the image.
+/// columns, sourcing rows starting from `src_top_cell` and columns
+/// starting from `src_left_cell` of the image.
 ///
 /// `prefix` is an optional kitty transmit string that should ride
 /// along with the first cell write — passes the bitmap to the
@@ -512,20 +513,23 @@ pub fn place_page(
     dst_top_cell: u16,
     dst_height_cells: u16,
     src_top_cell: u16,
+    src_left_cell: u16,
     width_cells: u16,
     prefix: Option<&str>,
 ) -> u16 {
     let _ = page_idx; // reserved for future per-page debug; placement is purely id-driven
-    let _ = pixel_w; // width is implied by `width_cells × cell_w_px`
-    let _ = cell_w_px;
-    let _ = cell_h_px;
 
     let max_src_rows = (pixel_h / cell_h_px.max(1)) as u16;
+    let max_src_cols = (pixel_w / cell_w_px.max(1)) as u16;
     let max_dst_rows_in_area = area.height.saturating_sub(dst_top_cell);
     // Source rows we have; destination rows we have; whichever is fewer.
     let height_cells = dst_height_cells
         .min(max_dst_rows_in_area)
         .min(max_src_rows.saturating_sub(src_top_cell));
+    // Clamp width to the image columns we actually have past src_left_cell
+    // — the user may have scrolled scroll_x to the rightmost edge where
+    // fewer image cols remain than the placement area can show.
+    let width_cells = width_cells.min(max_src_cols.saturating_sub(src_left_cell));
     if height_cells == 0 || width_cells == 0 {
         return 0;
     }
@@ -563,12 +567,14 @@ pub fn place_page(
         let img_row = src_top_cell.saturating_add(dy);
         // Save cursor + set fg color (= image ID), then placeholder
         // with row/col/id-extra diacritics. The remaining cells in
-        // this row inherit the fg color and increment the col by 1.
+        // this row inherit the fg color and increment the col by 1
+        // — so we only set the explicit `src_left_cell` diacritic on
+        // the first placement cell; the rest auto-increment.
         write!(
             symbol,
             "\x1b[s{id_color}\u{10EEEE}{}{}{}",
             diacritic(img_row),
-            diacritic(0),
+            diacritic(src_left_cell),
             id_extra_diacritic,
         )
         .unwrap();
@@ -863,5 +869,76 @@ mod tests {
         r.mark_transmitted(0, layout, 1, 16, 16);
         assert_eq!(r.lru.back(), Some(&0));
         assert_eq!(r.lru.front(), Some(&1));
+    }
+
+    /// Horizontal scroll (kitty path): when src_left_cell > 0, the
+    /// first emitted placeholder cell must carry the corresponding
+    /// column diacritic so kitty starts the visible window at the
+    /// correct offset into the image. Without this, Left/Right keys
+    /// have no effect under zoom — the view stays clamped to the
+    /// image's leftmost columns.
+    #[test]
+    fn place_page_honors_src_left_cell() {
+        let mut buf = Buffer::empty(Rect { x: 0, y: 0, width: 10, height: 4 });
+        let area = Rect { x: 0, y: 0, width: 10, height: 4 };
+        let written = place_page(
+            &mut buf,
+            area,
+            /*page_idx*/ 0,
+            /*image_id*/ 1,
+            /*pixel_w*/ 200,        // 20 cols at cell_w=10
+            /*pixel_h*/ 80,         // 4 rows at cell_h=20
+            /*cell_w_px*/ 10,
+            /*cell_h_px*/ 20,
+            /*dst_top_cell*/ 0,
+            /*dst_height_cells*/ 4,
+            /*src_top_cell*/ 0,
+            /*src_left_cell*/ 5,
+            /*width_cells*/ 10,
+            /*prefix*/ None,
+        );
+        assert!(written > 0);
+        let symbol = buf.cell((0, 0)).unwrap().symbol().to_string();
+        // First diacritic = row(0), second = col(5), third = id_extra(0).
+        let want_col = diacritic(5);
+        let want_row = diacritic(0);
+        assert!(
+            symbol.contains(want_col),
+            "first cell symbol must encode col=5 (= {:?}); got {:?}",
+            want_col, symbol
+        );
+        assert!(symbol.contains(want_row), "first cell must still encode row=0");
+    }
+
+    /// When src_left_cell would point past the rightmost image column,
+    /// width_cells is clamped so we don't emit placeholders that
+    /// reference invalid image grid positions (kitty would show
+    /// garbage / repeated content).
+    #[test]
+    fn place_page_clamps_width_at_image_right_edge() {
+        let mut buf = Buffer::empty(Rect { x: 0, y: 0, width: 10, height: 4 });
+        let area = Rect { x: 0, y: 0, width: 10, height: 4 };
+        // 12-col-wide image; src_left_cell=8 leaves only 4 valid cols.
+        let written = place_page(
+            &mut buf,
+            area,
+            0,
+            1,
+            /*pixel_w*/ 120,
+            /*pixel_h*/ 80,
+            10, 20,
+            0, 4, 0, /*src_left_cell*/ 8, /*requested width*/ 10,
+            None,
+        );
+        assert!(written > 0);
+        // Cells 0..4 should hold placeholders; cells 4..10 should be
+        // the default empty (skip-marked) cells.
+        for c in 4..10 {
+            let s = buf.cell((c, 0)).unwrap().symbol();
+            assert!(
+                !s.contains('\u{10EEEE}'),
+                "col {c} must not have a placeholder when image runs out at col 4"
+            );
+        }
     }
 }
