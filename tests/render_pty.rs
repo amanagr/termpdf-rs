@@ -121,6 +121,11 @@ fn spawn_in_pty(pdf: &std::path::Path) -> (Box<dyn portable_pty::Child + Send + 
     // most terminals report. Doesn't have to be exact for the
     // selection/upload assertions we run here.
     cmd.env("TERMPDF_CELL_PX", "8x16");
+    // Sandbox the disk cache to a per-test temp dir so test runs
+    // don't pollute the user's real ~/.cache/termpdf-rs.
+    let tmp_cache = std::env::temp_dir()
+        .join(format!("termpdf-test-cache-pty-{}", std::process::id()));
+    cmd.env("XDG_CACHE_HOME", &tmp_cache);
 
     let child = pair.slave.spawn_command(cmd).expect("spawn");
     drop(pair.slave);

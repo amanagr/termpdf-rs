@@ -100,6 +100,11 @@ fn spawn_in_pty(pdf: &std::path::Path) -> (Box<dyn portable_pty::Child + Send + 
         format!("{}/vendor/lib/libpdfium.so", env!("CARGO_MANIFEST_DIR")),
     );
     cmd.env("TERMPDF_CELL_PX", "8x16");
+    // Sandbox the disk cache to a per-test temp dir so test runs
+    // don't pollute the user's real ~/.cache/termpdf-rs.
+    let tmp_cache = std::env::temp_dir()
+        .join(format!("termpdf-test-cache-kitty-{}", std::process::id()));
+    cmd.env("XDG_CACHE_HOME", &tmp_cache);
 
     let child = pair.slave.spawn_command(cmd).expect("spawn");
     drop(pair.slave);
