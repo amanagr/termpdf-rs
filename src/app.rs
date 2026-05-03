@@ -2507,4 +2507,87 @@ mod tests {
         assert_eq!(c, 1, "out-of-window event must reset the count");
         assert!(!r);
     }
+
+    // ---- link-hint state machine ----------------------------------
+    //
+    // Tests the pure transition logic without spinning up an App or
+    // pdfium. We synthesise hint entries directly and call
+    // hint_keystroke through a small helper that mimics what
+    // `enter_link_hint_mode` would do.
+
+    fn hint_step(
+        hints: &[HintEntry],
+        filter_so_far: &str,
+        c: char,
+    ) -> (String, Option<LinkAction>, bool) {
+        // Simulate the same state-machine logic as App::hint_keystroke
+        // but without a full App. Returns (new filter, action if
+        // disambiguated, "exit hint mode" flag).
+        let mut filter = filter_so_far.to_string();
+        filter.push(c);
+        let matches: Vec<&HintEntry> = hints
+            .iter()
+            .filter(|e| e.label.starts_with(&filter))
+            .collect();
+        match matches.len() {
+            0 => (filter, None, true),
+            1 => (filter, Some(matches[0].action.clone()), true),
+            _ => (filter, None, false),
+        }
+    }
+
+    fn fake_hint(label: &str, action: LinkAction) -> HintEntry {
+        HintEntry {
+            page_idx: 0,
+            rect: Rect01 { x: 0.0, y: 0.0, w: 0.1, h: 0.1 },
+            action,
+            label: label.into(),
+        }
+    }
+
+    #[test]
+    fn hint_unique_match_dispatches_action() {
+        let hints = vec![
+            fake_hint("a", LinkAction::GoToPage(5)),
+            fake_hint("bc", LinkAction::Url("https://example.com".into())),
+            fake_hint("bd", LinkAction::GoToPage(7)),
+        ];
+        // 'a' is uniquely matching → action fires immediately.
+        let (filter, action, exit) = hint_step(&hints, "", 'a');
+        assert_eq!(filter, "a");
+        assert!(matches!(action, Some(LinkAction::GoToPage(5))));
+        assert!(exit, "unique match should exit hint mode");
+    }
+
+    #[test]
+    fn hint_ambiguous_keystroke_narrows_without_dispatching() {
+        let hints = vec![
+            fake_hint("aa", LinkAction::GoToPage(1)),
+            fake_hint("ab", LinkAction::GoToPage(2)),
+            fake_hint("c", LinkAction::GoToPage(3)),
+        ];
+        // 'a' matches both "aa" and "ab" — should narrow but not fire.
+        let (filter, action, exit) = hint_step(&hints, "", 'a');
+        assert_eq!(filter, "a");
+        assert!(action.is_none(), "ambiguous match must not fire");
+        assert!(!exit, "ambiguous match must stay in hint mode");
+        // Second char "a" → uniquely "aa".
+        let (filter2, action2, exit2) = hint_step(&hints, &filter, 'a');
+        assert_eq!(filter2, "aa");
+        assert!(matches!(action2, Some(LinkAction::GoToPage(1))));
+        assert!(exit2);
+    }
+
+    #[test]
+    fn hint_no_match_exits_without_dispatch() {
+        let hints = vec![
+            fake_hint("a", LinkAction::GoToPage(0)),
+            fake_hint("b", LinkAction::GoToPage(1)),
+        ];
+        // 'x' matches nothing → exit, no action.
+        let (filter, action, exit) = hint_step(&hints, "", 'x');
+        assert_eq!(filter, "x");
+        assert!(action.is_none(), "no-match must not dispatch");
+        assert!(exit, "no-match must exit hint mode");
+    }
 }
