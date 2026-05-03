@@ -1328,11 +1328,18 @@ impl<'doc> App<'doc> {
                     self.search = None;
                 } else {
                     let pct = (self.doc_index.fraction_complete() * 100.0).round() as u32;
-                    let suffix = if self.doc_index.is_complete() {
-                        String::new()
-                    } else {
-                        format!(" (index {pct}% — search may improve as it fills)")
-                    };
+                    let mut suffix = String::new();
+                    if results.truncated {
+                        // Surface the cap so the user knows the count
+                        // is a lower bound and "n of N" navigation
+                        // doesn't span the full doc — narrowing the
+                        // query will reveal more.
+                        suffix.push_str(" (truncated; narrow query for more)");
+                    }
+                    if !self.doc_index.is_complete() {
+                        suffix
+                            .push_str(&format!(" (index {pct}% — search may improve as it fills)"));
+                    }
                     self.status = format!(
                         "{}/{} matches for '{}'{}",
                         1,

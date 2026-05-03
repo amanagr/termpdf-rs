@@ -42,6 +42,11 @@ pub struct SearchResults {
     /// Bumped on every search state change so the compose cache can
     /// detect "user advanced n" without diffing the hits vector.
     pub revision: u64,
+    /// True if the search hit `MAX_SEARCH_HITS` and stopped collecting
+    /// before scanning the full document. The status line surfaces
+    /// this so the user knows the count and the navigation bound are
+    /// not authoritative — narrowing the query will reveal more.
+    pub truncated: bool,
     /// Set of page indices that contain at least one hit. Computed
     /// once when the results land so the per-frame "does this page
     /// have hits?" check is O(1) instead of an O(hits) iterator scan.
@@ -57,6 +62,7 @@ impl SearchResults {
             hits: Vec::new(),
             current: 0,
             revision: 0,
+            truncated: false,
             pages_with_hits: HashSet::new(),
         }
     }
@@ -128,6 +134,7 @@ pub fn run_search(
     };
 
     let mut hits = Vec::new();
+    let mut truncated = false;
     let pages = document.pages();
     let opts = PdfSearchOptions::new().match_case(case_sensitive);
 
@@ -143,6 +150,7 @@ pub fn run_search(
         for match_segments in search.iter(PdfSearchDirection::SearchForward) {
             for seg in match_segments.iter() {
                 if hits.len() >= MAX_SEARCH_HITS {
+                    truncated = true;
                     break 'pages;
                 }
                 let r = seg.bounds();
@@ -160,6 +168,7 @@ pub fn run_search(
         hits,
         current: 0,
         revision: 1,
+        truncated,
         pages_with_hits,
     })
 }
@@ -212,6 +221,7 @@ mod tests {
             hits,
             current: 0,
             revision: 0,
+            truncated: false,
             pages_with_hits,
         }
     }
@@ -272,6 +282,12 @@ mod tests {
         assert!(r.page_has_hits(7));
         assert!(!r.page_has_hits(0));
         assert!(!r.page_has_hits(99));
+    }
+
+    #[test]
+    fn truncated_flag_defaults_false() {
+        let r = SearchResults::empty("x".into());
+        assert!(!r.truncated);
     }
 
     #[test]
