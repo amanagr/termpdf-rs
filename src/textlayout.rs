@@ -344,17 +344,28 @@ impl PageText {
 
     /// Find the next occurrence of `target` (case-sensitive) on the
     /// same line as `from`, strictly after `from`. Vim's `f<c>`.
+    ///
+    /// Span [start_idx, end_idx] is in stream order; pdfium can
+    /// interleave chars from neighbouring lines (e.g. footnote chars
+    /// sandwiched mid-paragraph), so the linear scan must filter
+    /// `c.line == line` or `f<c>` could land off the user's line.
     pub fn find_char_in_line(&self, from: usize, target: char) -> Option<usize> {
         let line = self.line_of(from)?;
         let span = self.lines.get(line)?;
-        ((from + 1)..=span.end_idx).find(|&i| self.chars[i].ch == Some(target))
+        ((from + 1)..=span.end_idx).find(|&i| {
+            let c = &self.chars[i];
+            c.line == line && c.ch == Some(target)
+        })
     }
 
     /// Vim's `F<c>` — previous occurrence on the same line.
     pub fn rfind_char_in_line(&self, from: usize, target: char) -> Option<usize> {
         let line = self.line_of(from)?;
         let span = self.lines.get(line)?;
-        (span.start_idx..from).rev().find(|&i| self.chars[i].ch == Some(target))
+        (span.start_idx..from).rev().find(|&i| {
+            let c = &self.chars[i];
+            c.line == line && c.ch == Some(target)
+        })
     }
 
     /// Word range surrounding `from` — `[start, end]` inclusive,
@@ -944,6 +955,33 @@ mod tests {
         assert_eq!(pt.rfind_char_in_line(3, 'a'), Some(2));
         // No match returns None.
         assert_eq!(pt.find_char_in_line(0, 'z'), None);
+    }
+
+    /// Regression: pdfium can stream chars from neighbouring lines
+    /// interleaved (e.g. footnote sandwiched mid-paragraph). The
+    /// `start_idx..=end_idx` span over the line therefore contains
+    /// chars from OTHER lines whose stream idx falls inside the
+    /// range. `f<c>` must filter by `c.line == line` or it could
+    /// match a char on the wrong visual line.
+    #[test]
+    fn find_char_in_line_skips_chars_from_other_lines() {
+        // Stream order: line 0, line 1, line 0, line 1 — so each
+        // line's [start_idx, end_idx] span includes the OTHER line's
+        // stream indices. char_lines: [0, 1, 0, 1].
+        let pt = page_with(vec![
+            cell(0, 0.10, 0.10, 0.05, 0.04, 'x'), // line 0
+            cell(1, 0.10, 0.50, 0.05, 0.04, 'q'), // line 1 (the 'q' we must NOT match)
+            cell(2, 0.22, 0.10, 0.05, 0.04, 'y'), // line 0
+            cell(3, 0.28, 0.50, 0.05, 0.04, 'r'), // line 1
+        ]);
+        // From char 0 (line 0), search for 'q' on this line — must
+        // return None even though stream idx 1 contains 'q'.
+        assert_eq!(pt.find_char_in_line(0, 'q'), None);
+        // Conversely from char 1 (line 1), 'x' is on line 0 — None.
+        assert_eq!(pt.find_char_in_line(1, 'x'), None);
+        // Sanity: same-line lookup still works.
+        assert_eq!(pt.find_char_in_line(0, 'y'), Some(2));
+        assert_eq!(pt.rfind_char_in_line(3, 'q'), Some(1));
     }
 
     #[test]

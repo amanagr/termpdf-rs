@@ -1760,12 +1760,20 @@ impl<'doc> App<'doc> {
             };
             let new_line = (cur_line + delta).clamp(0, pt.lines.len() as i32 - 1) as usize;
             // Pick the char on the new line whose origin_x is nearest
-            // to the current caret's origin_x.
+            // to the current caret's origin_x. The `[start_idx, end_idx]`
+            // span is in *stream* order — pdfium can interleave chars
+            // from neighbouring lines (footnote/marginalia/multi-column
+            // pages) — so filter by `c.line == new_line` or the caret
+            // can teleport to a different visual line.
             let target_x = pt.chars[sel.head.idx].origin_x;
             let span = &pt.lines[new_line];
             let mut best = (span.start_idx, f32::MAX);
             for i in span.start_idx..=span.end_idx {
-                let dx = (pt.chars[i].origin_x - target_x).abs();
+                let c = &pt.chars[i];
+                if c.line != new_line {
+                    continue;
+                }
+                let dx = (c.origin_x - target_x).abs();
                 if dx < best.1 {
                     best = (i, dx);
                 }
