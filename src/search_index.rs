@@ -164,6 +164,12 @@ impl DocIndex {
     ///
     /// Only consults the indexed prefix; unindexed pages must be
     /// handled by the caller (typically: walk them via pdfium).
+    ///
+    /// Output is already strictly increasing: pages are added in
+    /// monotonic order so `page_starts` is non-decreasing in indexed
+    /// position, `match_offsets` walks the haystack left-to-right, and
+    /// the `last_page` filter strips consecutive duplicates. No
+    /// trailing sort is needed.
     pub fn pages_matching(&self, query: &str, case_sensitive: bool) -> Vec<usize> {
         if query.is_empty() {
             return Vec::new();
@@ -177,8 +183,6 @@ impl DocIndex {
                 last_page = page;
             }
         }
-        out.sort_unstable();
-        out.dedup();
         out
     }
 
