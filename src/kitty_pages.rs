@@ -37,7 +37,7 @@
 //! instead of an exact pixel. In return we drop scroll-frame Draw
 //! cost from ~150 ms to ~5 ms.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 
 use image::RgbaImage;
@@ -45,6 +45,14 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
 use crate::app::LayoutKey;
+
+/// Cap on cached pages. Each entry holds metadata + an optional
+/// encoded payload (~250 KB PNG). 64 entries ≈ 16 MB in our process;
+/// the terminal-side decoded RGBA is much larger (~5 MB/page) but
+/// each eviction emits an `a=d,d=I,i=ID` delete so the terminal can
+/// free its copy too. Without this cap, opening a 700-page PDF
+/// would leak ~3.5 GB of decoded image into the terminal.
+const MAX_CACHED_PAGES: usize = 64;
 
 /// Image-cache entry per page index.
 #[derive(Debug, Clone)]
@@ -92,6 +100,15 @@ pub struct KittyPageRegistry {
     /// for any fallback path that might still want to use it.
     id_base: u32,
     pages: HashMap<usize, PageEntry>,
+    /// LRU order — front = least recently used. `touch` moves a page
+    /// to the back; eviction pops from the front. Entries here mirror
+    /// keys in `pages`.
+    lru: VecDeque<usize>,
+    /// Kitty `a=d,d=I,i=ID` delete escapes accumulated during eviction.
+    /// Caller drains via `take_pending_deletes()` and prepends to the
+    /// next transmit (or a synthetic one) so the terminal frees its
+    /// decoded RGBA copy of the evicted image.
+    pending_deletes: String,
 }
 
 impl KittyPageRegistry {
@@ -100,6 +117,8 @@ impl KittyPageRegistry {
             is_tmux,
             id_base,
             pages: HashMap::new(),
+            lru: VecDeque::new(),
+            pending_deletes: String::new(),
         }
     }
 
@@ -110,6 +129,83 @@ impl KittyPageRegistry {
     #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.pages.clear();
+        self.lru.clear();
+        self.pending_deletes.clear();
+    }
+
+    /// Move `page_idx` to the MRU end of the LRU list. Idempotent.
+    fn touch(&mut self, page_idx: usize) {
+        if let Some(pos) = self.lru.iter().position(|&p| p == page_idx) {
+            self.lru.remove(pos);
+        }
+        self.lru.push_back(page_idx);
+    }
+
+    /// Evict LRU entries until the registry holds at most
+    /// `MAX_CACHED_PAGES` pages. Pages in `pinned` are skipped (so the
+    /// current frame's visible pages stay alive). For each eviction,
+    /// emits a kitty `a=d,d=I,i=ID` delete escape into
+    /// `pending_deletes` so the terminal also frees its image.
+    pub fn evict_to_budget(&mut self, pinned: &[usize]) {
+        if self.pages.len() <= MAX_CACHED_PAGES {
+            return;
+        }
+        let target = MAX_CACHED_PAGES;
+        // Scan front (LRU) to back, collecting victims that aren't
+        // pinned. Stop once we've trimmed enough.
+        let mut idx = 0;
+        while self.pages.len() > target && idx < self.lru.len() {
+            let cand = self.lru[idx];
+            if pinned.contains(&cand) {
+                idx += 1;
+                continue;
+            }
+            self.lru.remove(idx); // shifts; do NOT increment idx
+            if let Some(entry) = self.pages.remove(&cand) {
+                self.queue_delete(entry.image_id);
+            }
+        }
+    }
+
+    fn queue_delete(&mut self, id: u32) {
+        let (start, escape, end) = tmux_wrap(self.is_tmux);
+        // `a=d` = delete; `d=I` = by image id; `q=2` = suppress reply.
+        // Not freeing placement state explicitly — placements that
+        // referenced this id will simply render nothing once the
+        // image is gone, which is fine because we only evict
+        // non-visible (= unreferenced) pages.
+        write!(
+            self.pending_deletes,
+            "{start}{escape}_Ga=d,d=I,i={id},q=2;{escape}\\{end}"
+        )
+        .unwrap();
+    }
+
+    /// Drain accumulated delete escapes (from prior evictions). The
+    /// caller should prepend the result to its next transmit string
+    /// so the terminal processes the deletes alongside the new frame.
+    pub fn take_pending_deletes(&mut self) -> Option<String> {
+        if self.pending_deletes.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut self.pending_deletes))
+        }
+    }
+
+    /// Push a delete-escape blob back onto the pending queue. Used
+    /// when the caller drained but couldn't find a transmit to ride
+    /// it in on; the next frame with any transmit will pick it up.
+    pub fn put_back_pending_deletes(&mut self, s: String) {
+        if self.pending_deletes.is_empty() {
+            self.pending_deletes = s;
+        } else {
+            // Existing buffer was modified between take/put_back —
+            // shouldn't happen in our single-threaded draw loop, but
+            // handle it by prepending so order is preserved.
+            let mut combined = s;
+            combined.push_str(&self.pending_deletes);
+            self.pending_deletes = combined;
+        }
     }
 
     fn id_for(&self, page_idx: usize) -> u32 {
@@ -164,6 +260,7 @@ impl KittyPageRegistry {
         entry.transmitted_revision = revision;
         entry.pixel_w = pixel_w;
         entry.pixel_h = pixel_h;
+        self.touch(page_idx);
     }
 
     /// Build the kitty transmit escape for this page's bitmap. Free
@@ -216,6 +313,7 @@ impl KittyPageRegistry {
             });
             p
         };
+        self.touch(page_idx);
         build_transmit_string(&payload, format_code, id, pixel_w, pixel_h, self.is_tmux)
     }
 
@@ -263,6 +361,7 @@ impl KittyPageRegistry {
             format_code,
             bytes,
         });
+        self.touch(page_idx);
     }
 
     /// Pixel dimensions of the cached bitmap for this page, if any.
@@ -702,5 +801,65 @@ mod tests {
             ptr_after_pre, ptr_after_transmit,
             "build_transmit after pre_encode must reuse the bytes the pre-encode produced"
         );
+    }
+
+    #[test]
+    fn evict_caps_at_max() {
+        let mut r = KittyPageRegistry::new(false, 1000);
+        let layout = LayoutKey { fit_width_px: 64, dark: false };
+        let bm = RgbaImage::new(16, 16);
+        // Fill past cap.
+        for i in 0..(MAX_CACHED_PAGES + 8) {
+            r.mark_transmitted(i, layout, 0, 16, 16);
+            // Also stash a payload so eviction frees something visible.
+            r.pre_encode(&bm, i, layout, 0);
+        }
+        r.evict_to_budget(&[]);
+        assert_eq!(r.pages.len(), MAX_CACHED_PAGES);
+        // Pending deletes should reference the 8 evicted ids.
+        let deletes = r.take_pending_deletes().expect("evictions queued deletes");
+        // 8 eviction events, each emits one `_Ga=d,d=I,i=...` blob.
+        assert_eq!(deletes.matches("_Ga=d,d=I,i=").count(), 8);
+    }
+
+    #[test]
+    fn evict_skips_pinned_visible() {
+        let mut r = KittyPageRegistry::new(false, 1000);
+        let layout = LayoutKey { fit_width_px: 64, dark: false };
+        // Prime LRU: pages 0..N+4 marked, in order. 0..4 are LRU.
+        for i in 0..(MAX_CACHED_PAGES + 4) {
+            r.mark_transmitted(i, layout, 0, 16, 16);
+        }
+        // Pin pages 0,1,2,3 as visible — eviction must skip these
+        // (so on-screen placements stay alive) and instead evict the
+        // next-oldest non-pinned pages (4..7).
+        let pinned: Vec<usize> = (0..4).collect();
+        r.evict_to_budget(&pinned);
+        for &pi in &pinned {
+            assert!(
+                r.pages.contains_key(&pi),
+                "pinned page {pi} must NOT be evicted"
+            );
+        }
+        // 4..7 evicted (not pinned, oldest non-pinned).
+        for i in 4..8 {
+            assert!(
+                !r.pages.contains_key(&i),
+                "page {i} should be evicted (LRU non-pinned)"
+            );
+        }
+    }
+
+    #[test]
+    fn touch_reorders_lru() {
+        let mut r = KittyPageRegistry::new(false, 1000);
+        let layout = LayoutKey { fit_width_px: 64, dark: false };
+        r.mark_transmitted(0, layout, 0, 16, 16);
+        r.mark_transmitted(1, layout, 0, 16, 16);
+        r.mark_transmitted(2, layout, 0, 16, 16);
+        // Re-touching page 0 should move it to MRU (back of deque).
+        r.mark_transmitted(0, layout, 1, 16, 16);
+        assert_eq!(r.lru.back(), Some(&0));
+        assert_eq!(r.lru.front(), Some(&1));
     }
 }

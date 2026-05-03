@@ -549,7 +549,7 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     // NLL handles distinct struct fields separately.
     let overlay_cache = &app.overlay_cache;
     let kp = app.kitty_pages.as_mut().unwrap();
-    let transmits: Vec<Option<String>> = blits
+    let mut transmits: Vec<Option<String>> = blits
         .iter()
         .map(|b| {
             if !b.need_transmit {
@@ -559,6 +559,24 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
             Some(kp.build_transmit(bm, b.page_idx, layout_key, b.revision))
         })
         .collect();
+
+    // Drain any pending kitty `a=d,d=I,i=ID` deletes from prior
+    // evictions and ride them in on the first transmit of this frame.
+    // Doing it here rather than as a separate write keeps the deletes
+    // inside the `term.draw` window and avoids a second pty round-trip.
+    if let Some(deletes) = kp.take_pending_deletes() {
+        if let Some(slot) = transmits.iter_mut().find(|t| t.is_some()) {
+            // Prepend so deletes happen *before* the new image arrives,
+            // freeing terminal-side memory ahead of the new allocation.
+            let mut combined = deletes;
+            combined.push_str(slot.as_ref().unwrap());
+            *slot = Some(combined);
+        } else {
+            // No transmits this frame — stash the deletes for next.
+            // Cheap to write back; eviction is rare relative to draws.
+            kp.put_back_pending_deletes(deletes);
+        }
+    }
 
     drop(_compose);
 
@@ -595,13 +613,17 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
 
     // Now that the buffer has the placements, mark each page as
     // transmitted so the next frame skips the transmit if state is
-    // unchanged.
+    // unchanged. Then bound the registry size: evict LRU non-visible
+    // pages so a 700-page PDF doesn't pile up gigabytes of decoded
+    // RGBA in the terminal. The deletes queued here ride out on the
+    // next frame's first transmit (see take_pending_deletes above).
     let kp = app.kitty_pages.as_mut().unwrap();
     for b in &blits {
         if b.need_transmit {
             kp.mark_transmitted(b.page_idx, layout_key, b.revision, b.pixel_w, b.pixel_h);
         }
     }
+    kp.evict_to_budget(&visible);
 
     Ok(())
 }
