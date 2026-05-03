@@ -510,18 +510,15 @@ fn warm_next_uncached(app: &mut App<'_>) -> Result<bool> {
     if viewport_h == 0 {
         return Ok(false);
     }
-    let visible: Vec<usize> = app
-        .layout
-        .visible_pages(app.scroll_y_px, viewport_h)
-        .collect();
+    let visible = app.layout.visible_pages(app.scroll_y_px, viewport_h);
     if visible.is_empty() {
         return Ok(false);
     }
     let dir: i64 = if app.last_scroll_dir >= 0 { 1 } else { -1 };
     let start: i64 = if dir > 0 {
-        *visible.last().unwrap() as i64 + 1
+        visible.end as i64
     } else {
-        *visible.first().unwrap() as i64 - 1
+        visible.start as i64 - 1
     };
     // Look up to 8 pages ahead in the scroll direction for the first
     // un-cached one. With MAX_WARMS_PER_IDLE=4 calls per idle window
