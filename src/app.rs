@@ -796,10 +796,14 @@ impl<'doc> App<'doc> {
                 [240, 240, 240, 255]
             };
             let len = (viewport_w as usize) * 4;
-            self.bg_row_buf.clear();
-            self.bg_row_buf.reserve(len);
-            for _ in 0..viewport_w {
-                self.bg_row_buf.extend_from_slice(&bg);
+            // Resize-then-fill chunks: one alloc (or grow), one
+            // bounds-checked memset per pixel quad. Cheaper than the
+            // earlier `viewport_w` × extend_from_slice(&bg) loop, which
+            // walked the bounds check + amortised growth for each
+            // 4-byte append.
+            self.bg_row_buf.resize(len, 0);
+            for chunk in self.bg_row_buf.chunks_exact_mut(4) {
+                chunk.copy_from_slice(&bg);
             }
             self.bg_row_key = Some(key);
         }
