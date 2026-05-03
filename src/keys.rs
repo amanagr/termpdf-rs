@@ -458,11 +458,19 @@ pub fn parse_count(pending: &str) -> Option<usize> {
     if pending.is_empty() {
         return None;
     }
-    let digits: String = pending.chars().filter(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() {
-        return None;
+    // Fold digits directly into a usize accumulator instead of
+    // allocating a filtered String + reparsing it. Saves a small alloc
+    // per Normal-mode key dispatch (parse_count fires on every j/k/h/l
+    // etc to extract the count prefix).
+    let mut acc: usize = 0;
+    let mut any = false;
+    for c in pending.chars() {
+        if let Some(d) = c.to_digit(10) {
+            any = true;
+            acc = acc.checked_mul(10)?.checked_add(d as usize)?;
+        }
     }
-    digits.parse().ok()
+    any.then_some(acc)
 }
 
 #[cfg(test)]
