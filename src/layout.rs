@@ -59,33 +59,59 @@ impl PageLayout {
     /// Range of page indices (start..end, end exclusive) whose y-rect
     /// intersects the viewport. Empty if the document is empty or
     /// fully off-screen.
+    ///
+    /// Two binary searches over the monotonic `page_y_offsets`. The
+    /// previous linear scan was O(N) per frame — on a 700-page doc
+    /// that was ~42K compares/sec at steady scroll, all to find the
+    /// 1-3 visible pages near the cursor. The bounds-only test makes
+    /// this O(log N) instead.
     pub fn visible_pages(&self, scroll_y_px: i64, viewport_h_px: u32) -> Range<usize> {
-        if self.page_y_offsets.is_empty() {
+        let n = self.page_y_offsets.len();
+        if n == 0 {
             return 0..0;
         }
         let viewport_top = scroll_y_px;
         let viewport_bot = scroll_y_px + viewport_h_px as i64;
-        let mut first: Option<usize> = None;
-        let mut last_excl: usize = 0;
-        for (i, &y) in self.page_y_offsets.iter().enumerate() {
-            let h = self.page_heights_px[i] as i64;
-            let page_top = y;
-            let page_bot = y + h;
-            if page_bot <= viewport_top {
-                continue;
+        // First page whose bottom edge is strictly past viewport_top.
+        // page_bot is monotonic non-decreasing so the lo/hi loop is
+        // valid: predicate (bot <= viewport_top) is true for an
+        // initial run and false for the rest.
+        let first = {
+            let mut lo = 0usize;
+            let mut hi = n;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let bot = self.page_y_offsets[mid] + self.page_heights_px[mid] as i64;
+                if bot <= viewport_top {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
             }
-            if page_top >= viewport_bot {
-                break;
-            }
-            if first.is_none() {
-                first = Some(i);
-            }
-            last_excl = i + 1;
+            lo
+        };
+        if first >= n {
+            return 0..0;
         }
-        match first {
-            Some(f) => f..last_excl,
-            None => 0..0,
+        // First page whose top edge is at or past viewport_bot — the
+        // exclusive upper bound.
+        let last_excl = {
+            let mut lo = 0usize;
+            let mut hi = n;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if self.page_y_offsets[mid] < viewport_bot {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
+        };
+        if last_excl <= first {
+            return 0..0;
         }
+        first..last_excl
     }
 
     pub fn page_y(&self, idx: usize) -> i64 {
@@ -99,21 +125,37 @@ impl PageLayout {
     /// Which page contains the given doc-y pixel. Falls back to the
     /// last page if past the end, or 0 if the doc is empty. Inter-
     /// page gaps count as belonging to the page above them.
+    ///
+    /// Binary search over the monotonic ownership-end boundary
+    /// (`offset[i] + h[i] + gap_px`). Linear scan was fine for short
+    /// docs but becomes a real cost on a 700-page book where this
+    /// is hit by every layout-change scroll restore + every status-
+    /// bar redraw.
     pub fn page_at(&self, y_px: i64) -> usize {
-        if self.page_y_offsets.is_empty() {
+        let n = self.page_y_offsets.len();
+        if n == 0 {
             return 0;
         }
         if y_px < 0 {
             return 0;
         }
-        for (i, &offset) in self.page_y_offsets.iter().enumerate() {
-            let h = self.page_heights_px[i] as i64;
-            // page i owns y ∈ [offset, offset + h + gap)
-            if y_px < offset + h + self.gap_px as i64 {
-                return i;
+        let gap = self.gap_px as i64;
+        // First i where ownership-end > y_px.
+        let i = {
+            let mut lo = 0usize;
+            let mut hi = n;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let end = self.page_y_offsets[mid] + self.page_heights_px[mid] as i64 + gap;
+                if end <= y_px {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
             }
-        }
-        self.page_y_offsets.len() - 1
+            lo
+        };
+        i.min(n - 1)
     }
 
     /// Clamp a candidate scroll-y so it never sits past the end of
@@ -225,5 +267,27 @@ mod tests {
         // single page 50×100, viewport 200 → can't scroll at all.
         let l = PageLayout::build(&m, 50, 10);
         assert_eq!(l.clamp_scroll(50, 200), 0);
+    }
+
+    /// Long-doc regression: confirm visible_pages and page_at behave
+    /// correctly when the doc has hundreds of pages — guards against
+    /// off-by-one in the binary-search boundaries.
+    #[test]
+    fn visible_pages_long_doc_matches_naive_scan() {
+        let m = metrics(&[(100.0, 200.0); 500]);
+        let l = PageLayout::build(&m, 50, 10);
+        // Each page is 100 + 10 = 110 pixels apart; page i lives at
+        // y in [i*110, i*110 + 100). Pick a viewport that straddles
+        // two pages mid-doc.
+        let viewport_top = 250 * 110 + 50;
+        let r = l.visible_pages(viewport_top, 200);
+        assert_eq!(r, 250..253, "expected pages 250..253 visible at y={viewport_top}");
+        // Also: viewport pinned to last page should land on it.
+        let last_top = (500 - 1) * 110;
+        assert_eq!(l.visible_pages(last_top as i64, 100), 499..500);
+        // page_at points exactly at gap boundary stay on the page above.
+        assert_eq!(l.page_at(250 * 110 + 105), 250);
+        // page_at well past the end clamps.
+        assert_eq!(l.page_at(10_000_000), 499);
     }
 }
