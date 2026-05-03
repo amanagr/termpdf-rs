@@ -614,18 +614,24 @@ impl<'doc> App<'doc> {
         // Compute the total byte cost ONCE, then maintain it
         // incrementally as we evict. Previously this re-summed every
         // cached page on every loop iteration — O(n²) per call.
-        // Includes overlay_cache because a per-page overlay is the
-        // same dimensions as its source bitmap; otherwise the budget
-        // silently doubles.
-        let mut total: usize = self
-            .page_cache
-            .values()
-            .map(|img| (img.width() * img.height() * 4) as usize)
-            .sum::<usize>()
+        // Includes overlay_cache AND highlights_baked_cache: each is
+        // a same-dimension copy of the source bitmap. Counting all
+        // three in the initial total keeps the per-iteration sub
+        // accounting honest — leaving highlights_baked_cache out
+        // here used to under-count `total`, so the eviction loop
+        // exited too early and the cache could overshoot the budget.
+        let img_bytes = |img: &DynamicImage| (img.width() * img.height() * 4) as usize;
+        let rgba_bytes = |img: &RgbaImage| (img.width() * img.height() * 4) as usize;
+        let mut total: usize = self.page_cache.values().map(img_bytes).sum::<usize>()
             + self
                 .overlay_cache
                 .values()
-                .map(|(img, _)| (img.width() * img.height() * 4) as usize)
+                .map(|(img, _)| rgba_bytes(img))
+                .sum::<usize>()
+            + self
+                .highlights_baked_cache
+                .values()
+                .map(|(img, _)| rgba_bytes(img))
                 .sum::<usize>();
         while total > budget {
             let evict = self
