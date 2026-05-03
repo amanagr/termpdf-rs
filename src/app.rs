@@ -728,7 +728,7 @@ impl<'doc> App<'doc> {
     /// preloads pages below.
     pub fn prefetch_targets(&self, visible: std::ops::Range<usize>) -> Vec<usize> {
         const PREFETCH: usize = 2;
-        let mut out: Vec<usize> = Vec::new();
+        let mut out: Vec<usize> = Vec::with_capacity(PREFETCH * 2);
         if self.last_scroll_dir >= 0 {
             for i in 0..PREFETCH {
                 let p = visible.end + i;
