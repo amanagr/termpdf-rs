@@ -170,8 +170,8 @@ pub fn gen_hints(n: usize) -> Vec<String> {
     // `a_len - p` as standalone 1-char hints. Visually: the
     // common-sequence chars like 'a' get shorter codes.
     let single_count = a_len - p;
-    for i in 0..single_count {
-        hints.push(alphabet[i].to_string());
+    for &c in alphabet.iter().take(single_count) {
+        hints.push(c.to_string());
         if hints.len() == n {
             return hints;
         }
