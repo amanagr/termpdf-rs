@@ -616,7 +616,7 @@ impl<'doc> App<'doc> {
         });
         self.text_cache.retain(|page| {
             (page >= lo && page < hi)
-                || pin_range.as_ref().map_or(false, |r| r.contains(&page))
+                || pin_range.as_ref().is_some_and(|r| r.contains(&page))
         });
     }
 
@@ -1077,7 +1077,7 @@ impl<'doc> App<'doc> {
         let now = Instant::now();
         let rearm = self
             .last_space_at
-            .map_or(true, |t| now.duration_since(t) >= RESUME_MARKER_REARM);
+            .is_none_or(|t| now.duration_since(t) >= RESUME_MARKER_REARM);
         if rearm {
             // viewport bottom in document-pixel space — survives any
             // future zoom because the conversion happens at draw time.

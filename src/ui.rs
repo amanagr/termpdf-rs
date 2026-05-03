@@ -233,14 +233,13 @@ pub fn resume_marker_line(marker_w: u16) -> Line<'static> {
     const MIN_LABELED_WIDTH: u16 = (LABEL.len() as u16) + 4 + 2;
     let rule_style = Style::default().fg(Color::Yellow);
     if marker_w < MIN_LABELED_WIDTH {
-        let s: String = std::iter::repeat('─').take(marker_w as usize).collect();
-        return Line::from(Span::styled(s, rule_style));
+        return Line::from(Span::styled("─".repeat(marker_w as usize), rule_style));
     }
     let inner = marker_w - LABEL.len() as u16 - 2;
     let left_rule = inner / 2;
     let right_rule = inner - left_rule;
-    let left: String = std::iter::repeat('─').take(left_rule as usize).collect();
-    let right: String = std::iter::repeat('─').take(right_rule as usize).collect();
+    let left = "─".repeat(left_rule as usize);
+    let right = "─".repeat(right_rule as usize);
     // Black-on-yellow tag style for the label — guaranteed visible
     // on top of either a light or dark PDF render. BOLD reinforces
     // the focal-point role.

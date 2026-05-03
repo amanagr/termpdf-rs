@@ -342,24 +342,14 @@ impl PageText {
     pub fn find_char_in_line(&self, from: usize, target: char) -> Option<usize> {
         let line = self.line_of(from)?;
         let span = self.lines.get(line)?;
-        for i in (from + 1)..=span.end_idx {
-            if self.chars[i].ch == Some(target) {
-                return Some(i);
-            }
-        }
-        None
+        ((from + 1)..=span.end_idx).find(|&i| self.chars[i].ch == Some(target))
     }
 
     /// Vim's `F<c>` — previous occurrence on the same line.
     pub fn rfind_char_in_line(&self, from: usize, target: char) -> Option<usize> {
         let line = self.line_of(from)?;
         let span = self.lines.get(line)?;
-        for i in (span.start_idx..from).rev() {
-            if self.chars[i].ch == Some(target) {
-                return Some(i);
-            }
-        }
-        None
+        (span.start_idx..from).rev().find(|&i| self.chars[i].ch == Some(target))
     }
 
     /// Word range surrounding `from` — `[start, end]` inclusive,
