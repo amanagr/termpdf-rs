@@ -283,8 +283,14 @@ mod tests {
         assert_ne!(h1, h3);
     }
 
+    /// Serialize tests that mutate XDG_CACHE_HOME — cargo runs
+    /// tests in parallel by default and concurrent env mutation
+    /// would race the lookup inside `evict_to_budget`.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn evict_to_budget_drops_files_when_over_budget() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         // Stand up a fake cache_root inside a temp dir and point
         // `dirs::cache_dir` at it via XDG_CACHE_HOME.
         let scratch = std::env::temp_dir()
@@ -330,6 +336,7 @@ mod tests {
 
     #[test]
     fn evict_to_budget_no_op_when_under_budget() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let scratch = std::env::temp_dir()
             .join(format!("disk_cache_under_budget_test_{}", std::process::id()));
         let prev_xdg = std::env::var("XDG_CACHE_HOME").ok();
