@@ -218,6 +218,26 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         // `f` enters link-hint mode (vimium-style): every clickable
         // link on visible pages gets a 1-2 char overlay; type to pick.
         KeyCode::Char('f') => app.enter_link_hint_mode(),
+        // `]]` / `[[` jump to next / prev outline entry. Both
+        // require a doubled keystroke matching vim's section-motion
+        // binding. The first ] / [ stays in `pending`; the second
+        // fires the jump.
+        KeyCode::Char(']') => {
+            if app.pending == "]" {
+                app.jump_section(1);
+                app.pending.clear();
+            } else {
+                app.pending.push(']');
+            }
+        }
+        KeyCode::Char('[') => {
+            if app.pending == "[" {
+                app.jump_section(-1);
+                app.pending.clear();
+            } else {
+                app.pending.push('[');
+            }
+        }
 
         // Marks: `m{a-z}` to set, `'{a-z}` to jump. Two-stroke pattern
         // matched in the awaiting_mark_* prelude above.

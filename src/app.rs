@@ -792,6 +792,57 @@ impl<'doc> App<'doc> {
         self.goto_page_no_record(p);
     }
 
+    /// Jump to the next (`dir = +1`) or previous (`dir = -1`) outline
+    /// entry by page. Skips entries with no resolved page. No-op if
+    /// the document has no outline or if we're already at the
+    /// boundary in the requested direction.
+    ///
+    /// Vim convention: `]]` next, `[[` prev. The first jump from a
+    /// page that's mid-section lands on the next/previous *boundary*
+    /// (so `]]` from the middle of section 3 goes to section 4, and
+    /// `[[` goes to the start of section 3).
+    pub fn jump_section(&mut self, dir: i32) {
+        if self.outline.is_empty() {
+            self.status = "no outline in this document".into();
+            return;
+        }
+        let cur = self.current_page();
+        let mut targets: Vec<usize> = self
+            .outline
+            .iter()
+            .filter_map(|e| e.page)
+            .filter(|p| *p < self.page_count)
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        if targets.is_empty() {
+            self.status = "outline has no resolved pages".into();
+            return;
+        }
+        let target = if dir > 0 {
+            targets.into_iter().find(|p| *p > cur)
+        } else {
+            // For `[[`: if we're on a section's first page, go to the
+            // PREVIOUS section. Otherwise go to the start of the
+            // current section.
+            let mut prevs = targets.into_iter().filter(|p| *p < cur);
+            prevs.next_back()
+        };
+        match target {
+            Some(p) => {
+                self.goto_page(p);
+                self.status = format!("→ page {}", p + 1);
+            }
+            None => {
+                self.status = if dir > 0 {
+                    "no next section".into()
+                } else {
+                    "no prev section".into()
+                };
+            }
+        }
+    }
+
     /// Same as `goto_page` but does NOT touch the jumplist. Used by
     /// `<C-o>`/`<C-i>` themselves so walking the list doesn't keep
     /// re-pushing the destinations as new jumps.

@@ -1720,6 +1720,7 @@ pub fn help_overlay_lines() -> Vec<&'static str> {
         "  n / N                  next / previous match",
         "  :nohl                  clear search results",
         "",
+        "  ]] / [[                jump to next / prev outline entry",
         "  o  /  :toc             open outline panel",
         "    j/k Enter            navigate / jump to entry",
         "    / type Enter         filter by substring",
