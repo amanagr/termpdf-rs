@@ -460,6 +460,19 @@ fn warm_one_idle(app: &mut App<'_>) -> Result<()> {
                 dark: app.dark,
             };
             ui::ensure_overlay(app, pi, layout_key);
+            // Pre-encode the PNG payload into the kitty registry cache
+            // so the next draw-cycle transmit is a cache hit (saves
+            // ~2 ms per page on the hot path). Revision must match
+            // what the draw path will recompute, so use the shared
+            // helper. Compute it BEFORE the split borrow below — that
+            // way the &App borrow ends before we take &mut on
+            // kitty_pages.
+            let revision = ui::compute_page_revision(app, pi);
+            let bm = app.overlay_cache.get(&pi).map(|(bm, _)| bm);
+            let kp = app.kitty_pages.as_mut();
+            if let (Some(kp), Some(bm)) = (kp, bm) {
+                kp.pre_encode(bm, pi, layout_key, revision);
+            }
             return Ok(());
         }
     }

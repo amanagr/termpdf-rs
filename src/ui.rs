@@ -610,7 +610,11 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
 /// the layout (which is tracked separately by the kitty registry).
 /// Bumping this for a page invalidates only that page's transmit
 /// cache, leaving every other transmitted page in the terminal alone.
-fn compute_page_revision(app: &App<'_>, page_idx: usize) -> u64 {
+///
+/// Pub(crate) so the idle warm path in main.rs can recompute the same
+/// fingerprint when populating the pre-encode cache — both paths must
+/// agree or the draw cycle will see a cache miss and re-encode anyway.
+pub(crate) fn compute_page_revision(app: &App<'_>, page_idx: usize) -> u64 {
     let (search_revision, has_search_hits, current_hit_on_this_page) = match &app.search {
         Some(s) => {
             let any = s.hits.iter().any(|h| h.page == page_idx);
