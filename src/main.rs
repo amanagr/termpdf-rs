@@ -408,29 +408,47 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Idle-time prefetch. Renders one upcoming page in the user's
-/// scroll direction so the next j/k press lands on a cached page
-/// instead of a synchronous 20 ms pdfium call. Searches a few pages
-/// ahead so a quick pdfium failure on one page (corrupt, password,
-/// etc.) doesn't dead-end the prefetch.
+/// Idle-time prefetch. Renders + pre-encodes upcoming pages in the
+/// user's scroll direction so the next j/k press lands on a cached
+/// page instead of a synchronous ~20 ms pdfium call.
 ///
-/// Bounded by design to **one** render per idle tick — if the user
-/// presses a key while we're inside pdfium, they wait at most one
-/// render time. The event loop's own poll interval (down to 120 ms
-/// when settle is pending) guarantees we still notice the keypress
-/// quickly between ticks.
+/// Loops up to `MAX_WARMS_PER_IDLE` times in a single call, polling
+/// for input between iterations so a keystroke mid-prefetch breaks
+/// out immediately. Each iteration costs ~25 ms (pdfium + overlay +
+/// PNG encode); 4 of them packs a whole prefetch tier into ~100 ms
+/// of idle slack.
 fn warm_one_idle(app: &mut App<'_>) -> Result<()> {
+    const MAX_WARMS_PER_IDLE: u32 = 4;
+    for _ in 0..MAX_WARMS_PER_IDLE {
+        if !warm_next_uncached(app)? {
+            // Either prefetch depth exhausted or no candidate remains.
+            return Ok(());
+        }
+        // Yield: if input arrived during the just-finished warm, bail
+        // so the run loop can dispatch it without waiting for our
+        // remaining iterations.
+        if event::poll(Duration::ZERO)? {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// Render + bake overlay + pre-encode PNG for one upcoming uncached
+/// page. Returns `true` if a page was warmed, `false` if the prefetch
+/// window held no eligible candidate (depth exhausted, all already
+/// cached, or all failed).
+fn warm_next_uncached(app: &mut App<'_>) -> Result<bool> {
     let viewport_h = app.viewport_px.1;
     if viewport_h == 0 {
-        // Layout never built (no draw yet). Nothing useful to do.
-        return Ok(());
+        return Ok(false);
     }
     let visible: Vec<usize> = app
         .layout
         .visible_pages(app.scroll_y_px, viewport_h)
         .collect();
     if visible.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let dir: i64 = if app.last_scroll_dir >= 0 { 1 } else { -1 };
     let start: i64 = if dir > 0 {
@@ -438,10 +456,11 @@ fn warm_one_idle(app: &mut App<'_>) -> Result<()> {
     } else {
         *visible.first().unwrap() as i64 - 1
     };
-    // Look up to 5 pages ahead in the scroll direction for the first
-    // un-cached one. Past 5 is wasted work — the user's unlikely to
-    // get there before something else changes (zoom, jump, search).
-    const PREFETCH_DEPTH: i64 = 5;
+    // Look up to 8 pages ahead in the scroll direction for the first
+    // un-cached one. With MAX_WARMS_PER_IDLE=4 calls per idle window
+    // the absolute reachable distance is depth(=8) but typically the
+    // first 1-2 pages encountered will be the ones to warm.
+    const PREFETCH_DEPTH: i64 = 8;
     let fit_width_px = app.layout.fit_width_px;
     for offset in 0..PREFETCH_DEPTH {
         let cand = start + offset * dir;
@@ -449,34 +468,26 @@ fn warm_one_idle(app: &mut App<'_>) -> Result<()> {
             break;
         }
         let pi = cand as usize;
-        if !app.page_cache.contains_key(&pi) && !app.failed_pages.contains(&pi) {
-            ui::ensure_page_rendered(app, pi, fit_width_px, /*allow_failure=*/ true)?;
-            // Bake overlay too (highlights+selection): tier-2 cache
-            // ready means the next sight skips the per-page bake too.
-            // Cheap relative to the pdfium render we just did (~1 ms
-            // vs ~20 ms).
-            let layout_key = crate::app::LayoutKey {
-                fit_width_px,
-                dark: app.dark,
-            };
-            ui::ensure_overlay(app, pi, layout_key);
-            // Pre-encode the PNG payload into the kitty registry cache
-            // so the next draw-cycle transmit is a cache hit (saves
-            // ~2 ms per page on the hot path). Revision must match
-            // what the draw path will recompute, so use the shared
-            // helper. Compute it BEFORE the split borrow below — that
-            // way the &App borrow ends before we take &mut on
-            // kitty_pages.
-            let revision = ui::compute_page_revision(app, pi);
-            let bm = app.overlay_cache.get(&pi).map(|(bm, _)| bm);
-            let kp = app.kitty_pages.as_mut();
-            if let (Some(kp), Some(bm)) = (kp, bm) {
-                kp.pre_encode(bm, pi, layout_key, revision);
-            }
-            return Ok(());
+        if app.page_cache.contains_key(&pi) || app.failed_pages.contains(&pi) {
+            continue;
         }
+        ui::ensure_page_rendered(app, pi, fit_width_px, /*allow_failure=*/ true)?;
+        let layout_key = crate::app::LayoutKey {
+            fit_width_px,
+            dark: app.dark,
+        };
+        ui::ensure_overlay(app, pi, layout_key);
+        // Pre-encode the PNG payload into the kitty registry cache so
+        // the next draw cycle hits the cache.
+        let revision = ui::compute_page_revision(app, pi);
+        let bm = app.overlay_cache.get(&pi).map(|(bm, _)| bm);
+        let kp = app.kitty_pages.as_mut();
+        if let (Some(kp), Some(bm)) = (kp, bm) {
+            kp.pre_encode(bm, pi, layout_key, revision);
+        }
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Same as `dispatch_event` but with explicit per-event coalescing
