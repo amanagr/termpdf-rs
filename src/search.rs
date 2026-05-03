@@ -12,6 +12,8 @@
 //! get a future "budget N pages per frame tick" pass; v1 keeps it
 //! simple.
 
+use std::collections::HashSet;
+
 use anyhow::Result;
 use pdfium_render::prelude::*;
 
@@ -40,6 +42,12 @@ pub struct SearchResults {
     /// Bumped on every search state change so the compose cache can
     /// detect "user advanced n" without diffing the hits vector.
     pub revision: u64,
+    /// Set of page indices that contain at least one hit. Computed
+    /// once when the results land so the per-frame "does this page
+    /// have hits?" check is O(1) instead of an O(hits) iterator scan.
+    /// Big win on doc-wide queries (a query matching ~5000 hits used
+    /// to scan the full vec for every visible page on every frame).
+    pages_with_hits: HashSet<usize>,
 }
 
 impl SearchResults {
@@ -49,6 +57,7 @@ impl SearchResults {
             hits: Vec::new(),
             current: 0,
             revision: 0,
+            pages_with_hits: HashSet::new(),
         }
     }
 
@@ -64,6 +73,12 @@ impl SearchResults {
         let next = ((self.current as i32) + dir).rem_euclid(n);
         self.current = next as usize;
         self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// True if any hit lives on `page_idx`. O(1) lookup against the
+    /// pre-built page-index set.
+    pub fn page_has_hits(&self, page_idx: usize) -> bool {
+        self.pages_with_hits.contains(&page_idx)
     }
 }
 
@@ -139,11 +154,13 @@ pub fn run_search(
         }
     }
 
+    let pages_with_hits: HashSet<usize> = hits.iter().map(|h| h.page).collect();
     Ok(SearchResults {
         query: trimmed.to_string(),
         hits,
         current: 0,
         revision: 1,
+        pages_with_hits,
     })
 }
 
@@ -188,18 +205,24 @@ mod tests {
         assert_eq!(r.current, 0);
     }
 
-    #[test]
-    fn advance_wraps_around() {
-        let mut r = SearchResults {
+    fn fake_results(hits: Vec<SearchHit>) -> SearchResults {
+        let pages_with_hits: HashSet<usize> = hits.iter().map(|h| h.page).collect();
+        SearchResults {
             query: "x".into(),
-            hits: vec![
-                SearchHit { page: 0, rect: Rect01 { x: 0.0, y: 0.0, w: 0.1, h: 0.1 } },
-                SearchHit { page: 1, rect: Rect01 { x: 0.0, y: 0.0, w: 0.1, h: 0.1 } },
-                SearchHit { page: 2, rect: Rect01 { x: 0.0, y: 0.0, w: 0.1, h: 0.1 } },
-            ],
+            hits,
             current: 0,
             revision: 0,
-        };
+            pages_with_hits,
+        }
+    }
+
+    #[test]
+    fn advance_wraps_around() {
+        let mut r = fake_results(vec![
+            SearchHit { page: 0, rect: Rect01 { x: 0.0, y: 0.0, w: 0.1, h: 0.1 } },
+            SearchHit { page: 1, rect: Rect01 { x: 0.0, y: 0.0, w: 0.1, h: 0.1 } },
+            SearchHit { page: 2, rect: Rect01 { x: 0.0, y: 0.0, w: 0.1, h: 0.1 } },
+        ]);
         r.advance(1);
         assert_eq!(r.current, 1);
         r.advance(1);
@@ -222,18 +245,33 @@ mod tests {
 
     #[test]
     fn advance_bumps_revision_only_when_hits_exist() {
-        let mut r = SearchResults {
-            query: "x".into(),
-            hits: vec![SearchHit { page: 0, rect: Rect01 { x: 0.0, y: 0.0, w: 0.1, h: 0.1 } }; 2],
-            current: 0,
-            revision: 5,
-        };
+        let mut r = fake_results(vec![
+            SearchHit { page: 0, rect: Rect01 { x: 0.0, y: 0.0, w: 0.1, h: 0.1 } };
+            2
+        ]);
+        r.revision = 5;
         r.advance(1);
         assert_eq!(r.revision, 6);
         let mut r2 = SearchResults::empty("x".into());
         r2.revision = 7;
         r2.advance(1);
         assert_eq!(r2.revision, 7);
+    }
+
+    #[test]
+    fn page_has_hits_lookup_is_o1() {
+        // Distinct hit pages should be recognized; missing pages reject.
+        let r = fake_results(vec![
+            SearchHit { page: 3, rect: Rect01 { x: 0.0, y: 0.0, w: 0.1, h: 0.1 } },
+            SearchHit { page: 7, rect: Rect01 { x: 0.0, y: 0.0, w: 0.1, h: 0.1 } },
+            // Duplicate page is still just one set entry — exercises
+            // the dedup behaviour callers rely on.
+            SearchHit { page: 3, rect: Rect01 { x: 0.5, y: 0.5, w: 0.1, h: 0.1 } },
+        ]);
+        assert!(r.page_has_hits(3));
+        assert!(r.page_has_hits(7));
+        assert!(!r.page_has_hits(0));
+        assert!(!r.page_has_hits(99));
     }
 
     #[test]

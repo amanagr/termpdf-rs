@@ -134,7 +134,13 @@ impl KittyPageRegistry {
     }
 
     /// Move `page_idx` to the MRU end of the LRU list. Idempotent.
+    /// Fast-paths the common steady-scroll case where the page being
+    /// touched is already at MRU — skips the O(n) scan + remove that
+    /// would otherwise fire on every redraw of the same visible page.
     fn touch(&mut self, page_idx: usize) {
+        if self.lru.back().copied() == Some(page_idx) {
+            return;
+        }
         if let Some(pos) = self.lru.iter().position(|&p| p == page_idx) {
             self.lru.remove(pos);
         }

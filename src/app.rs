@@ -248,6 +248,12 @@ pub struct App<'doc> {
     /// composer a pre-sized buffer instead and only touch the gap
     /// rows between pages.
     pub canvas_buf: Option<RgbaImage>,
+    /// Pre-baked single row of background pixels (RGBA bytes), reused
+    /// across `fill_gap_rows` and `try_scroll_shift_canvas` so we
+    /// don't re-build a viewport_w * 4 byte Vec on every frame. Keyed
+    /// by (viewport_w, dark) and rebuilt only when either changes.
+    pub bg_row_buf: Vec<u8>,
+    pub bg_row_key: Option<(u32, bool)>,
     /// FNV-1a hash of the most recently encoded canvas buffer.
     /// Used to skip the kitty re-encode when ComposeKey changed but
     /// the resulting pixels happen to match the previous frame
@@ -462,6 +468,8 @@ impl<'doc> App<'doc> {
             last_input_at: None,
             input_burst_count: 0,
             canvas_buf: None,
+            bg_row_buf: Vec::new(),
+            bg_row_key: None,
             last_canvas_hash: 0,
             last_compose_key: None,
             highlights,
@@ -586,8 +594,14 @@ impl<'doc> App<'doc> {
     }
 
     /// Mark a page as the most-recently-used. Called every time
-    /// `ensure_image` reads or inserts a bitmap.
+    /// `ensure_image` reads or inserts a bitmap. Fast-paths the
+    /// steady-scroll case where the page is already at MRU — skips
+    /// the O(n) `retain` that would otherwise scan the whole window
+    /// on every redraw.
     pub fn touch_page(&mut self, page: usize) {
+        if self.page_cache_lru.last().copied() == Some(page) {
+            return;
+        }
         self.page_cache_lru.retain(|&p| p != page);
         self.page_cache_lru.push(page);
     }
@@ -695,6 +709,32 @@ impl<'doc> App<'doc> {
 
     pub fn invalidate_compose(&mut self) {
         self.last_compose_key = None;
+    }
+
+    /// Get a slice of `viewport_w * 4` background-color bytes — one
+    /// pre-baked row of (R, G, B, 255) tuples for `copy_from_slice`
+    /// into target rows. Cached by (viewport_w, dark): a steady-scroll
+    /// frame at unchanged dimensions reuses the same Vec instead of
+    /// rebuilding it. Saves ~viewport_w*4 bytes of allocator churn per
+    /// frame at 1080p (~7600 bytes), plus the iterator chain that
+    /// builds it.
+    pub fn bg_row(&mut self, viewport_w: u32) -> &[u8] {
+        let key = (viewport_w, self.dark);
+        if self.bg_row_key != Some(key) {
+            let bg: [u8; 4] = if self.dark {
+                [20, 20, 20, 255]
+            } else {
+                [240, 240, 240, 255]
+            };
+            let len = (viewport_w as usize) * 4;
+            self.bg_row_buf.clear();
+            self.bg_row_buf.reserve(len);
+            for _ in 0..viewport_w {
+                self.bg_row_buf.extend_from_slice(&bg);
+            }
+            self.bg_row_key = Some(key);
+        }
+        &self.bg_row_buf
     }
 
     /// True if the user is in a sustained input burst (autorepeat
