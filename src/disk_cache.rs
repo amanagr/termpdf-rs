@@ -108,7 +108,17 @@ pub fn store(path: &Path, image: &DynamicImage) -> std::io::Result<bool> {
             return Ok(false);
         }
     }
-    let rgba = image.to_rgba8();
+    // pdfium gives us DynamicImage::ImageRgba8 already; borrow the
+    // inner RgbaImage when present instead of paying a ~3 MB clone
+    // via to_rgba8() each idle warm tick.
+    let owned;
+    let rgba: &image::RgbaImage = match image.as_rgba8() {
+        Some(r) => r,
+        None => {
+            owned = image.to_rgba8();
+            &owned
+        }
+    };
     let mut buf = Vec::with_capacity(512 * 1024);
     {
         use image::codecs::png::{CompressionType, FilterType, PngEncoder};
