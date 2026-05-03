@@ -243,6 +243,10 @@ fn main() -> Result<()> {
     }
 
     tmux_passthrough_hint();
+    // Trim oldest disk-cache entries above the byte budget. Runs in
+    // a background thread so the filesystem walk doesn't add to
+    // first-paint latency.
+    disk_cache::evict_to_budget_async();
     let picker = pick_protocol(args.protocol);
 
     let mut app = App::new(

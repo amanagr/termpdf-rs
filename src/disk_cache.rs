@@ -35,6 +35,12 @@ use std::time::SystemTime;
 
 use image::DynamicImage;
 
+/// Soft cap on disk-cache size. `evict_to_budget` runs at startup
+/// and trims oldest files until under this budget. 512 MB ≈ ~2000
+/// pages of typical PDFs — enough room for the user's working set
+/// of recent PDFs without unbounded growth on a long-running setup.
+const DISK_CACHE_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+
 /// Compose the cache file path for one rendered page. Returns `None`
 /// when no cache directory is available (no `XDG_CACHE_HOME`, no
 /// `$HOME`, etc.) or when the source file's metadata can't be read.
@@ -128,6 +134,91 @@ pub fn store(path: &Path, image: &DynamicImage) -> std::io::Result<bool> {
     Ok(true)
 }
 
+/// Walk `~/.cache/termpdf-rs/`, sum file sizes; if over `budget`,
+/// delete oldest files (by mtime, ascending) until under. Best-effort:
+/// any IO error skips that file. Empty per-PDF dirs are also pruned.
+///
+/// Designed to run once at startup. On a 10 000-file cache the walk
+/// + sort is sub-100 ms — small relative to pdfium binding load.
+/// Caller should not error on failure.
+pub fn evict_to_budget(budget_bytes: u64) -> std::io::Result<()> {
+    let cache_root = match dirs::cache_dir() {
+        Some(d) => d.join("termpdf-rs"),
+        None => return Ok(()),
+    };
+    if !cache_root.exists() {
+        return Ok(());
+    }
+
+    // Collect (mtime, size, path) for every cache file. Skip non-png
+    // sidecar files (e.g. half-written .png.tmp) so a crashed write
+    // doesn't fool the sort.
+    let mut entries: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
+    let mut total: u64 = 0;
+    for pdf_dir in std::fs::read_dir(&cache_root)?.flatten() {
+        let pdf_dir_path = pdf_dir.path();
+        if !pdf_dir_path.is_dir() {
+            continue;
+        }
+        for file in std::fs::read_dir(&pdf_dir_path)?.flatten() {
+            let path = file.path();
+            if path.extension().is_none_or(|e| e != "png") {
+                continue;
+            }
+            let meta = match file.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let size = meta.len();
+            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            total += size;
+            entries.push((mtime, size, path));
+        }
+    }
+
+    if total <= budget_bytes {
+        return Ok(());
+    }
+
+    // Oldest first.
+    entries.sort_by_key(|e| e.0);
+
+    let mut to_free = total - budget_bytes;
+    for (_mtime, size, path) in entries {
+        if to_free == 0 {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            to_free = to_free.saturating_sub(size);
+        }
+    }
+
+    // Prune now-empty per-PDF dirs so they don't accumulate.
+    if let Ok(read) = std::fs::read_dir(&cache_root) {
+        for entry in read.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let empty = std::fs::read_dir(&path)
+                    .map(|mut it| it.next().is_none())
+                    .unwrap_or(false);
+                if empty {
+                    let _ = std::fs::remove_dir(&path);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Convenience wrapper: spawn `evict_to_budget` in a background
+/// thread so startup isn't blocked on filesystem walk for users
+/// with large caches. Failures are swallowed.
+pub fn evict_to_budget_async() {
+    std::thread::spawn(|| {
+        let _ = evict_to_budget(DISK_CACHE_BUDGET_BYTES);
+    });
+}
+
 fn fnv1a_hash_str(s: &str) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
@@ -190,5 +281,72 @@ mod tests {
         let h3 = fnv1a_hash_str("");
         assert_ne!(h1, h2);
         assert_ne!(h1, h3);
+    }
+
+    #[test]
+    fn evict_to_budget_drops_files_when_over_budget() {
+        // Stand up a fake cache_root inside a temp dir and point
+        // `dirs::cache_dir` at it via XDG_CACHE_HOME.
+        let scratch = std::env::temp_dir()
+            .join(format!("disk_cache_evict_test_{}", std::process::id()));
+        let prev_xdg = std::env::var("XDG_CACHE_HOME").ok();
+        // SAFETY: tests in this binary share process env. We restore
+        // before assertions to keep this test self-contained.
+        unsafe { std::env::set_var("XDG_CACHE_HOME", &scratch); }
+
+        let pdf_dir = scratch.join("termpdf-rs/abcd1234abcd1234");
+        std::fs::create_dir_all(&pdf_dir).unwrap();
+        // Three 10 KB files = 30 KB total.
+        let big = vec![0u8; 10 * 1024];
+        for i in 0..3 {
+            std::fs::write(pdf_dir.join(format!("{i}_800_0.png")), &big).unwrap();
+        }
+
+        // Budget 5 KB forces eviction of all but ~zero files (oldest
+        // first; mtime ordering is whatever the filesystem assigned
+        // so we don't pin a specific survivor here — we just check
+        // the total bytes drop).
+        evict_to_budget(5 * 1024).unwrap();
+
+        // Restore env before assertions to avoid leaks on panic.
+        match prev_xdg {
+            Some(v) => unsafe { std::env::set_var("XDG_CACHE_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CACHE_HOME") },
+        }
+
+        let surviving = std::fs::read_dir(&pdf_dir)
+            .map(|it| it.flatten().count())
+            .unwrap_or(0);
+        // Started with 3 files; budget is below one file's size; at
+        // most one should survive (could be 0). Evict logic stops as
+        // soon as `to_free` hits 0, so we expect 0 or 1 survivor.
+        assert!(
+            surviving <= 1,
+            "expected ≤1 file to survive 5 KB budget, found {surviving}"
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn evict_to_budget_no_op_when_under_budget() {
+        let scratch = std::env::temp_dir()
+            .join(format!("disk_cache_under_budget_test_{}", std::process::id()));
+        let prev_xdg = std::env::var("XDG_CACHE_HOME").ok();
+        unsafe { std::env::set_var("XDG_CACHE_HOME", &scratch); }
+
+        let pdf_dir = scratch.join("termpdf-rs/cafebabecafebabe");
+        std::fs::create_dir_all(&pdf_dir).unwrap();
+        std::fs::write(pdf_dir.join("0_800_0.png"), vec![0u8; 1024]).unwrap();
+
+        evict_to_budget(10 * 1024 * 1024).unwrap(); // 10 MB budget; well above 1 KB
+
+        match prev_xdg {
+            Some(v) => unsafe { std::env::set_var("XDG_CACHE_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CACHE_HOME") },
+        }
+
+        assert!(pdf_dir.join("0_800_0.png").exists(), "file under budget must survive");
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 }
