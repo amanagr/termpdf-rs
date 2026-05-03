@@ -21,6 +21,7 @@ mod compose;
 mod dark;
 mod highlight;
 mod keys;
+mod kitty_pages;
 mod layout;
 mod outline;
 mod pdf;

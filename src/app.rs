@@ -209,6 +209,14 @@ pub struct App<'doc> {
     /// loop runs back-to-back.
     pub pages_in_flight: std::collections::HashSet<(usize, u32, bool)>,
     pub image_proto: Option<StatefulProtocol>,
+    /// Per-page kitty placements registry. `Some(...)` only when the
+    /// picker selected the kitty protocol; the canvas / ratatui-image
+    /// path is used for sixel/iterm2/halfblocks. When set, the kitty
+    /// draw path bypasses canvas composition entirely — each page is
+    /// transmitted once with its own image ID and re-shown via
+    /// unicode-placeholder cells. Drops the per-frame Draw cost from
+    /// ~150 ms (full canvas re-encode + pty write) to ~5 ms.
+    pub kitty_pages: Option<crate::kitty_pages::KittyPageRegistry>,
     pub last_compose_key: Option<ComposeKey>,
     /// Reused viewport-sized RGBA buffer. Allocating an 8 MB
     /// `RgbaImage::from_pixel` per recompose was 4–6 ms of pure
@@ -350,6 +358,11 @@ impl<'doc> App<'doc> {
         // Empty layout — first `ensure_image` call builds a real one
         // once the viewport size is known.
         let layout = PageLayout::build(&[], 0, 0);
+        let kitty_pages = matches!(picker.protocol_type(), ratatui_image::picker::ProtocolType::Kitty)
+            .then(|| {
+                let is_tmux = std::env::var("TMUX").is_ok();
+                crate::kitty_pages::KittyPageRegistry::new(is_tmux, stable_kitty_id())
+            });
         let app = Self {
             document,
             path: path.to_path_buf(),
@@ -386,6 +399,7 @@ impl<'doc> App<'doc> {
             render_worker: None, // populated by main after construction
             pages_in_flight: std::collections::HashSet::new(),
             image_proto: None,
+            kitty_pages,
             canvas_buf: None,
             last_canvas_hash: 0,
             last_compose_key: None,

@@ -89,6 +89,18 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
             Block::default().style(Style::default().bg(Color::Black)),
             img_area,
         );
+    } else if app.kitty_pages.is_some() {
+        // Per-page kitty placements bypass ratatui-image: each page
+        // becomes its own kitty image, transmitted once. Steady scroll
+        // is then just a few hundred bytes of placeholder cells per
+        // frame instead of a multi-MB canvas re-encode.
+        if let Err(e) = draw_pages_kitty(f, app, img_area) {
+            f.render_widget(
+                Paragraph::new(format!("render error: {e:#}"))
+                    .style(Style::default().fg(Color::Red)),
+                img_area,
+            );
+        }
     } else if let Err(e) = ensure_image(app, img_area) {
         f.render_widget(
             Paragraph::new(format!("render error: {e:#}"))
@@ -96,7 +108,8 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
             img_area,
         );
     } else if let Some(proto) = app.image_proto.as_mut() {
-        // The composed image is exactly viewport-sized (we already
+        // Non-kitty fallback (sixel / iterm2 / halfblocks): the
+        // composed image is exactly viewport-sized (we already
         // centered/cropped while painting), so render it across the
         // full image area.
         f.render_stateful_widget(
@@ -340,6 +353,235 @@ fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
     app.canvas_buf = Some(canvas);
     app.last_compose_key = Some(compose_key);
     Ok(())
+}
+
+/// Render path for the kitty protocol that bypasses ratatui-image.
+/// Each visible page is transmitted to the terminal once with its
+/// own image ID; subsequent frames emit only unicode-placeholder
+/// cells. Steady-state scrolling drops from ~150 ms (full canvas
+/// re-encode + pty write) to a few hundred bytes per visible page.
+///
+/// Trade-off vs. the canvas path: cell-quantized scrolling. Sub-cell
+/// pixel offsets are dropped; in the typical reading workflow (page
+/// jumps, line scroll) this is invisible. See `kitty_pages` module
+/// docs for the protocol details.
+fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> {
+    let (cell_w_u8, cell_h_u8) = app.picker.font_size();
+    let cell_w = cell_w_u8 as u32;
+    let cell_h = cell_h_u8 as u32;
+    let viewport_w = (area.width as u32) * cell_w;
+    let viewport_h = (area.height as u32) * cell_h;
+    app.viewport_px = (viewport_w, viewport_h);
+
+    let fit_width_px =
+        (((viewport_w as f32) * app.zoom).max(1.0) as u32).min(MAX_FIT_WIDTH_PX);
+    app.ensure_layout(fit_width_px, viewport_h);
+    let layout_key = LayoutKey { fit_width_px, dark: app.dark };
+
+    let visible_range = app.layout.visible_pages(app.scroll_y_px, viewport_h);
+    let visible: Vec<usize> = visible_range.clone().collect();
+    if visible.is_empty() {
+        return Ok(());
+    }
+
+    {
+        let _s = crate::profile::span(crate::profile::Phase::EnsureRendered);
+        for &pi in &visible {
+            ensure_page_rendered(app, pi, fit_width_px, /*allow_failure=*/ true)?;
+            app.touch_page(pi);
+        }
+    }
+
+    app.evict_far_pages(visible_range.clone());
+    app.enforce_byte_budget(page_cache_budget_bytes(), visible_range);
+
+    {
+        let _s = crate::profile::span(crate::profile::Phase::EnsureOverlay);
+        for &pi in &visible {
+            ensure_overlay(app, pi, layout_key);
+        }
+    }
+
+    // Compose-phase span: cover the planning + per-page geometry math.
+    let _compose = crate::profile::span(crate::profile::Phase::Compose);
+
+    // Plan placements + decide which pages need a transmit. Pulled out
+    // into a Vec so the read-only borrows on overlay_cache and
+    // kitty_pages can be released before we mutate the registry +
+    // ratatui buffer in the second pass below.
+    struct PageBlit {
+        page_idx: usize,
+        image_id: u32,
+        pixel_w: u32,
+        pixel_h: u32,
+        revision: u64,
+        need_transmit: bool,
+        dst_top_cell: u16,
+        dst_left_cell: u16,
+        height_cells: u16,
+        src_top_cell: u16,
+        width_cells: u16,
+    }
+
+    let scroll_y = app.scroll_y_px;
+    let area_width_cells = area.width;
+    let area_height_cells = area.height;
+
+    let mut blits: Vec<PageBlit> = Vec::with_capacity(visible.len());
+    for &page_idx in &visible {
+        let Some((bm, _)) = app.overlay_cache.get(&page_idx) else {
+            continue;
+        };
+        let pixel_w = bm.width();
+        let pixel_h = bm.height();
+
+        let page_doc_y = app.layout.page_y(page_idx);
+        let page_h_px = app.layout.page_h(page_idx);
+        if page_h_px == 0 {
+            continue;
+        }
+
+        // Cell-quantize the scroll offset for placement purposes.
+        let src_top_px = (scroll_y - page_doc_y).max(0) as u32;
+        let src_top_cell = (src_top_px / cell_h.max(1)) as u16;
+        let dst_top_px = (page_doc_y - scroll_y).max(0) as u32;
+        let dst_top_cell = (dst_top_px / cell_h.max(1)) as u16;
+
+        let img_h_cells = (pixel_h / cell_h.max(1)) as u16;
+        let img_w_cells = (pixel_w / cell_w.max(1)) as u16;
+
+        let max_dst_rows = area_height_cells.saturating_sub(dst_top_cell);
+        let max_src_rows = img_h_cells.saturating_sub(src_top_cell);
+        let height_cells = max_dst_rows.min(max_src_rows);
+        if height_cells == 0 {
+            continue;
+        }
+
+        // Center horizontally if the rendered page is narrower than
+        // the viewport (typical for portrait pages with default zoom).
+        let dst_left_cell = if img_w_cells < area_width_cells {
+            (area_width_cells - img_w_cells) / 2
+        } else {
+            0
+        };
+        let width_cells = img_w_cells.min(area_width_cells.saturating_sub(dst_left_cell));
+        if width_cells == 0 {
+            continue;
+        }
+
+        let revision = compute_page_revision(app, page_idx);
+        let kp = app.kitty_pages.as_ref().expect("kitty_pages should be Some on this draw path");
+        let need_transmit = !kp.is_fresh(page_idx, layout_key, revision, pixel_w, pixel_h);
+        let image_id = kp.image_id(page_idx);
+
+        blits.push(PageBlit {
+            page_idx,
+            image_id,
+            pixel_w,
+            pixel_h,
+            revision,
+            need_transmit,
+            dst_top_cell,
+            dst_left_cell,
+            height_cells,
+            src_top_cell,
+            width_cells,
+        });
+    }
+
+    // Build transmit strings for pages that need them. Held outside
+    // the draw loop so the immutable borrow on overlay_cache doesn't
+    // overlap the mutable borrow on kitty_pages.
+    let transmits: Vec<Option<String>> = {
+        let kp = app.kitty_pages.as_ref().unwrap();
+        blits
+            .iter()
+            .map(|b| {
+                if !b.need_transmit {
+                    return None;
+                }
+                let bm = app.overlay_cache.get(&b.page_idx).map(|(b, _)| b)?;
+                Some(kp.build_transmit(bm, b.page_idx))
+            })
+            .collect()
+    };
+
+    drop(_compose);
+
+    // Emit placements (and prefix the first cell with the transmit
+    // string for any page that needed one). The Draw span on the
+    // outside of `term.draw` covers the actual write to the pty.
+    let buf = f.buffer_mut();
+    let img_area_left = area.left();
+    let img_area_top = area.top();
+
+    for (b, t) in blits.iter().zip(transmits.iter()) {
+        let placement_area = Rect {
+            x: img_area_left.saturating_add(b.dst_left_cell),
+            y: img_area_top,
+            width: b.width_cells,
+            height: area_height_cells,
+        };
+        crate::kitty_pages::place_page(
+            buf,
+            placement_area,
+            b.page_idx,
+            b.image_id,
+            b.pixel_w,
+            b.pixel_h,
+            cell_w,
+            cell_h,
+            b.dst_top_cell,
+            b.height_cells,
+            b.src_top_cell,
+            b.width_cells,
+            t.as_deref(),
+        );
+    }
+
+    // Now that the buffer has the placements, mark each page as
+    // transmitted so the next frame skips the transmit if state is
+    // unchanged.
+    let kp = app.kitty_pages.as_mut().unwrap();
+    for b in &blits {
+        if b.need_transmit {
+            kp.mark_transmitted(b.page_idx, layout_key, b.revision, b.pixel_w, b.pixel_h);
+        }
+    }
+
+    Ok(())
+}
+
+/// Per-page revision: hash of every overlay-affecting field except
+/// the layout (which is tracked separately by the kitty registry).
+/// Bumping this for a page invalidates only that page's transmit
+/// cache, leaving every other transmitted page in the terminal alone.
+fn compute_page_revision(app: &App<'_>, page_idx: usize) -> u64 {
+    let (search_revision, has_search_hits, current_hit_on_this_page) = match &app.search {
+        Some(s) => {
+            let any = s.hits.iter().any(|h| h.page == page_idx);
+            let cur = s.current_hit().map(|h| h.page == page_idx).unwrap_or(false);
+            (s.revision, any, cur)
+        }
+        None => (0u64, false, false),
+    };
+    let sel = app.selection_signature_for_page(page_idx);
+
+    // FNV-1a-style mix; doesn't need to be cryptographic — just
+    // non-degenerate enough that flipping any single field flips the
+    // revision.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for v in [
+        app.highlight_revision,
+        search_revision,
+        sel,
+        has_search_hits as u64,
+        current_hit_on_this_page as u64,
+    ] {
+        h ^= v;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
 }
 
 /// Scroll-shift optimisation: when the only ComposeKey field that
