@@ -546,7 +546,12 @@ impl PageText {
         let (lo, hi) = if start <= end { (start, end) } else { (end, start) };
         let lo = lo.min(self.chars.len() - 1);
         let hi = hi.min(self.chars.len() - 1);
-        let mut out = String::new();
+        // Upper bound: each char contributes 1-4 UTF-8 bytes plus
+        // possibly a newline. Average is closer to 1 byte, so size to
+        // (hi - lo + 1) bytes — typical paragraph yanks fit without
+        // reallocation, the rare wide-codepoint or many-line case grows
+        // a single doubling step.
+        let mut out = String::with_capacity(hi.saturating_sub(lo) + 1);
         let mut last_line = self.chars[lo].line;
         for c in &self.chars[lo..=hi] {
             if c.is_generated {
