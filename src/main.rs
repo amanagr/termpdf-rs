@@ -25,6 +25,7 @@ mod layout;
 mod outline;
 mod pdf;
 mod pdfhighlights;
+mod render_worker;
 mod search;
 mod session;
 mod textlayout;
@@ -250,6 +251,12 @@ fn main() -> Result<()> {
         saved.marks.clone(),
         picker,
     )?;
+
+    // Background render worker for prefetch (steady-scroll smoothness).
+    // Failure to spawn falls back to fully synchronous rendering — the
+    // user sees the same UX as before this commit, just without the
+    // prefetch speedup.
+    app.render_worker = render_worker::RenderWorker::spawn(lib.clone(), args.path.clone());
 
     setup_terminal()?;
     let res = run_loop(&mut app);

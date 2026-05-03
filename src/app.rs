@@ -199,6 +199,15 @@ pub struct App<'doc> {
     /// here instead of from `page_cache`, skipping the per-highlight
     /// blend loop.
     pub highlights_baked_cache: HashMap<usize, (RgbaImage, HighlightsBakedKey)>,
+    /// Background page-render worker (`None` if it failed to spawn —
+    /// falls back to fully synchronous rendering). Used only for
+    /// prefetch: visible-page rendering on cold cache stays sync so
+    /// the user sees the new page in the same frame.
+    pub render_worker: Option<crate::render_worker::RenderWorker>,
+    /// (page, target_width_px, dark) tuples currently in flight on
+    /// the worker. Prevents duplicate requests when the prefetch
+    /// loop runs back-to-back.
+    pub pages_in_flight: std::collections::HashSet<(usize, u32, bool)>,
     pub image_proto: Option<StatefulProtocol>,
     pub last_compose_key: Option<ComposeKey>,
     /// Reused viewport-sized RGBA buffer. Allocating an 8 MB
@@ -374,6 +383,8 @@ impl<'doc> App<'doc> {
             failed_pages: std::collections::HashSet::new(),
             overlay_cache: HashMap::new(),
             highlights_baked_cache: HashMap::new(),
+            render_worker: None, // populated by main after construction
+            pages_in_flight: std::collections::HashSet::new(),
             image_proto: None,
             canvas_buf: None,
             last_canvas_hash: 0,

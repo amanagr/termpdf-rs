@@ -255,6 +255,11 @@ fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
 
     // Ensure a bitmap exists for every visible page. Each render is
     // cached under its page index; the bitmap matches the current
+    // Drain any completed worker renders into the page cache before
+    // we decide what's still missing. This is what makes prefetched
+    // pages "appear" in the cache between frames.
+    drain_worker_results(app);
+
     // LayoutKey because `ensure_layout` clears the cache on change.
     let visible = app.layout.visible_pages(app.scroll_y_px, viewport_h);
     for page_idx in visible.clone() {
@@ -263,12 +268,11 @@ fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
     }
 
     // Speculatively render a few pages outside the viewport in the
-    // user's scroll direction. Failures here are swallowed —
-    // prefetch is best-effort, the user hasn't asked to see these
-    // pages yet.
+    // user's scroll direction. Sent to the background worker (if
+    // available) so cold prefetch never blocks the UI.
     let prefetch = app.prefetch_targets(visible.clone());
     for page_idx in prefetch {
-        let _ = ensure_page_rendered(app, page_idx, fit_width_px, true);
+        request_prefetch(app, page_idx, fit_width_px);
     }
 
     app.evict_far_pages(visible.clone());
@@ -561,6 +565,90 @@ fn fnv1a_hash(bytes: &[u8]) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     h
+}
+
+/// Drain completed render-worker responses into `page_cache` so
+/// prefetched pages become available to the very next frame. Called
+/// at the top of `ensure_image`. Cheap: a non-blocking `try_recv`
+/// loop, returns instantly when the channel is empty.
+///
+/// Stale renders (key no longer matches the current `LayoutKey` —
+/// the user zoomed or toggled dark mode while the page was in
+/// flight) are dropped on the floor. The next ensure_image cycle
+/// will re-issue with the new dimensions.
+fn drain_worker_results(app: &mut App<'_>) {
+    let Some(worker) = app.render_worker.as_ref() else {
+        return;
+    };
+    let current_layout = LayoutKey {
+        fit_width_px: app.layout.fit_width_px,
+        dark: app.dark,
+    };
+    let drained = worker.drain();
+    for resp in drained {
+        app.pages_in_flight.remove(&(
+            resp.req.page,
+            resp.req.target_width_px,
+            resp.req.dark,
+        ));
+        if resp.req.target_width_px != current_layout.fit_width_px
+            || resp.req.dark != current_layout.dark
+        {
+            // Stale — layout moved on while this was in flight.
+            continue;
+        }
+        match resp.image {
+            Ok(img) => {
+                app.page_cache.insert(resp.req.page, img);
+                // Force a recompose since a previously-blank page
+                // now has pixels.
+                app.last_compose_key = None;
+            }
+            Err(_) => {
+                // Worker hit an error. Mark the page as failed so we
+                // don't keep retrying every frame.
+                app.failed_pages.insert(resp.req.page);
+            }
+        }
+    }
+}
+
+/// Send a prefetch request to the background worker. No-op if:
+///   - the worker isn't available (failed to spawn or already
+///     disconnected),
+///   - the page is already cached,
+///   - the page is already in flight at the requested dimensions,
+///   - the page is on the failed-pages blacklist.
+/// Falls back to nothing — prefetch is best-effort.
+fn request_prefetch(app: &mut App<'_>, page_idx: usize, fit_width_px: u32) {
+    if app.page_cache.contains_key(&page_idx) {
+        return;
+    }
+    if app.failed_pages.contains(&page_idx) {
+        return;
+    }
+    let key = (page_idx, fit_width_px, app.dark);
+    if app.pages_in_flight.contains(&key) {
+        return;
+    }
+    let Some(worker) = app.render_worker.as_ref() else {
+        // No worker — fall back to synchronous prefetch (the old
+        // behaviour). Failures swallowed.
+        let _ = ensure_page_rendered(app, page_idx, fit_width_px, true);
+        return;
+    };
+    let req = crate::render_worker::RenderReq {
+        page: page_idx,
+        target_width_px: fit_width_px,
+        dark: app.dark,
+    };
+    if worker.request(req) {
+        app.pages_in_flight.insert(key);
+    } else {
+        // Worker died; clear it so future calls take the fallback path.
+        app.render_worker = None;
+        let _ = ensure_page_rendered(app, page_idx, fit_width_px, true);
+    }
 }
 
 /// Render `page_idx` through pdfium if it's not already cached.
