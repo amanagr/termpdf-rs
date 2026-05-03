@@ -649,29 +649,51 @@ impl<'doc> App<'doc> {
                 .values()
                 .map(|(img, _)| rgba_bytes(img))
                 .sum::<usize>();
-        while total > budget {
-            let evict = self
-                .page_cache_lru
-                .iter()
-                .copied()
-                .find(|p| !pinned.contains(p));
-            let Some(p) = evict else {
-                // Everything left is pinned; budget is undersized
-                // for the current viewport. Better to overshoot than
-                // refuse to render.
-                break;
-            };
-            if let Some(img) = self.page_cache.remove(&p) {
-                total = total.saturating_sub((img.width() * img.height() * 4) as usize);
-            }
-            if let Some((img, _)) = self.overlay_cache.remove(&p) {
-                total = total.saturating_sub((img.width() * img.height() * 4) as usize);
-            }
-            if let Some((img, _)) = self.highlights_baked_cache.remove(&p) {
-                total = total.saturating_sub((img.width() * img.height() * 4) as usize);
-            }
-            self.page_cache_lru.retain(|&x| x != p);
+        if total <= budget {
+            return;
         }
+        // Build the eviction set in a single oldest-first pass through
+        // the LRU, then drop the entries from page_cache_lru with one
+        // retain. The previous loop did `retain(|&x| x != p)` per
+        // evicted page — O(K·N) for K evictions and N entries; a long
+        // run of evictions on a 700-page doc was visibly stuttery on
+        // the first scroll past the budget. Single-pass is O(N + K).
+        let mut to_evict: Vec<usize> = Vec::new();
+        for &p in &self.page_cache_lru {
+            if total <= budget {
+                break;
+            }
+            if pinned.contains(&p) {
+                continue;
+            }
+            let mut freed: usize = 0;
+            if let Some(img) = self.page_cache.get(&p) {
+                freed += img_bytes(img);
+            }
+            if let Some((img, _)) = self.overlay_cache.get(&p) {
+                freed += rgba_bytes(img);
+            }
+            if let Some((img, _)) = self.highlights_baked_cache.get(&p) {
+                freed += rgba_bytes(img);
+            }
+            total = total.saturating_sub(freed);
+            to_evict.push(p);
+        }
+        if to_evict.is_empty() {
+            // Everything left is pinned; budget is undersized for the
+            // current viewport. Better to overshoot than refuse to
+            // render.
+            return;
+        }
+        for p in &to_evict {
+            self.page_cache.remove(p);
+            self.overlay_cache.remove(p);
+            self.highlights_baked_cache.remove(p);
+        }
+        // Use a HashSet for O(1) membership rather than O(K) per
+        // retained item.
+        let evict_set: std::collections::HashSet<usize> = to_evict.into_iter().collect();
+        self.page_cache_lru.retain(|p| !evict_set.contains(p));
     }
 
     /// Pages worth speculatively rendering ahead of the current
