@@ -1545,6 +1545,23 @@ pub fn bake_selection_into_page(
 // `ensure_overlay`) so it travels through the same kitty re-upload
 // path that already works for saved highlights.
 
+/// Percent through the document, based on doc-pixel scroll position.
+/// 0% = top of doc; 100% = bottom of last page in viewport. Pure
+/// helper so it can be unit-tested without an `App` instance.
+pub(crate) fn reading_percent(app: &App<'_>) -> u32 {
+    reading_percent_pure(
+        app.scroll_y_px,
+        app.viewport_px.1 as i64,
+        app.layout.total_height_px,
+    )
+}
+
+pub(crate) fn reading_percent_pure(scroll_y_px: i64, viewport_h_px: i64, total_h_px: i64) -> u32 {
+    let scrollable = (total_h_px - viewport_h_px).max(1);
+    let p = (scroll_y_px.max(0) as f64 / scrollable as f64) * 100.0;
+    p.clamp(0.0, 100.0).round() as u32
+}
+
 fn status_line(app: &App<'_>) -> Paragraph<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
 
@@ -1568,8 +1585,14 @@ fn status_line(app: &App<'_>) -> Paragraph<'static> {
     if matches!(app.mode, Mode::Command | Mode::Search) {
         spans.push(Span::raw(app.cmd_buffer.clone()));
     } else {
+        // Reading-progress indicator. Shows page index plus % through
+        // the document — handy on long books where "page 234" is
+        // meaningless without context. The percent uses the *visual*
+        // top-of-viewport position (not page index) so scrolling
+        // mid-page nudges it smoothly.
+        let pct = reading_percent(app);
         spans.push(Span::styled(
-            format!(" {}/{}  ", app.current_page() + 1, app.page_count),
+            format!(" {}/{}  {:>2}%  ", app.current_page() + 1, app.page_count, pct),
             Style::default().fg(Color::White),
         ));
         if app.dark {
@@ -2306,5 +2329,57 @@ mod tests {
         let h = visible_cell_height(&l, 0, /*viewport_h_cells*/ 10, 0, /*cell_h_px*/ 16);
         // 100 px / 16 px/cell = 6 cells; viewport allows 10, so 6 wins.
         assert_eq!(h, 6);
+    }
+
+    // ---- reading_percent_pure ---------------------------------------
+
+    #[test]
+    fn reading_percent_zero_at_top_of_doc() {
+        // scroll=0, viewport=600, total=12000 → 0%.
+        assert_eq!(reading_percent_pure(0, 600, 12000), 0);
+    }
+
+    #[test]
+    fn reading_percent_hundred_at_bottom() {
+        // scroll positions the viewport bottom flush with doc bottom.
+        // total - viewport = 11400; scroll = 11400 → 100%.
+        assert_eq!(reading_percent_pure(11400, 600, 12000), 100);
+    }
+
+    #[test]
+    fn reading_percent_midway_lands_at_fifty() {
+        // Half-scrolled through the scrollable distance → 50%.
+        assert_eq!(reading_percent_pure(5700, 600, 12000), 50);
+    }
+
+    #[test]
+    fn reading_percent_clamps_above_100() {
+        // Past-end scroll (race window during a layout swap) must
+        // not show 101% or panic.
+        assert_eq!(reading_percent_pure(99999, 600, 12000), 100);
+    }
+
+    #[test]
+    fn reading_percent_negative_scroll_treated_as_top() {
+        // Defensive: a negative scroll_y_px (shouldn't happen in
+        // practice, but the layout has saturating math) maps to 0%.
+        assert_eq!(reading_percent_pure(-50, 600, 12000), 0);
+    }
+
+    #[test]
+    fn reading_percent_short_doc_no_div_by_zero() {
+        // Doc shorter than the viewport — scrollable distance would be
+        // ≤0 if not floored at 1. Result must be in [0,100], not NaN
+        // or a panic.
+        let p = reading_percent_pure(0, 1000, 200);
+        assert!(p <= 100);
+        // With nothing to scroll the only sensible position is 0%.
+        assert_eq!(p, 0);
+    }
+
+    #[test]
+    fn reading_percent_doc_exactly_one_viewport_tall() {
+        // total == viewport → no scroll possible → 0%.
+        assert_eq!(reading_percent_pure(0, 600, 600), 0);
     }
 }
