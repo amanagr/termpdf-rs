@@ -1,0 +1,360 @@
+//! Pre-built full-text index of the open PDF.
+//!
+//! Replaces O(N pages × pdfium search overhead) with O(text length)
+//! string scanning for the "which pages contain this query" question.
+//! Sioyek's benchmark shows this is the difference between 0.03s
+//! and 4.8s on a 4 100-page document.
+//!
+//! ## Strategy
+//!
+//! Idle warm calls `add_page` for one page per tick, building up a
+//! concatenated `text: String` plus a `page_starts: Vec<usize>`
+//! back-index. Search then becomes `text.match_indices` (or a
+//! case-insensitive sweep) that yields byte offsets; `page_for_offset`
+//! maps those back to page indices.
+//!
+//! ## What we don't index
+//!
+//! Per-character rect coordinates. Pdfium has those (via
+//! `PdfPageText`) but storing them in memory is expensive. Instead
+//! we use the index to *narrow* the set of pages to ask pdfium
+//! about: a query matching 5 of 700 pages becomes 5 pdfium scans
+//! instead of 700, even before we have the full index.
+//!
+//! ## Persistence
+//!
+//! Built per-process. Persistence to disk is a future task —
+//! cheaper than rebuilding for huge docs but adds invalidation
+//! complexity. Even without persistence, idle warm fills the
+//! index well before the user usually triggers their first search.
+
+use std::collections::HashSet;
+use std::ops::Range;
+
+/// Byte offset into the concatenated `text` field at which a given
+/// page's text begins. Sentinel `usize::MAX` means "page not yet
+/// indexed".
+const NOT_INDEXED: usize = usize::MAX;
+
+#[derive(Debug)]
+pub struct DocIndex {
+    text: String,
+    /// `page_starts[i]` = byte offset where page `i`'s text starts
+    /// in `text`, or `NOT_INDEXED` if the page hasn't been added yet.
+    /// `text` is built in increasing page-index order so the offsets
+    /// stay monotonic across the indexed prefix.
+    page_starts: Vec<usize>,
+    /// Pages that have been added (regardless of their position in
+    /// the build order). Lookup-only set so `add_page` is idempotent.
+    indexed_pages: HashSet<usize>,
+    total_pages: usize,
+    /// Bumped on every `add_page`. Lets external code (status line,
+    /// invalidation) detect "index grew" without diffing.
+    pub revision: u64,
+}
+
+impl DocIndex {
+    pub fn new(total_pages: usize) -> Self {
+        Self {
+            text: String::new(),
+            page_starts: vec![NOT_INDEXED; total_pages],
+            indexed_pages: HashSet::with_capacity(total_pages),
+            total_pages,
+            revision: 0,
+        }
+    }
+
+    /// Total pages in the document.
+    #[allow(dead_code)] // public read API; UI may use it for index status display
+    pub fn total_pages(&self) -> usize {
+        self.total_pages
+    }
+
+    /// How many pages have been indexed so far.
+    pub fn indexed_count(&self) -> usize {
+        self.indexed_pages.len()
+    }
+
+    /// Ratio 0..=1 of how complete the index is.
+    pub fn fraction_complete(&self) -> f32 {
+        if self.total_pages == 0 {
+            return 1.0;
+        }
+        (self.indexed_count() as f32) / (self.total_pages as f32)
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.indexed_count() == self.total_pages
+    }
+
+    pub fn contains(&self, page_idx: usize) -> bool {
+        self.indexed_pages.contains(&page_idx)
+    }
+
+    /// Append `page_text` to the index for `page_idx`. Idempotent —
+    /// re-adding a page is a no-op.
+    ///
+    /// Note: pages must be added in monotonic order for the
+    /// `page_starts` map to be correct. The idle-warm scheduler
+    /// always picks the lowest unindexed page to enforce this.
+    pub fn add_page(&mut self, page_idx: usize, page_text: String) {
+        if page_idx >= self.total_pages || self.indexed_pages.contains(&page_idx) {
+            return;
+        }
+        let start = self.text.len();
+        self.page_starts[page_idx] = start;
+        self.text.push_str(&page_text);
+        // Sentinel newline between pages so word matches don't span
+        // page boundaries. Cheap; any cross-page hit would be wrong
+        // for our highlight rendering anyway.
+        self.text.push('\n');
+        self.indexed_pages.insert(page_idx);
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Map a byte offset within `text` back to the page that owns it.
+    /// `usize::MAX` if no page is indexed at that offset.
+    pub fn page_for_offset(&self, offset: usize) -> usize {
+        // Binary search over the monotonic indexed prefix. We treat
+        // unindexed entries (sentinel) as gaps and skip them.
+        let mut best = usize::MAX;
+        let mut lo = 0usize;
+        let mut hi = self.page_starts.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let v = self.page_starts[mid];
+            if v == NOT_INDEXED {
+                // Walk forward until we find an indexed entry; if we
+                // can't, retreat.
+                let mut step = mid + 1;
+                while step < hi && self.page_starts[step] == NOT_INDEXED {
+                    step += 1;
+                }
+                if step < hi {
+                    if self.page_starts[step] <= offset {
+                        best = step;
+                        lo = step + 1;
+                    } else {
+                        hi = mid;
+                    }
+                } else {
+                    hi = mid;
+                }
+            } else if v <= offset {
+                best = mid;
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        best
+    }
+
+    /// Find the lowest page index that's not yet in the index. Used
+    /// by idle warm to prioritise filling-in-order so `page_starts`
+    /// stays monotonic.
+    pub fn next_page_to_index(&self) -> Option<usize> {
+        (0..self.total_pages).find(|&i| !self.indexed_pages.contains(&i))
+    }
+
+    /// Pages that contain `query`. Case-insensitive when
+    /// `case_sensitive=false`. Returns a deduplicated, sorted list of
+    /// page indices — caller can ask pdfium for the exact rects on
+    /// just those pages instead of every page in the document.
+    ///
+    /// Only consults the indexed prefix; unindexed pages must be
+    /// handled by the caller (typically: walk them via pdfium).
+    pub fn pages_matching(&self, query: &str, case_sensitive: bool) -> Vec<usize> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut last_page: usize = usize::MAX;
+        for offset in self.match_offsets(query, case_sensitive) {
+            let page = self.page_for_offset(offset);
+            if page != usize::MAX && page != last_page {
+                out.push(page);
+                last_page = page;
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Iterator-friendly raw offset matcher. Public for tests; in
+    /// production callers should prefer `pages_matching`.
+    pub fn match_offsets<'a>(
+        &'a self,
+        query: &'a str,
+        case_sensitive: bool,
+    ) -> Box<dyn Iterator<Item = usize> + 'a> {
+        if case_sensitive {
+            Box::new(self.text.match_indices(query).map(|(i, _)| i))
+        } else {
+            // Lowercase both sides. Allocates two transient strings
+            // per search; for our query sizes (<100 chars) that's fine.
+            let needle = query.to_lowercase();
+            let hay = self.text.to_lowercase();
+            // Materialise into a Vec because the iterator borrows
+            // `hay`, which is owned locally. An iterator would have a
+            // self-referential lifetime that doesn't escape this fn.
+            let v: Vec<usize> = hay.match_indices(&needle).map(|(i, _)| i).collect();
+            Box::new(v.into_iter())
+        }
+    }
+
+    /// Hit count for `query` (counts every match, not just unique
+    /// pages). Cheap status-line readout.
+    #[allow(dead_code)] // public read API for status-line previews
+    pub fn match_count(&self, query: &str, case_sensitive: bool) -> usize {
+        self.match_offsets(query, case_sensitive).count()
+    }
+
+    /// Text payload size in bytes — for memory-budget gauges.
+    #[allow(dead_code)] // public read API for telemetry / debug
+    pub fn text_bytes(&self) -> usize {
+        self.text.len()
+    }
+
+    /// Indexed text — used by the indexed-pages-only fast path that
+    /// scans without re-asking pdfium. Pub(crate) so callers in the
+    /// same crate can build alternative search backends on top.
+    #[allow(dead_code)]
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+/// Range mapping: given a slice's start in `text`, return
+/// (page, in-page byte offset, in-page byte length). Helper for
+/// callers that want to highlight not just the page but the actual
+/// match position. Unused today (pdfium per-match rects are
+/// authoritative); kept as a future hook.
+#[allow(dead_code)]
+pub fn slice_to_page_range(
+    index: &DocIndex,
+    text_range: Range<usize>,
+) -> Option<(usize, Range<usize>)> {
+    let page = index.page_for_offset(text_range.start);
+    if page == usize::MAX {
+        return None;
+    }
+    let page_start = index.page_starts[page];
+    let in_page_start = text_range.start.saturating_sub(page_start);
+    let in_page_end = text_range.end.saturating_sub(page_start);
+    Some((page, in_page_start..in_page_end))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn populated_index() -> DocIndex {
+        let mut idx = DocIndex::new(3);
+        idx.add_page(0, "the quick brown fox".into());
+        idx.add_page(1, "jumps over the lazy dog".into());
+        idx.add_page(2, "and rests by the river".into());
+        idx
+    }
+
+    #[test]
+    fn add_page_idempotent() {
+        let mut idx = DocIndex::new(2);
+        idx.add_page(0, "hello".into());
+        let before = idx.text_bytes();
+        idx.add_page(0, "hello".into()); // dup
+        assert_eq!(idx.text_bytes(), before, "duplicate add_page must be a no-op");
+    }
+
+    #[test]
+    fn add_page_out_of_range_no_op() {
+        let mut idx = DocIndex::new(2);
+        idx.add_page(99, "ignored".into());
+        assert_eq!(idx.indexed_count(), 0);
+    }
+
+    #[test]
+    fn pages_matching_groups_per_page_dedups_sorts() {
+        let idx = populated_index();
+        // "the" appears on all 3 pages; "fox" only on page 0.
+        let mut all = idx.pages_matching("the", false);
+        all.sort();
+        assert_eq!(all, vec![0, 1, 2]);
+        assert_eq!(idx.pages_matching("fox", false), vec![0]);
+    }
+
+    #[test]
+    fn pages_matching_is_case_insensitive_by_default() {
+        let idx = populated_index();
+        assert_eq!(idx.pages_matching("FOX", false), vec![0]);
+        // Case-sensitive: must match exact case.
+        assert_eq!(idx.pages_matching("FOX", true), Vec::<usize>::new());
+        assert_eq!(idx.pages_matching("fox", true), vec![0]);
+    }
+
+    #[test]
+    fn match_count_counts_every_occurrence() {
+        let idx = populated_index();
+        // "the" appears 3 times across pages.
+        assert_eq!(idx.match_count("the", false), 3);
+        assert_eq!(idx.match_count("zzz", false), 0);
+    }
+
+    #[test]
+    fn next_page_to_index_returns_lowest_unindexed() {
+        let mut idx = DocIndex::new(5);
+        assert_eq!(idx.next_page_to_index(), Some(0));
+        idx.add_page(0, "a".into());
+        assert_eq!(idx.next_page_to_index(), Some(1));
+        // Skip-add: still returns lowest unindexed.
+        idx.add_page(2, "c".into());
+        assert_eq!(idx.next_page_to_index(), Some(1));
+    }
+
+    #[test]
+    fn complete_when_all_pages_added() {
+        let mut idx = DocIndex::new(2);
+        assert!(!idx.is_complete());
+        idx.add_page(0, "a".into());
+        assert!(!idx.is_complete());
+        idx.add_page(1, "b".into());
+        assert!(idx.is_complete());
+        assert!((idx.fraction_complete() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn page_for_offset_finds_correct_page() {
+        let idx = populated_index();
+        // Page 0 starts at 0, page 1 starts at "the quick brown fox\n".len() = 20.
+        assert_eq!(idx.page_for_offset(0), 0);
+        assert_eq!(idx.page_for_offset(19), 0);
+        assert_eq!(idx.page_for_offset(20), 1);
+        // Past last page — no page owns it.
+        assert_eq!(idx.page_for_offset(usize::MAX / 2), 2);
+    }
+
+    #[test]
+    fn slice_to_page_range_translates_to_in_page_offsets() {
+        let idx = populated_index();
+        // Find "fox" on page 0 starting at byte 16.
+        let off = idx.text.find("fox").expect("fox is present");
+        let (page, range) = slice_to_page_range(&idx, off..off + 3).expect("page mapped");
+        assert_eq!(page, 0);
+        assert_eq!(range, 16..19);
+    }
+
+    #[test]
+    fn revision_bumps_on_each_add() {
+        let mut idx = DocIndex::new(2);
+        let r0 = idx.revision;
+        idx.add_page(0, "a".into());
+        assert_ne!(idx.revision, r0);
+        let r1 = idx.revision;
+        idx.add_page(1, "b".into());
+        assert_ne!(idx.revision, r1);
+        // Idempotent re-add doesn't bump.
+        idx.add_page(0, "a".into());
+        assert_eq!(idx.revision, r1.wrapping_add(1));
+    }
+}

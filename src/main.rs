@@ -30,6 +30,7 @@ mod pdfhighlights;
 mod profile;
 mod render_worker;
 mod search;
+mod search_index;
 mod session;
 mod textlayout;
 mod ui;
@@ -423,21 +424,55 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
 /// out immediately. Each iteration costs ~25 ms (pdfium + overlay +
 /// PNG encode); 4 of them packs a whole prefetch tier into ~100 ms
 /// of idle slack.
+///
+/// Also opportunistically extends the doc-text index (for fast
+/// search) one page per call. The text extraction is cheap relative
+/// to a full pdfium render, so it's a free side-effect of being on
+/// the page-warming critical path.
 fn warm_one_idle(app: &mut App<'_>) -> Result<()> {
     const MAX_WARMS_PER_IDLE: u32 = 4;
     for _ in 0..MAX_WARMS_PER_IDLE {
         if !warm_next_uncached(app)? {
-            // Either prefetch depth exhausted or no candidate remains.
+            // No bitmap warming work — but maybe text indexing has
+            // leftovers (we cap text-only work to one per idle call
+            // so it doesn't starve the bitmap warm budget).
+            index_one_page_text(app);
             return Ok(());
         }
-        // Yield: if input arrived during the just-finished warm, bail
-        // so the run loop can dispatch it without waiting for our
-        // remaining iterations.
         if event::poll(Duration::ZERO)? {
             return Ok(());
         }
     }
+    // After bitmap warms, pump one text-index entry too if there's
+    // still slack.
+    index_one_page_text(app);
     Ok(())
+}
+
+/// Extract text for the next un-indexed page and add to the search
+/// index. ~5 ms per page on a typical doc. Bounded to one call per
+/// `warm_one_idle` so a held-key burst that interrupts us costs at
+/// most one text extract.
+fn index_one_page_text(app: &mut App<'_>) {
+    if app.doc_index.is_complete() {
+        return;
+    }
+    let Some(page_idx) = app.doc_index.next_page_to_index() else {
+        return;
+    };
+    // pdfium-render: load page, get text, extract.
+    let pages = app.document.pages();
+    let Ok(page) = pages.get(page_idx as i32) else {
+        // Skip on failure but mark indexed so we don't loop. We stash
+        // an empty string — page_for_offset still works correctly.
+        app.doc_index.add_page(page_idx, String::new());
+        return;
+    };
+    let text = match page.text() {
+        Ok(t) => t.all(),
+        Err(_) => String::new(),
+    };
+    app.doc_index.add_page(page_idx, text);
 }
 
 /// Render + bake overlay + pre-encode PNG for one upcoming uncached

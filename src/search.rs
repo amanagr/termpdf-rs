@@ -69,29 +69,62 @@ impl SearchResults {
 
 /// Run a full-document search. Errors only on pdfium failures —
 /// "no matches" returns `Ok(SearchResults { hits: empty })`.
+///
+/// Optimisation: when `index` is provided, use it as a per-page
+/// filter — only scan pages whose indexed text contains the query.
+/// On a doc with the index fully built, an "xyz" query matching
+/// 5 of 700 pages does 5 pdfium scans instead of 700. Pages
+/// outside the indexed prefix still need pdfium (worst case: same
+/// as the no-index path). Pass `None` to disable the optimisation.
 pub fn run_search(
     document: &PdfDocument<'_>,
     page_metrics: &[PageMetrics],
     query: &str,
     case_sensitive: bool,
+    index: Option<&crate::search_index::DocIndex>,
 ) -> Result<SearchResults> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return Ok(SearchResults::empty(query.to_string()));
     }
 
+    // Build the candidate page set. With a complete index, this is
+    // exactly the set of pages whose text contains the query — we
+    // skip pdfium entirely for non-matching pages. With a partial
+    // index, indexed-non-matching pages get skipped and unindexed
+    // pages get scanned (pdfium-authoritative on those).
+    let candidates: Vec<usize> = match index {
+        Some(idx) => {
+            let mut hit_pages: Vec<usize> = idx.pages_matching(trimmed, case_sensitive);
+            if !idx.is_complete() {
+                // Augment with all unindexed pages — we don't yet
+                // know whether they match.
+                for p in 0..page_metrics.len() {
+                    if !idx.contains(p) {
+                        hit_pages.push(p);
+                    }
+                }
+                hit_pages.sort_unstable();
+                hit_pages.dedup();
+            }
+            hit_pages
+        }
+        None => (0..page_metrics.len()).collect(),
+    };
+
     let mut hits = Vec::new();
     let pages = document.pages();
     let opts = PdfSearchOptions::new().match_case(case_sensitive);
 
-    'pages: for (page_idx, m) in page_metrics.iter().enumerate() {
+    'pages: for page_idx in candidates {
+        let Some(m) = page_metrics.get(page_idx) else {
+            continue;
+        };
         let Ok(page) = pages.get(page_idx as i32) else {
             continue;
         };
         let Ok(text) = page.text() else { continue };
         let Ok(search) = text.search(trimmed, &opts) else { continue };
-        // search.iter(Forwards) walks every match; each match's
-        // segments are visual lines (one rect per line).
         for match_segments in search.iter(PdfSearchDirection::SearchForward) {
             for seg in match_segments.iter() {
                 if hits.len() >= MAX_SEARCH_HITS {
