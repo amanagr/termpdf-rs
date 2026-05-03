@@ -262,9 +262,12 @@ fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
 
     // LayoutKey because `ensure_layout` clears the cache on change.
     let visible = app.layout.visible_pages(app.scroll_y_px, viewport_h);
-    for page_idx in visible.clone() {
-        ensure_page_rendered(app, page_idx, fit_width_px, /*allow_failure=*/ true)?;
-        app.touch_page(page_idx);
+    {
+        let _s = crate::profile::span(crate::profile::Phase::EnsureRendered);
+        for page_idx in visible.clone() {
+            ensure_page_rendered(app, page_idx, fit_width_px, /*allow_failure=*/ true)?;
+            app.touch_page(page_idx);
+        }
     }
 
     // Speculatively render a few pages outside the viewport in the
@@ -299,14 +302,18 @@ fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
     // Make sure every visible page has a fresh overlay bitmap before
     // we stitch them together. Done in a separate loop so the borrow
     // of `app` stays mutable here, then immutable in compose.
-    for page_idx in visible {
-        ensure_overlay(app, page_idx, layout_key);
+    {
+        let _s = crate::profile::span(crate::profile::Phase::EnsureOverlay);
+        for page_idx in visible {
+            ensure_overlay(app, page_idx, layout_key);
+        }
     }
 
     // Two fast paths before the full compose:
     //   - Scroll-shift: only scroll_y_px changed → memmove rows, repaint strip.
     //   - Selection-only: only selection_sig changed → re-blit just the
     //     selection's page over the previous canvas.
+    let _compose_span = crate::profile::span(crate::profile::Phase::Compose);
     let canvas = if let Some(c) = try_scroll_shift_canvas(app, &compose_key, viewport_w, viewport_h) {
         c
     } else if let Some(c) = try_selection_only_repaint(app, &compose_key, viewport_w, viewport_h) {
@@ -314,6 +321,7 @@ fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
     } else {
         compose_into_buffer(app, viewport_w, viewport_h)
     };
+    drop(_compose_span);
 
     // Hash-equal skip: if the just-composed canvas matches the
     // previously-encoded one byte-for-byte, no need to rebuild
@@ -325,6 +333,7 @@ fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
     // 8 MB; plus the wire bytes themselves).
     let h = fnv1a_hash(canvas.as_raw());
     if h != app.last_canvas_hash || app.image_proto.is_none() {
+        let _s = crate::profile::span(crate::profile::Phase::BuildProtocol);
         app.image_proto = Some(app.build_protocol(DynamicImage::ImageRgba8(canvas.clone())));
         app.last_canvas_hash = h;
     }

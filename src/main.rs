@@ -25,6 +25,7 @@ mod layout;
 mod outline;
 mod pdf;
 mod pdfhighlights;
+mod profile;
 mod render_worker;
 mod search;
 mod session;
@@ -261,6 +262,7 @@ fn main() -> Result<()> {
     setup_terminal()?;
     let res = run_loop(&mut app);
     teardown_terminal()?;
+    profile::report();
 
     if let Err(e) = app.persist_highlights() {
         eprintln!("warning: failed to persist highlights: {e:?}");
@@ -339,7 +341,9 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
             should_draw = false;
         }
         if should_draw {
+            let _draw = profile::span(profile::Phase::Draw);
             term.draw(|f| ui::draw(f, app))?;
+            drop(_draw);
             last_draw = std::time::Instant::now();
         }
 
