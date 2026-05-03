@@ -136,8 +136,13 @@ impl PageText {
         let w = metrics.width_pts.max(1.0);
         let h = metrics.height_pts.max(1.0);
 
-        let mut chars: Vec<CharCell> = Vec::new();
-        for ch in text.chars().iter() {
+        let chars_collection = text.chars();
+        // Pre-size to the pdfium-reported char count so the per-char
+        // push doesn't grow the Vec mid-build. A typical PDF page has
+        // 500-3000 chars; growing from 0 takes ~9 reallocs at small N
+        // and a final 32-128 KB malloc at large N.
+        let mut chars: Vec<CharCell> = Vec::with_capacity(chars_collection.len() as usize);
+        for ch in chars_collection.iter() {
             let bbox = match ch.loose_bounds() {
                 Ok(r) => r,
                 Err(_) => continue,
