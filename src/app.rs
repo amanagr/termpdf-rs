@@ -241,6 +241,13 @@ pub struct App<'doc> {
     /// rapid; the user wants their page to show immediately.
     /// Held-j autorepeats fire ~25 events/sec → count climbs fast.
     pub input_burst_count: u32,
+    /// Set by the kitty draw path when it deferred cold-page renders
+    /// past its per-frame budget. The run-loop reads this, forces an
+    /// immediate next-iteration draw, and clears it. Staggering
+    /// catch-up renders one-per-frame keeps Ghostty's renderer from
+    /// crashing on the multi-MB transmit burst that a big jump (e.g.
+    /// `100G` on a 600-page book) used to dump in a single frame.
+    pub pending_cold_redraw: bool,
     pub last_compose_key: Option<ComposeKey>,
     /// Inclusive `(lo, hi)` page range the previous compose's
     /// selection touched. Lets `try_selection_only_repaint` re-blit
@@ -330,6 +337,11 @@ pub struct App<'doc> {
     /// Optional substring filter applied to `outline` to produce
     /// `outline_filtered_indices`. Empty = no filter.
     pub toc_filter: String,
+    /// Memoised result of `toc_filtered_indices`: `(filter_string,
+    /// matching_outline_indices)`. Refreshed only when `toc_filter`
+    /// changes; same filter on the next draw is a single string-eq
+    /// check instead of a fuzzy walk over the whole outline.
+    pub toc_filtered_cache: Option<(String, Vec<usize>)>,
     /// Whether the user is currently editing `toc_filter` (started
     /// by `/` while the TOC is open).
     pub toc_filter_editing: bool,
@@ -518,6 +530,7 @@ impl<'doc> App<'doc> {
             kitty_pages,
             last_input_at: None,
             input_burst_count: 0,
+            pending_cold_redraw: false,
             canvas_buf: None,
             bg_row_buf: Vec::new(),
             bg_row_key: None,
@@ -539,6 +552,7 @@ impl<'doc> App<'doc> {
             show_toc: false,
             toc_cursor: 0,
             toc_filter: String::new(),
+            toc_filtered_cache: None,
             toc_filter_editing: false,
             pending_initial_page: if page < page_count { Some(page) } else { None },
             pending_initial_scroll_in_page: scroll_in_page.clamp(0.0, 1.0),
@@ -1154,6 +1168,18 @@ impl<'doc> App<'doc> {
         }
     }
 
+    /// Drop any half-typed Normal-mode chord state. Called on every
+    /// mode entry so that e.g. `5g:` (numeric prefix → Command) doesn't
+    /// leave `5g` sitting in `pending` to fire later, and `m:` (mark-
+    /// set → Command) doesn't silently consume the next post-Esc
+    /// keystroke as the mark name.
+    pub fn clear_chord_state(&mut self) {
+        self.pending.clear();
+        self.awaiting_mark_set = false;
+        self.awaiting_mark_jump = false;
+        self.awaiting_highlight_delete_confirm = false;
+    }
+
     pub fn enter_visual(&mut self) {
         // Place the caret at the first char that's *actually visible*
         // in the viewport — not at idx 0 (top of page). If the user
@@ -1191,7 +1217,7 @@ impl<'doc> App<'doc> {
         self.text_selection = Some(TextSelection::new(caret));
         self.mode = Mode::Visual;
         self.selection_placement = true;
-        self.pending.clear();
+        self.clear_chord_state();
         self.status = "VISUAL · placement — hjkl moves caret · v starts selection · Esc cancels".into();
     }
 
@@ -1264,9 +1290,10 @@ impl<'doc> App<'doc> {
         self.selection_placement = false;
         self.mode = Mode::Normal;
         self.status.clear();
-        // Clear leftover pending-key bytes (e.g. partial `g` from `gg`)
-        // so the next Normal-mode keypress isn't misinterpreted.
-        self.pending.clear();
+        // Drop leftover chord state (e.g. partial `g` from `gg`,
+        // dangling awaiting_mark_*) so the next Normal-mode keystroke
+        // isn't misinterpreted.
+        self.clear_chord_state();
     }
 
     /// Yank the active Visual-mode selection: extract its text,
@@ -1454,6 +1481,7 @@ impl<'doc> App<'doc> {
         if viewport_h == 0 {
             return;
         }
+        self.clear_chord_state();
         let visible: Vec<usize> = self
             .layout
             .visible_pages(self.scroll_y_px, viewport_h)
@@ -1645,19 +1673,36 @@ impl<'doc> App<'doc> {
     }
 
     /// Indices of `outline` entries matching the current filter, in
-    /// outline order. Recomputed on demand because filters are
-    /// keystroke-cheap and outlines are small (~30 entries typical).
-    pub fn toc_filtered_indices(&self) -> Vec<usize> {
-        outline::fuzzy_filter(&self.outline, &self.toc_filter)
+    /// outline order. Memoised against `toc_filter` so opening a TOC
+    /// with a stable filter doesn't re-lowercase the query and
+    /// re-walk the outline 60 times a second from `draw_toc`. Empties
+    /// when the filter changes via `toc_filter_*`. For small outlines
+    /// the recompute is cheap; for long technical books with deep
+    /// outlines it was visible CPU.
+    pub fn toc_filtered_indices(&mut self) -> Vec<usize> {
+        let needs_recompute = match &self.toc_filtered_cache {
+            Some((cached_filter, _)) => cached_filter != &self.toc_filter,
+            None => true,
+        };
+        if needs_recompute {
+            let v = outline::fuzzy_filter(&self.outline, &self.toc_filter);
+            self.toc_filtered_cache = Some((self.toc_filter.clone(), v));
+        }
+        // The cache owns the canonical Vec; the per-call clone is
+        // ~30 × 8 bytes for a typical outline. The expensive part
+        // (lowercasing the query, walking every entry doing
+        // subsequence-match) is what the cache eliminates.
+        self.toc_filtered_cache.as_ref().unwrap().1.clone()
     }
 
     pub fn toc_move(&mut self, delta: i32) {
+        let cursor = self.toc_cursor;
         let filtered = self.toc_filtered_indices();
         if filtered.is_empty() {
             return;
         }
         let n = filtered.len() as i32;
-        let new = ((self.toc_cursor as i32) + delta).clamp(0, n - 1);
+        let new = ((cursor as i32) + delta).clamp(0, n - 1);
         self.toc_cursor = new as usize;
         self.invalidate_compose();
     }
@@ -1678,8 +1723,9 @@ impl<'doc> App<'doc> {
     /// Activate the highlighted TOC entry: jump to its page (if
     /// resolvable) and close the panel.
     pub fn toc_activate(&mut self) {
+        let cursor = self.toc_cursor;
         let filtered = self.toc_filtered_indices();
-        let Some(&entry_idx) = filtered.get(self.toc_cursor) else {
+        let Some(&entry_idx) = filtered.get(cursor) else {
             return;
         };
         let entry = &self.outline[entry_idx];
@@ -2098,6 +2144,7 @@ impl<'doc> App<'doc> {
         // placement mode entirely so the band starts growing from the
         // very first drag delta.
         self.selection_placement = false;
+        self.clear_chord_state();
         self.status = "Drag to select · release to save · Esc to cancel".into();
     }
 

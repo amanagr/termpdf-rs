@@ -205,10 +205,12 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         }
 
         KeyCode::Char(':') => {
+            app.clear_chord_state();
             app.mode = Mode::Command;
             app.cmd_buffer.clear();
         }
         KeyCode::Char('/') => {
+            app.clear_chord_state();
             app.mode = Mode::Search;
             app.cmd_buffer.clear();
             app.status = "Search: (typing — Enter to run, Esc to cancel)".into();
@@ -245,7 +247,11 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         KeyCode::Char('\'') => app.awaiting_mark_jump = true,
 
         KeyCode::Esc => {
-            app.pending.clear();
+            // Drop pending chord, mark-pending flags, and any other
+            // half-typed Normal-mode state. Otherwise `m<Esc>` leaves
+            // awaiting_mark_set true and silently consumes the next
+            // keystroke as the mark name.
+            app.clear_chord_state();
             app.status.clear();
         }
         _ => {}

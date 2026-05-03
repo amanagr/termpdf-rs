@@ -387,6 +387,19 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
         //      event thrashes the kitty graphics pipeline.
         //   2. Held-key autorepeat (j/Space/l) collapses into one
         //      redraw at the final state.
+        // Cold-render staggering: if the just-finished draw deferred
+        // any cold-page renders past its budget, jump straight back to
+        // the top of the loop with the watchdog allowed to fire so the
+        // catch-up renders happen one-per-frame instead of all-at-once.
+        // Skipping the event::poll here is what gives the catch-up
+        // its ~16 ms cadence — long enough that Ghostty's renderer
+        // can drain each transmit before the next arrives.
+        if app.pending_cold_redraw {
+            app.pending_cold_redraw = false;
+            last_draw = std::time::Instant::now() - MIN_FRAME_INTERVAL;
+            continue;
+        }
+
         if event::poll(poll_dur)? {
             dispatch_event_coalesced(app, event::read()?)?;
             app.note_input();
@@ -406,19 +419,64 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
             // True idle: no input pending and no settle to do. Use
             // the moment to warm one upcoming page so the next j/k
             // press hits the cache instead of a 20 ms pdfium render.
-            // Bounded to one page per idle tick so input lag is at
-            // most one pdfium call.
-            let idle_long_enough = app
-                .last_input_at
-                .map(|t| t.elapsed() >= Duration::from_millis(200))
-                .unwrap_or(true);
-            if idle_long_enough {
+            //
+            // Idle work only kicks in *after* the user's first real
+            // input — opening a fresh 600-page PDF should not
+            // immediately spawn a tick storm of pdfium renders + tmux
+            // passthrough kitty transmits before the user has done
+            // anything. (Previously `unwrap_or(true)` treated "no
+            // input yet" as idle, producing ~40% CPU and a flood of
+            // kitty graphics escapes through tmux on open.)
+            let action = idle_action(app.last_input_at.map(|t| t.elapsed()));
+            if action != IdleAction::Skip {
                 let _s = profile::span(profile::Phase::IdleWarm);
-                let _ = warm_one_idle(app);
+                let _ = warm_one_idle(app, action);
             }
         }
     }
     Ok(())
+}
+
+/// First idle-tier threshold: how long the user must be idle before
+/// we run any background work at all.
+pub(crate) const IDLE_BITMAP_WARM_MS: u64 = 200;
+/// Second idle-tier threshold: doc-text indexing is heavier (a single
+/// `page.text().all()` is 5–50 ms on dense pages) and runs every tick
+/// for the entire doc on first open. Holding it back to ≥1 s of idle
+/// keeps a long-reading session calm; only when the user has truly
+/// stepped away does the indexer keep grinding.
+pub(crate) const IDLE_TEXT_INDEX_MS: u64 = 1000;
+/// Cap on bitmap warms per idle tick. 2 is enough to keep j-press hot
+/// (one for the page about to come into view, one as a buffer) while
+/// halving the per-tick burst of PNG transmits through tmux that
+/// previously locked Ghostty up on big books.
+pub(crate) const MAX_WARMS_PER_IDLE: u32 = 2;
+
+/// What kind of idle-tick work the run-loop should consider doing,
+/// based on how long the user has been idle since their last input.
+/// Pulled out as a pure function so the tier policy is unit-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdleAction {
+    /// User has not yet given any input this session, or the idle
+    /// window is too short — skip background work entirely.
+    Skip,
+    /// Bitmap prefetch only.
+    BitmapWarm,
+    /// Bitmap prefetch *and* doc-text indexing.
+    BitmapWarmAndTextIndex,
+}
+
+pub(crate) fn idle_action(last_input_elapsed: Option<Duration>) -> IdleAction {
+    let Some(elapsed) = last_input_elapsed else {
+        return IdleAction::Skip;
+    };
+    if elapsed >= Duration::from_millis(IDLE_TEXT_INDEX_MS) {
+        IdleAction::BitmapWarmAndTextIndex
+    } else if elapsed >= Duration::from_millis(IDLE_BITMAP_WARM_MS) {
+        IdleAction::BitmapWarm
+    } else {
+        IdleAction::Skip
+    }
 }
 
 /// Idle-time prefetch. Renders + pre-encodes upcoming pages in the
@@ -427,38 +485,36 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
 ///
 /// Loops up to `MAX_WARMS_PER_IDLE` times in a single call, polling
 /// for input between iterations so a keystroke mid-prefetch breaks
-/// out immediately. Each iteration costs ~25 ms (pdfium + overlay +
-/// PNG encode); 4 of them packs a whole prefetch tier into ~100 ms
-/// of idle slack.
+/// out immediately.
 ///
 /// Also opportunistically extends the doc-text index (for fast
-/// search) one page per call. The text extraction is cheap relative
-/// to a full pdfium render, so it's a free side-effect of being on
-/// the page-warming critical path.
-fn warm_one_idle(app: &mut App<'_>) -> Result<()> {
-    const MAX_WARMS_PER_IDLE: u32 = 4;
+/// search) but only after `IDLE_TEXT_INDEX_MS` of idle — the text
+/// extract is heavy enough on dense pages that running it every
+/// 250 ms tick is a sustained drain on a freshly-opened doc.
+fn warm_one_idle(app: &mut App<'_>, action: IdleAction) -> Result<()> {
+    let do_text = action == IdleAction::BitmapWarmAndTextIndex;
     for _ in 0..MAX_WARMS_PER_IDLE {
         if !warm_next_uncached(app)? {
-            // No bitmap warming work — but maybe text indexing has
-            // leftovers (we cap text-only work to one per idle call
-            // so it doesn't starve the bitmap warm budget).
-            index_one_page_text(app);
+            if do_text {
+                index_one_page_text(app);
+            }
             return Ok(());
         }
         if event::poll(Duration::ZERO)? {
             return Ok(());
         }
     }
-    // After bitmap warms, pump one text-index entry too if there's
-    // still slack.
-    index_one_page_text(app);
+    if do_text {
+        index_one_page_text(app);
+    }
     Ok(())
 }
 
 /// Extract text for the next un-indexed page and add to the search
-/// index. ~5 ms per page on a typical doc. Bounded to one call per
-/// `warm_one_idle` so a held-key burst that interrupts us costs at
-/// most one text extract.
+/// index. ~5–50 ms per page depending on density. Caller gates this
+/// behind `IDLE_TEXT_INDEX_MS` of elapsed idle so it doesn't run
+/// during active reading; bounded to one call per `warm_one_idle`
+/// so a keystroke mid-extract costs at most one page of work.
 ///
 /// On the transition from incomplete → complete, persists the index
 /// to disk so the next open of the same PDF skips the indexing
@@ -521,7 +577,7 @@ fn warm_next_uncached(app: &mut App<'_>) -> Result<bool> {
         visible.start as i64 - 1
     };
     // Look up to 8 pages ahead in the scroll direction for the first
-    // un-cached one. With MAX_WARMS_PER_IDLE=4 calls per idle window
+    // un-cached one. With `MAX_WARMS_PER_IDLE` calls per idle window
     // the absolute reachable distance is depth(=8) but typically the
     // first 1-2 pages encountered will be the ones to warm.
     const PREFETCH_DEPTH: i64 = 8;
@@ -615,4 +671,79 @@ fn dispatch_event(app: &mut App<'_>, ev: Event) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod idle_tier_tests {
+    use super::*;
+
+    #[test]
+    fn no_input_yet_skips_all_idle_work() {
+        // The pre-fix behaviour was `unwrap_or(true)`, which kicked
+        // off prefetch + text indexing on a freshly-opened PDF before
+        // the user had touched the keyboard. That produced ~40% CPU
+        // and a tmux passthrough flood that crashed Ghostty on big
+        // books. Skip is what protects us now.
+        assert_eq!(idle_action(None), IdleAction::Skip);
+    }
+
+    #[test]
+    fn below_bitmap_threshold_skips() {
+        assert_eq!(
+            idle_action(Some(Duration::from_millis(IDLE_BITMAP_WARM_MS - 1))),
+            IdleAction::Skip
+        );
+    }
+
+    #[test]
+    fn at_bitmap_threshold_warms_bitmap_only() {
+        assert_eq!(
+            idle_action(Some(Duration::from_millis(IDLE_BITMAP_WARM_MS))),
+            IdleAction::BitmapWarm
+        );
+    }
+
+    #[test]
+    fn between_thresholds_warms_bitmap_only() {
+        // Active reading cadence (key every few hundred ms) must NOT
+        // trigger the heavier text-index work — that's what blew the
+        // CPU budget on long sessions.
+        assert_eq!(
+            idle_action(Some(Duration::from_millis(IDLE_TEXT_INDEX_MS - 1))),
+            IdleAction::BitmapWarm
+        );
+    }
+
+    #[test]
+    fn at_text_index_threshold_runs_both_tiers() {
+        assert_eq!(
+            idle_action(Some(Duration::from_millis(IDLE_TEXT_INDEX_MS))),
+            IdleAction::BitmapWarmAndTextIndex
+        );
+    }
+
+    #[test]
+    fn long_idle_runs_both_tiers() {
+        assert_eq!(
+            idle_action(Some(Duration::from_secs(30))),
+            IdleAction::BitmapWarmAndTextIndex
+        );
+    }
+
+    // Compile-time consistency: bitmap tier must trigger before (or
+    // at the same time as) the text tier — otherwise text-indexing
+    // without prior bitmap-warming would happen, contradicting the
+    // policy promise that text-index is strictly heavier work.
+    const _THRESHOLD_ORDER_GUARD: () = {
+        assert!(IDLE_BITMAP_WARM_MS <= IDLE_TEXT_INDEX_MS);
+    };
+
+    // Compile-time guard on the warm budget: caps the per-tick burst
+    // that previously hit 4 PNG transmits through tmux passthrough
+    // back-to-back. If a future commit bumps this above 3, the build
+    // fails so the tmux/Ghostty risk gets re-evaluated explicitly.
+    const _WARM_BUDGET_GUARD: () = {
+        assert!(MAX_WARMS_PER_IDLE >= 1);
+        assert!(MAX_WARMS_PER_IDLE <= 3);
+    };
 }

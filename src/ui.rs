@@ -42,6 +42,106 @@ use crate::pdf;
 /// character per viewport anyway).
 pub const MAX_FIT_WIDTH_PX: u32 = 4096;
 
+/// Cap on cold-page renders per kitty draw. Each cold render emits a
+/// ~250–500 KB base64 PNG transmit through tmux passthrough; a big
+/// jump like `100G` on a 600-page book can put 3+ cold pages in the
+/// visible region simultaneously, and shipping their transmits in one
+/// frame pushed Ghostty's renderer over its limit (window-vanish,
+/// observed 2026-05-03). One cold render per draw + a forced
+/// next-frame redraw spreads the burst into ~3 frames at 60 Hz.
+pub const MAX_COLD_RENDERS_PER_DRAW: usize = 1;
+
+/// Cap on transmit emissions per kitty draw. A revision flip
+/// (highlight added, selection moved, search advanced) marks every
+/// visible cached page stale at the same time — left unbounded, a
+/// 5-page-visible viewport ships ~1.5 MB of base64 in one frame.
+/// The budget keeps each frame's transmit bytes bounded; the
+/// `pending_cold_redraw` mechanism in run_loop catches the deferred
+/// pages up on subsequent frames at ~50 ms intervals. Pages with no
+/// prior transmit can't be deferred (placement without a prior
+/// transmit shows garbled cells), so the cold-render budget at the
+/// render phase is the upstream guard for those.
+pub const MAX_TRANSMITS_PER_DRAW: usize = 2;
+
+/// What to do with a single page on a kitty draw, given the cache
+/// hit/miss and the current rapid-scroll + budget state. Pulled out
+/// as a pure function so the staggering logic is unit-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ColdRenderDecision {
+    /// Page is already in `page_cache`; just touch the LRU.
+    AlreadyCached,
+    /// Page is cold but the budget allows a render this frame.
+    Render,
+    /// Page is cold and we're skipping it: either a rapid-scroll
+    /// burst is in progress, or the per-frame cold budget is
+    /// exhausted. Caller should set `pending_cold_redraw` so the
+    /// run-loop forces another draw and we catch up next frame.
+    Defer,
+}
+
+pub(crate) fn plan_cold_render(
+    is_cached: bool,
+    rapid: bool,
+    cold_budget_remaining: usize,
+) -> ColdRenderDecision {
+    if is_cached {
+        return ColdRenderDecision::AlreadyCached;
+    }
+    if rapid || cold_budget_remaining == 0 {
+        return ColdRenderDecision::Defer;
+    }
+    ColdRenderDecision::Render
+}
+
+/// Plan which transmits to defer this frame given a per-frame budget.
+/// Each input is `(need_transmit, page_idx, has_prior_transmit_on_terminal)`.
+/// Returns the indices into the input slice whose `need_transmit` should
+/// be flipped to false. Pages without a prior transmit are never
+/// deferred — placement without bytes shows garbled cells. Among
+/// deferrable transmits, those farthest from `current_page` are shed
+/// first so the active page always re-paints same-frame.
+pub(crate) fn plan_transmit_deferrals(
+    blits: &[(bool, usize, bool)],
+    current_page: usize,
+    budget: usize,
+) -> Vec<usize> {
+    let mut candidates: Vec<usize> = blits
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (need, _, has_prior))| {
+            if *need && *has_prior {
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let needed = blits.iter().filter(|(n, _, _)| *n).count();
+    if needed <= budget {
+        return Vec::new();
+    }
+    // Keep up to `budget` transmits; among deferrable candidates the
+    // CLOSEST to current_page survive — distance ascending = drop the
+    // farthest. Stable secondary sort by index for determinism.
+    candidates.sort_by_key(|&i| {
+        let p = blits[i].1;
+        let dist = if p >= current_page {
+            p - current_page
+        } else {
+            current_page - p
+        };
+        (dist, i)
+    });
+    // How many deferrable transmits can we shed? Non-deferrable
+    // (no-prior) transmits stay in the count regardless.
+    let non_deferrable = needed - candidates.len();
+    let max_keep = budget.saturating_sub(non_deferrable);
+    if candidates.len() <= max_keep {
+        return Vec::new();
+    }
+    candidates.split_off(max_keep)
+}
+
 /// Soft byte budget on `App::page_cache`. A 4-byte-per-pixel RGBA
 /// budget; 256 MB ≈ 64 megapixels of cached pages, which is several
 /// dozen typical pages or a smaller number of big scanned ones.
@@ -424,21 +524,39 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
         return Ok(());
     }
 
-    // During a rapid-scroll burst, also skip pdfium render for cold
-    // pages. Otherwise we pay ~20 ms per cold page in pdfium even
+    // During a rapid-scroll burst, skip pdfium render for cold pages
+    // entirely. Otherwise we pay ~20 ms per cold page in pdfium even
     // though the placement loop will discard them. The settle redraw
     // after the burst will render whatever's then visible.
+    //
+    // Outside rapid-scroll, cap cold renders to one per draw. A big
+    // jump (`100G` on a 600-page book) makes 3+ pages cold all at
+    // once, and dumping their PNG transmits back-to-back in one
+    // frame is ~1.5 MB of base64 through tmux passthrough — enough
+    // to crash Ghostty's renderer (window-vanish, observed
+    // 2026-05-03). One per draw + force-redraw next iteration shows
+    // the catch-up pages popping in over ~3 frames (~50 ms) instead
+    // of all at once, which Ghostty handles fine.
     let rapid = app.is_rapid_scrolling();
+    let mut cold_budget = MAX_COLD_RENDERS_PER_DRAW;
+    let mut deferred_cold = false;
     {
         let _s = crate::profile::span(crate::profile::Phase::EnsureRendered);
         for &pi in &visible {
-            if rapid && !app.page_cache.contains_key(&pi) {
-                continue;
+            let is_cached = app.page_cache.contains_key(&pi);
+            match plan_cold_render(is_cached, rapid, cold_budget) {
+                ColdRenderDecision::AlreadyCached => {}
+                ColdRenderDecision::Render => cold_budget -= 1,
+                ColdRenderDecision::Defer => {
+                    deferred_cold = true;
+                    continue;
+                }
             }
             ensure_page_rendered(app, pi, fit_width_px, /*allow_failure=*/ true)?;
             app.touch_page(pi);
         }
     }
+    app.pending_cold_redraw = deferred_cold;
 
     app.evict_far_pages(visible_range.clone());
     app.enforce_byte_budget(page_cache_budget_bytes(), visible_range);
@@ -581,6 +699,32 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
                 b.need_transmit = false;
                 b.height_cells = 0;
             }
+        }
+    }
+
+    // Per-frame transmit budget. A revision flip (highlight added,
+    // selection moved, search advanced) marks every visible cached
+    // page stale at once; left unbounded the burst is the same shape
+    // as the cold-render burst that crashed Ghostty (2026-05-03).
+    // Defer the farthest-from-current pages whose terminal already
+    // has a prior version cached; those pages place the older image
+    // for one extra frame and the run-loop's force-redraw catches
+    // them up next iteration.
+    {
+        let kp_ref = app.kitty_pages.as_ref().unwrap();
+        let triples: Vec<(bool, usize, bool)> = blits
+            .iter()
+            .map(|b| (b.need_transmit, b.page_idx, kp_ref.has_prior_transmit(b.page_idx)))
+            .collect();
+        let current_page = app.current_page();
+        let to_defer = plan_transmit_deferrals(&triples, current_page, MAX_TRANSMITS_PER_DRAW);
+        if !to_defer.is_empty() {
+            for i in to_defer {
+                blits[i].need_transmit = false;
+            }
+            // Trigger a follow-up frame so the deferred pages catch
+            // up; same mechanism the cold-render staggering uses.
+            app.pending_cold_redraw = true;
         }
     }
 
@@ -1764,7 +1908,7 @@ fn status_line(app: &App<'_>) -> Paragraph<'static> {
     Paragraph::new(Line::from(spans))
 }
 
-fn draw_toc(f: &mut Frame, app: &App<'_>, area: Rect) {
+fn draw_toc(f: &mut Frame, app: &mut App<'_>, area: Rect) {
     use ratatui::style::Stylize;
 
     let panel_w = area.width.saturating_mul(2) / 5;
@@ -1918,6 +2062,164 @@ pub fn help_overlay_lines() -> Vec<&'static str> {
         "",
         "Press ? or Esc to close",
     ]
+}
+
+#[cfg(test)]
+mod cold_render_plan_tests {
+    use super::{plan_cold_render, ColdRenderDecision, MAX_COLD_RENDERS_PER_DRAW};
+
+    #[test]
+    fn cached_page_is_always_already_cached() {
+        // Cache hit dominates over rapid + budget — the early return
+        // prevents the render loop from charging a cold-budget slot
+        // for pages that don't need any pdfium work.
+        assert_eq!(
+            plan_cold_render(true, false, 0),
+            ColdRenderDecision::AlreadyCached
+        );
+        assert_eq!(
+            plan_cold_render(true, true, 0),
+            ColdRenderDecision::AlreadyCached
+        );
+        assert_eq!(
+            plan_cold_render(true, true, 5),
+            ColdRenderDecision::AlreadyCached
+        );
+    }
+
+    #[test]
+    fn cold_with_budget_renders() {
+        assert_eq!(
+            plan_cold_render(false, false, 1),
+            ColdRenderDecision::Render
+        );
+        assert_eq!(
+            plan_cold_render(false, false, MAX_COLD_RENDERS_PER_DRAW),
+            ColdRenderDecision::Render
+        );
+    }
+
+    #[test]
+    fn cold_under_rapid_scroll_defers() {
+        // Rapid-scroll defer is older logic that staggers cold work
+        // until input settles. Must stay defer even when budget would
+        // otherwise allow it — held-`j` autorepeat should not punch
+        // through into pdfium calls.
+        assert_eq!(
+            plan_cold_render(false, true, 1),
+            ColdRenderDecision::Defer
+        );
+        assert_eq!(
+            plan_cold_render(false, true, MAX_COLD_RENDERS_PER_DRAW),
+            ColdRenderDecision::Defer
+        );
+    }
+
+    #[test]
+    fn cold_with_zero_budget_defers() {
+        // The crash-bait case: a `100G` jump puts 3+ visible pages all
+        // cold at once. After the first one renders, budget hits 0 and
+        // the rest must defer to next-frame catch-up.
+        assert_eq!(
+            plan_cold_render(false, false, 0),
+            ColdRenderDecision::Defer
+        );
+    }
+
+    #[test]
+    fn budget_constant_within_safe_burst_window() {
+        // Compile-time guard: keep the per-draw cold-render cap small
+        // enough that 3 visible pages take ≥3 draw frames to catch up,
+        // i.e. ≥48 ms at 60 Hz. Anything bigger reopens the Ghostty
+        // window-vanish hazard.
+        const _: () = assert!(MAX_COLD_RENDERS_PER_DRAW >= 1);
+        const _: () = assert!(MAX_COLD_RENDERS_PER_DRAW <= 2);
+    }
+}
+
+#[cfg(test)]
+mod transmit_budget_plan_tests {
+    use super::{plan_transmit_deferrals, MAX_TRANSMITS_PER_DRAW};
+
+    #[test]
+    fn under_budget_no_deferrals() {
+        // 2 pages, budget 2 → nothing to shed. Both transmit same frame.
+        let blits = vec![(true, 0, true), (true, 1, true)];
+        assert!(plan_transmit_deferrals(&blits, 0, 2).is_empty());
+    }
+
+    #[test]
+    fn over_budget_drops_farthest_from_current() {
+        // 4 visible pages all stale, current page = 1, budget = 2.
+        // Page 1 (dist 0) and page 0 or 2 (dist 1) survive; page 3 dropped.
+        let blits = vec![
+            (true, 0, true),
+            (true, 1, true),
+            (true, 2, true),
+            (true, 3, true),
+        ];
+        let to_defer = plan_transmit_deferrals(&blits, 1, 2);
+        assert_eq!(to_defer.len(), 2);
+        // Closest two indices (1, 0 or 2 by tie) survive.
+        assert!(to_defer.contains(&3));
+    }
+
+    #[test]
+    fn pages_without_prior_transmit_never_deferred() {
+        // Mixed: page 0 (stale, has prior), page 5 (cold first-time, no prior).
+        // Even if page 5 is far, we can't defer it — placement without prior
+        // bytes shows garbled cells. Budget = 1 → page 0 gets deferred instead.
+        let blits = vec![
+            (true, 0, true),  // far from current
+            (true, 5, false), // first-time, MUST transmit
+        ];
+        let to_defer = plan_transmit_deferrals(&blits, 5, 1);
+        // Only 1 deferrable; non-deferrable consumes the budget — defer all 1.
+        assert_eq!(to_defer, vec![0]);
+    }
+
+    #[test]
+    fn no_need_transmit_blits_ignored() {
+        // Pages with need_transmit=false aren't part of the budget calc.
+        let blits = vec![
+            (false, 0, true),
+            (false, 1, true),
+            (false, 2, true),
+            (true, 3, true),
+        ];
+        assert!(plan_transmit_deferrals(&blits, 0, 1).is_empty());
+    }
+
+    #[test]
+    fn all_non_deferrable_returns_empty() {
+        // Every transmit is first-time (no prior). Budget=1 but 3 pages
+        // need to ship; deferring any would garble. Helper returns empty;
+        // upstream cold-render budget should have prevented this state.
+        let blits = vec![
+            (true, 0, false),
+            (true, 1, false),
+            (true, 2, false),
+        ];
+        assert!(plan_transmit_deferrals(&blits, 1, 1).is_empty());
+    }
+
+    #[test]
+    fn budget_zero_defers_everything_deferrable() {
+        // Pathological case: budget = 0. All deferrable transmits drop.
+        let blits = vec![(true, 0, true), (true, 1, true)];
+        let to_defer = plan_transmit_deferrals(&blits, 0, 0);
+        assert_eq!(to_defer.len(), 2);
+    }
+
+    #[test]
+    fn budget_constant_within_safe_burst_window() {
+        // Compile-time guard. Keep the cap small enough that ≥3 stale
+        // visible pages stagger over ≥2 frames; anything larger
+        // reopens the multi-MB-burst hazard the cold-render fix
+        // already addressed.
+        const _: () = assert!(MAX_TRANSMITS_PER_DRAW >= 1);
+        const _: () = assert!(MAX_TRANSMITS_PER_DRAW <= 3);
+    }
 }
 
 #[cfg(test)]

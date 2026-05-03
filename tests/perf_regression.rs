@@ -240,10 +240,22 @@ fn perf_optimizations_stay_wired_into_binary() {
     // therefore emit a single transmit for that one page.
     let initial_transmits = count_kitty_transmit_headers(&buf);
 
-    // Now sit idle for ~2 s. With idle-warm budget of 4 pages per
-    // 250 ms idle window, the remaining 4 cold pages should all get
-    // pre-encoded *and* pre-transmitted to stdout during this wait.
-    drain_until(&rx, &mut buf, Duration::from_secs(2), |_| false);
+    // Idle prefetch only kicks in *after* the user has registered at
+    // least one input — otherwise opening a fresh book would burst
+    // pdfium renders + tmux passthrough kitty transmits before the
+    // user has done anything (which is what crashed Ghostty on big
+    // books). Send a benign no-op key so the run-loop's
+    // `last_input_at` becomes Some without changing visible state.
+    // `g` alone is the start of a `gg` chord — it's recorded as
+    // input but doesn't scroll or render anything new.
+    writer.write_all(b"g").ok();
+    writer.flush().ok();
+
+    // Now sit idle for ~3 s. The first ~200 ms is below the
+    // bitmap-warm threshold; from there on, the warm budget of 2
+    // pages per 250 ms idle window pre-encodes and pre-transmits
+    // the remaining cold pages to stdout.
+    drain_until(&rx, &mut buf, Duration::from_secs(3), |_| false);
 
     let after_idle_transmits = count_kitty_transmit_headers(&buf);
 

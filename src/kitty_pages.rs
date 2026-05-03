@@ -231,6 +231,17 @@ impl KittyPageRegistry {
         self.id_base.wrapping_add(1).wrapping_add(page_idx as u32)
     }
 
+    /// True if this page has been transmitted to the terminal at least
+    /// once with this registry alive. When true, deferring a stale
+    /// transmit just means placement shows the previous (slightly
+    /// older) image — when false, placement without a transmit emits
+    /// garbled foreground-color cells, so the caller MUST transmit.
+    pub fn has_prior_transmit(&self, page_idx: usize) -> bool {
+        self.pages
+            .get(&page_idx)
+            .is_some_and(|e| e.transmitted_layout.is_some())
+    }
+
     /// True if the cached transmit for this page is fresh — caller
     /// can skip the transmit step. Read-only; pairs with
     /// `mark_transmitted` after the actual transmit string has been
