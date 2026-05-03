@@ -12,7 +12,7 @@
 //! get a future "budget N pages per frame tick" pass; v1 keeps it
 //! simple.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use anyhow::Result;
 use pdfium_render::prelude::*;
@@ -47,12 +47,6 @@ pub struct SearchResults {
     /// this so the user knows the count and the navigation bound are
     /// not authoritative — narrowing the query will reveal more.
     pub truncated: bool,
-    /// Set of page indices that contain at least one hit. Computed
-    /// once when the results land so the per-frame "does this page
-    /// have hits?" check is O(1) instead of an O(hits) iterator scan.
-    /// Big win on doc-wide queries (a query matching ~5000 hits used
-    /// to scan the full vec for every visible page on every frame).
-    pages_with_hits: HashSet<usize>,
     /// Per-page contiguous range `[start, end)` into `hits`. Hits are
     /// added in page order during `run_search`, so all hits for a
     /// given page live in one slice. The highlights-bake path used
@@ -60,6 +54,8 @@ pub struct SearchResults {
     /// even though the slice we actually need is tiny. This map gives
     /// O(1) lookup of the per-page slice and the absolute start index
     /// (so the bake loop can still tell "is this the current hit?").
+    /// Doubles as the "does this page have hits?" set: a key is
+    /// present iff the page has at least one hit.
     page_hit_ranges: HashMap<usize, (usize, usize)>,
 }
 
@@ -71,7 +67,6 @@ impl SearchResults {
             current: 0,
             revision: 0,
             truncated: false,
-            pages_with_hits: HashSet::new(),
             page_hit_ranges: HashMap::new(),
         }
     }
@@ -91,9 +86,9 @@ impl SearchResults {
     }
 
     /// True if any hit lives on `page_idx`. O(1) lookup against the
-    /// pre-built page-index set.
+    /// per-page range map (a key is present iff the page has hits).
     pub fn page_has_hits(&self, page_idx: usize) -> bool {
-        self.pages_with_hits.contains(&page_idx)
+        self.page_hit_ranges.contains_key(&page_idx)
     }
 
     /// Slice of `hits` belonging to `page_idx` along with the absolute
@@ -199,7 +194,6 @@ pub fn run_search(
         }
     }
 
-    let pages_with_hits: HashSet<usize> = hits.iter().map(|h| h.page).collect();
     let page_hit_ranges = build_page_hit_ranges(&hits);
     Ok(SearchResults {
         query: trimmed.to_string(),
@@ -207,7 +201,6 @@ pub fn run_search(
         current: 0,
         revision: 1,
         truncated,
-        pages_with_hits,
         page_hit_ranges,
     })
 }
@@ -254,7 +247,6 @@ mod tests {
     }
 
     fn fake_results(hits: Vec<SearchHit>) -> SearchResults {
-        let pages_with_hits: HashSet<usize> = hits.iter().map(|h| h.page).collect();
         let page_hit_ranges = build_page_hit_ranges(&hits);
         SearchResults {
             query: "x".into(),
@@ -262,7 +254,6 @@ mod tests {
             current: 0,
             revision: 0,
             truncated: false,
-            pages_with_hits,
             page_hit_ranges,
         }
     }
