@@ -493,7 +493,10 @@ impl PageText {
         let line_lo = self.chars[lo].line;
         let line_hi = self.chars[hi].line;
 
-        let mut out: Vec<Rect01> = Vec::new();
+        // Upper bound: one rect per line in [line_lo, line_hi]. The
+        // bake-selection path calls this on every Visual-mode keystroke
+        // — pre-sizing avoids a growth realloc on multi-line spans.
+        let mut out: Vec<Rect01> = Vec::with_capacity(line_hi.saturating_sub(line_lo) + 1);
         for line_idx in line_lo..=line_hi {
             let Some(span) = self.lines.get(line_idx) else { continue };
             // Determine the char range covering THIS line within the

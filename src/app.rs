@@ -1275,7 +1275,12 @@ impl<'doc> App<'doc> {
         // the selection. Concatenate with `\n\n` between pages.
         let (lo, hi) = sel.ordered();
         let mut combined = String::new();
-        let mut per_page_rects: Vec<(usize, Vec<Rect01>)> = Vec::new();
+        let page_span = hi.page.saturating_sub(lo.page) + 1;
+        let mut per_page_rects: Vec<(usize, Vec<Rect01>)> = if save {
+            Vec::with_capacity(page_span)
+        } else {
+            Vec::new()
+        };
         for page_idx in lo.page..=hi.page {
             let Some(pt) = self.text_cache.get(page_idx) else {
                 continue;
