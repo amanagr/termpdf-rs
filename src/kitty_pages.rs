@@ -47,7 +47,7 @@ use ratatui::layout::Rect;
 use crate::app::LayoutKey;
 
 /// Image-cache entry per page index.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PageEntry {
     image_id: u32,
     /// Last-transmitted layout key (zoom + dark). `None` means the
@@ -63,6 +63,26 @@ struct PageEntry {
     /// (see `transmit`) so these are always cell-aligned.
     pixel_w: u32,
     pixel_h: u32,
+    /// Encoded payload (PNG or raw RGBA) for the most recent bitmap.
+    /// Two readers:
+    ///   1. `build_transmit` — if its (layout, revision, dims)
+    ///      fingerprint matches, skip the encode and reuse these bytes.
+    ///   2. `pre_encode` — populated during idle so the next user
+    ///      input lands with PNG bytes ready to ship.
+    /// Independent of `transmitted_*`: this caches the encode output,
+    /// not the terminal's image cache.
+    cached_payload: Option<CachedPayload>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedPayload {
+    layout: LayoutKey,
+    revision: u64,
+    pixel_w: u32,
+    pixel_h: u32,
+    /// Kitty format code: 100 = PNG, 32 = raw RGBA.
+    format_code: u8,
+    bytes: Vec<u8>,
 }
 
 pub struct KittyPageRegistry {
@@ -137,6 +157,7 @@ impl KittyPageRegistry {
             transmitted_revision: 0,
             pixel_w,
             pixel_h,
+            cached_payload: None,
         });
         entry.image_id = id;
         entry.transmitted_layout = Some(layout);
@@ -148,8 +169,100 @@ impl KittyPageRegistry {
     /// Build the kitty transmit escape for this page's bitmap. Free
     /// function exposed via the registry so callers don't have to
     /// know the `is_tmux` flag separately.
-    pub fn build_transmit(&self, bitmap: &RgbaImage, page_idx: usize) -> String {
-        transmit(bitmap, self.id_for(page_idx), self.is_tmux)
+    ///
+    /// Consults the per-page payload cache: if a cached encode for the
+    /// same (layout, revision, dims) already exists (e.g. populated by
+    /// `pre_encode` during idle, or by a previous transmit at the same
+    /// revision), reuse those bytes instead of re-encoding. PNG encode
+    /// is the dominant cost in this function — skipping it makes the
+    /// transmit a near-pure base64 + IO operation.
+    pub fn build_transmit(
+        &mut self,
+        bitmap: &RgbaImage,
+        page_idx: usize,
+        layout: LayoutKey,
+        revision: u64,
+    ) -> String {
+        let id = self.id_for(page_idx);
+        let pixel_w = bitmap.width();
+        let pixel_h = bitmap.height();
+        let entry = self.pages.entry(page_idx).or_insert(PageEntry {
+            image_id: id,
+            transmitted_layout: None,
+            transmitted_revision: 0,
+            pixel_w,
+            pixel_h,
+            cached_payload: None,
+        });
+        // Pull cached payload if its fingerprint still matches.
+        let cached = entry.cached_payload.as_ref().and_then(|c| {
+            (c.layout == layout
+                && c.revision == revision
+                && c.pixel_w == pixel_w
+                && c.pixel_h == pixel_h)
+                .then_some((c.format_code, c.bytes.clone()))
+        });
+        let (format_code, payload) = if let Some(p) = cached {
+            p
+        } else {
+            let p = encode_payload(bitmap);
+            entry.cached_payload = Some(CachedPayload {
+                layout,
+                revision,
+                pixel_w,
+                pixel_h,
+                format_code: p.0,
+                bytes: p.1.clone(),
+            });
+            p
+        };
+        build_transmit_string(&payload, format_code, id, pixel_w, pixel_h, self.is_tmux)
+    }
+
+    /// Encode the bitmap's payload (PNG or raw RGBA) into the cache
+    /// without transmitting. Used by the idle warm path: encode now
+    /// during the slack between keystrokes so the next draw cycle
+    /// picks the bytes up from cache.
+    ///
+    /// Returns immediately if the cached payload's fingerprint already
+    /// matches — so calling this multiple times for an unchanged page
+    /// is free.
+    pub fn pre_encode(
+        &mut self,
+        bitmap: &RgbaImage,
+        page_idx: usize,
+        layout: LayoutKey,
+        revision: u64,
+    ) {
+        let id = self.id_for(page_idx);
+        let pixel_w = bitmap.width();
+        let pixel_h = bitmap.height();
+        let entry = self.pages.entry(page_idx).or_insert(PageEntry {
+            image_id: id,
+            transmitted_layout: None,
+            transmitted_revision: 0,
+            pixel_w,
+            pixel_h,
+            cached_payload: None,
+        });
+        if let Some(c) = &entry.cached_payload {
+            if c.layout == layout
+                && c.revision == revision
+                && c.pixel_w == pixel_w
+                && c.pixel_h == pixel_h
+            {
+                return;
+            }
+        }
+        let (format_code, bytes) = encode_payload(bitmap);
+        entry.cached_payload = Some(CachedPayload {
+            layout,
+            revision,
+            pixel_w,
+            pixel_h,
+            format_code,
+            bytes,
+        });
     }
 
     /// Pixel dimensions of the cached bitmap for this page, if any.
@@ -164,38 +277,42 @@ impl KittyPageRegistry {
     }
 }
 
-/// Build the kitty `a=T,U=1` chunked transmit for a bitmap. The
-/// terminal stores the image keyed by `id`; subsequent placements
-/// reference this ID.
+/// Encode the bitmap into a (kitty format code, payload bytes) pair.
+/// 100 = PNG, 32 = raw RGBA.
 ///
-/// Format choice (raw RGBA vs PNG): PDF pages are mostly white space
-/// with sparse text, so PNG compresses 5-20× smaller than raw RGBA.
-/// We pay a one-shot encode cost (~20-50 ms with `Fast` + `NoFilter`)
-/// to save 50-150 ms of pty-write time on the wire. Net win for any
-/// page bigger than ~50 KB raw, which is every real PDF page.
+/// Format choice: PDF pages are mostly white space with sparse text,
+/// so PNG compresses 5-20× smaller than raw RGBA. We pay a one-shot
+/// encode cost (~2 ms with `Fast` + `Up`) to save 50-150 ms of
+/// pty-write time on the wire. Net win for any page bigger than ~50 KB
+/// raw, which is every real PDF page.
 ///
 /// Set `TERMPDF_TRANSMIT_RAW=1` to force the old raw-RGBA path —
 /// useful for A/B testing or if a terminal turns out not to like
 /// PNG transmits in practice.
-fn transmit(bitmap: &RgbaImage, id: u32, is_tmux: bool) -> String {
-    let (w, h) = (bitmap.width(), bitmap.height());
-
-    // Decide format. The check is per-call (not OnceLock cached) so
-    // a flipped env var takes effect on the next render — convenient
-    // when bisecting performance.
+fn encode_payload(bitmap: &RgbaImage) -> (u8, Vec<u8>) {
     let force_raw = std::env::var("TERMPDF_TRANSMIT_RAW")
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false);
+    if force_raw {
+        return (32, bitmap.as_raw().to_vec());
+    }
+    match encode_png_fast(bitmap) {
+        Ok(png) => (100, png),
+        Err(_) => (32, bitmap.as_raw().to_vec()),
+    }
+}
 
-    let (format_code, payload): (u8, Vec<u8>) = if force_raw {
-        (32, bitmap.as_raw().to_vec())
-    } else {
-        match encode_png_fast(bitmap) {
-            Ok(png) => (100, png),
-            Err(_) => (32, bitmap.as_raw().to_vec()),
-        }
-    };
-
+/// Build the kitty `a=T,U=1` chunked transmit for an already-encoded
+/// payload. Pure formatting — no encode work — so it's cheap to call
+/// even after a cache hit.
+fn build_transmit_string(
+    payload: &[u8],
+    format_code: u8,
+    id: u32,
+    pixel_w: u32,
+    pixel_h: u32,
+    is_tmux: bool,
+) -> String {
     let (start, escape, end) = tmux_wrap(is_tmux);
 
     // Chunk size matches ratatui-image: 4096 base64 chars per chunk
@@ -220,7 +337,7 @@ fn transmit(bitmap: &RgbaImage, id: u32, is_tmux: bool) -> String {
             // accepts and uses them as a hint).
             write!(
                 data,
-                "i={id},a=T,U=1,f={format_code},t=d,s={w},v={h},"
+                "i={id},a=T,U=1,f={format_code},t=d,s={pixel_w},v={pixel_h},"
             )
             .unwrap();
         }
@@ -232,6 +349,15 @@ fn transmit(bitmap: &RgbaImage, id: u32, is_tmux: bool) -> String {
         data.push_str(end);
     }
     data
+}
+
+/// Convenience wrapper used in unit tests: encode + build in one
+/// call. Production callers go through `KittyPageRegistry::build_transmit`
+/// which adds the payload cache on top.
+#[cfg(test)]
+fn transmit(bitmap: &RgbaImage, id: u32, is_tmux: bool) -> String {
+    let (format_code, payload) = encode_payload(bitmap);
+    build_transmit_string(&payload, format_code, id, bitmap.width(), bitmap.height(), is_tmux)
 }
 
 /// PNG-encode with `Fast` compression + `Up` filter. Benchmarked on a
@@ -498,5 +624,83 @@ mod tests {
         let s = transmit(&bm, 1, true);
         assert!(s.starts_with("\x1bPtmux;"));
         assert!(s.ends_with("\x1b\\"));
+    }
+
+    #[test]
+    fn build_transmit_caches_payload_across_calls() {
+        // Same (layout, revision, dims) → second call must reuse the
+        // cached encoded payload (no re-encode).
+        let mut r = KittyPageRegistry::new(false, 1000);
+        let layout = LayoutKey { fit_width_px: 64, dark: false };
+        let bm = RgbaImage::new(16, 16);
+        let s1 = r.build_transmit(&bm, 0, layout, 7);
+        // Pull the cache pointer / len so we can prove it didn't get
+        // re-encoded into a fresh buffer.
+        let cached_after_first = {
+            let entry = r.pages.get(&0).expect("page entry exists");
+            let p = entry.cached_payload.as_ref().expect("payload cached");
+            (p.bytes.as_ptr() as usize, p.bytes.len())
+        };
+        let s2 = r.build_transmit(&bm, 0, layout, 7);
+        let cached_after_second = {
+            let entry = r.pages.get(&0).expect("page entry exists");
+            let p = entry.cached_payload.as_ref().expect("payload cached");
+            (p.bytes.as_ptr() as usize, p.bytes.len())
+        };
+        assert_eq!(s1, s2);
+        assert_eq!(
+            cached_after_first, cached_after_second,
+            "second build_transmit must reuse the cached payload, not re-encode"
+        );
+    }
+
+    #[test]
+    fn build_transmit_invalidates_cache_on_revision_change() {
+        let mut r = KittyPageRegistry::new(false, 1000);
+        let layout = LayoutKey { fit_width_px: 64, dark: false };
+        let bm = RgbaImage::new(16, 16);
+        r.build_transmit(&bm, 0, layout, 7);
+        let len_before = r.pages.get(&0).unwrap().cached_payload.as_ref().unwrap().bytes.len();
+        // Modify bitmap (simulating an overlay change) and bump revision.
+        let mut bm2 = RgbaImage::new(16, 16);
+        for px in bm2.pixels_mut() {
+            *px = image::Rgba([255, 0, 0, 255]);
+        }
+        r.build_transmit(&bm2, 0, layout, 8);
+        let cached = r.pages.get(&0).unwrap().cached_payload.as_ref().unwrap();
+        assert_eq!(cached.revision, 8);
+        // Different content → very likely different encoded length. If
+        // by coincidence equal we still know revision was bumped.
+        let _ = len_before;
+    }
+
+    #[test]
+    fn pre_encode_populates_cache() {
+        let mut r = KittyPageRegistry::new(false, 1000);
+        let layout = LayoutKey { fit_width_px: 64, dark: false };
+        let bm = RgbaImage::new(16, 16);
+        r.pre_encode(&bm, 5, layout, 3);
+        let entry = r.pages.get(&5).expect("page entry exists after pre_encode");
+        let cached = entry.cached_payload.as_ref().expect("payload cached");
+        assert_eq!(cached.layout, layout);
+        assert_eq!(cached.revision, 3);
+        assert_eq!(cached.pixel_w, 16);
+        assert_eq!(cached.pixel_h, 16);
+        assert!(!cached.bytes.is_empty());
+    }
+
+    #[test]
+    fn build_transmit_after_pre_encode_skips_re_encode() {
+        let mut r = KittyPageRegistry::new(false, 1000);
+        let layout = LayoutKey { fit_width_px: 64, dark: false };
+        let bm = RgbaImage::new(16, 16);
+        r.pre_encode(&bm, 0, layout, 7);
+        let ptr_after_pre = r.pages.get(&0).unwrap().cached_payload.as_ref().unwrap().bytes.as_ptr() as usize;
+        let _s = r.build_transmit(&bm, 0, layout, 7);
+        let ptr_after_transmit = r.pages.get(&0).unwrap().cached_payload.as_ref().unwrap().bytes.as_ptr() as usize;
+        assert_eq!(
+            ptr_after_pre, ptr_after_transmit,
+            "build_transmit after pre_encode must reuse the bytes the pre-encode produced"
+        );
     }
 }

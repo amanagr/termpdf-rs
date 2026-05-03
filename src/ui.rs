@@ -544,22 +544,21 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
         }
     }
 
-    // Build transmit strings for pages that need them. Held outside
-    // the draw loop so the immutable borrow on overlay_cache doesn't
-    // overlap the mutable borrow on kitty_pages.
-    let transmits: Vec<Option<String>> = {
-        let kp = app.kitty_pages.as_ref().unwrap();
-        blits
-            .iter()
-            .map(|b| {
-                if !b.need_transmit {
-                    return None;
-                }
-                let bm = app.overlay_cache.get(&b.page_idx).map(|(b, _)| b)?;
-                Some(kp.build_transmit(bm, b.page_idx))
-            })
-            .collect()
-    };
+    // Build transmit strings for pages that need them. Split-borrow
+    // app.overlay_cache (read) and app.kitty_pages (write) — Rust's
+    // NLL handles distinct struct fields separately.
+    let overlay_cache = &app.overlay_cache;
+    let kp = app.kitty_pages.as_mut().unwrap();
+    let transmits: Vec<Option<String>> = blits
+        .iter()
+        .map(|b| {
+            if !b.need_transmit {
+                return None;
+            }
+            let bm = overlay_cache.get(&b.page_idx).map(|(bm, _)| bm)?;
+            Some(kp.build_transmit(bm, b.page_idx, layout_key, b.revision))
+        })
+        .collect();
 
     drop(_compose);
 
