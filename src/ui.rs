@@ -962,10 +962,7 @@ fn try_selection_only_repaint(
     }
 
     let fit_width_px = app.layout.fit_width_px;
-    let visible: Vec<usize> = app
-        .layout
-        .visible_pages(app.scroll_y_px, viewport_h)
-        .collect();
+    let visible = app.layout.visible_pages(app.scroll_y_px, viewport_h);
     let page_x_origin: i64 = if fit_width_px <= viewport_w {
         ((viewport_w - fit_width_px) / 2) as i64
     } else {
@@ -994,15 +991,17 @@ fn try_selection_only_repaint(
         (Some(r), None) | (None, Some(r)) => Some(r),
         (Some((a, b)), Some((c, d))) => Some((a.min(c), b.max(d))),
     };
-    for page_idx in &visible {
-        let Some((lo, hi)) = union else { break };
-        if *page_idx < lo || *page_idx > hi {
+    let Some((lo, hi)) = union else {
+        return Some(canvas);
+    };
+    for page_idx in visible {
+        if page_idx < lo || page_idx > hi {
             continue;
         }
-        let Some(page_img) = app.composed_image(*page_idx) else {
+        let Some(page_img) = app.composed_image(page_idx) else {
             continue;
         };
-        let page_doc_y = app.layout.page_y(*page_idx);
+        let page_doc_y = app.layout.page_y(page_idx);
         let page_y_in_viewport = page_doc_y - app.scroll_y_px;
         blit_clipped(&mut canvas, page_x_origin, page_y_in_viewport, page_img);
     }
