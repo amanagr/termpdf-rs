@@ -1355,7 +1355,26 @@ fn ensure_highlights_baked(app: &mut App<'_>, page_idx: usize, layout: LayoutKey
     let Some(src) = app.page_cache.get(&page_idx) else {
         return;
     };
-    let mut img = src.to_rgba8();
+    // Reuse the prior baked buffer when dims match. The bake always
+    // overwrites every pixel from `src` first, so there's no risk of
+    // stale-paint bleed-through. Saves an 8 MB malloc/free per
+    // highlight-revision bump (e.g. selecting the next search hit
+    // re-bakes every visible page). When `src` isn't ImageRgba8 the
+    // borrow falls back to a `to_rgba8` conversion clone — pdfium
+    // always hands us ImageRgba8 in practice, so the fallback only
+    // exists to keep the function total.
+    let prev_buf = app.highlights_baked_cache.remove(&page_idx).map(|(b, _)| b);
+    let mut img = match (src.as_rgba8(), prev_buf) {
+        (Some(src_rgba), Some(mut existing))
+            if existing.dimensions() == src_rgba.dimensions() =>
+        {
+            let dst: &mut [u8] = existing.as_mut();
+            dst.copy_from_slice(src_rgba.as_raw());
+            existing
+        }
+        (Some(src_rgba), _) => src_rgba.clone(),
+        (None, _) => src.to_rgba8(),
+    };
 
     for h in app.highlights.for_page(page_idx) {
         let rect = norm_to_pixels(
