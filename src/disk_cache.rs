@@ -152,9 +152,10 @@ pub fn evict_to_budget(budget_bytes: u64) -> std::io::Result<()> {
         return Ok(());
     }
 
-    // Collect (mtime, size, path) for every cache file. Skip non-png
-    // sidecar files (e.g. half-written .png.tmp) so a crashed write
-    // doesn't fool the sort.
+    // Collect (mtime, size, path) for every cache file. Skip half-
+    // written sidecar files (e.g. .png.tmp / .idx.tmp) so a crashed
+    // write doesn't fool the sort. Counts both PNG (page bitmaps)
+    // and .bin (search index) files toward the budget.
     let mut entries: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
     let mut total: u64 = 0;
     for pdf_dir in std::fs::read_dir(&cache_root)?.flatten() {
@@ -164,7 +165,8 @@ pub fn evict_to_budget(budget_bytes: u64) -> std::io::Result<()> {
         }
         for file in std::fs::read_dir(&pdf_dir_path)?.flatten() {
             let path = file.path();
-            if path.extension().is_none_or(|e| e != "png") {
+            let keep = path.extension().is_some_and(|e| e == "png" || e == "bin");
+            if !keep {
                 continue;
             }
             let meta = match file.metadata() {
