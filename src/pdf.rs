@@ -126,11 +126,15 @@ pub fn page_metrics(document: &PdfDocument<'_>) -> Result<Vec<PageMetrics>> {
 /// matches the pre-supersample blur). 3.0 squeezes a tiny bit more
 /// out at significantly higher render cost.
 fn render_scale() -> f32 {
-    std::env::var("TERMPDF_RENDER_SCALE")
-        .ok()
-        .and_then(|s| s.parse::<f32>().ok())
-        .filter(|v| v.is_finite() && *v >= 1.0 && *v <= 4.0)
-        .unwrap_or(2.0)
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<f32> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("TERMPDF_RENDER_SCALE")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 1.0 && *v <= 4.0)
+            .unwrap_or(2.0)
+    })
 }
 
 /// Render `page_idx` at exactly `target_width_px` pixels wide. The

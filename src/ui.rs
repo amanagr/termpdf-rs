@@ -46,12 +46,19 @@ pub const MAX_FIT_WIDTH_PX: u32 = 4096;
 /// budget; 256 MB ≈ 64 megapixels of cached pages, which is several
 /// dozen typical pages or a smaller number of big scanned ones.
 /// Override at startup with `$TERMPDF_CACHE_MB`.
+///
+/// Cached: this fires on every frame from the budget enforcement path;
+/// without the OnceLock it was paying an env-scan syscall per draw.
 pub fn page_cache_budget_bytes() -> usize {
-    let mb = std::env::var("TERMPDF_CACHE_MB")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(256);
-    mb.saturating_mul(1024 * 1024)
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let mb = std::env::var("TERMPDF_CACHE_MB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(256);
+        mb.saturating_mul(1024 * 1024)
+    })
 }
 
 pub fn draw(f: &mut Frame, app: &mut App<'_>) {
