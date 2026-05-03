@@ -82,15 +82,18 @@ pub fn fill_rect_blend(
     let span = (x2 - x) * 4;
 
     if alpha >= 0.999 {
-        // Solid fill — pack one row of the colour bytes once and
-        // copy_from_slice it into each row.
-        let mut row: Vec<u8> = Vec::with_capacity(span);
-        for _ in x..x2 {
-            row.extend_from_slice(&[cr, cg, cb, 255]);
-        }
+        // Solid fill — write each row's pixels inline. Previously
+        // allocated a Vec and copied it into each row; the Vec
+        // allocation per call dominated when this path was hit by
+        // outline_rect (4 calls per current search hit). chunks_exact_mut
+        // lets the optimizer turn the inner write into a tight u32
+        // store.
+        let pixel = [cr, cg, cb, 255];
         for py in y..y2 {
             let off = py * stride + x * 4;
-            buf[off..off + span].copy_from_slice(&row);
+            for chunk in buf[off..off + span].chunks_exact_mut(4) {
+                chunk.copy_from_slice(&pixel);
+            }
         }
         return;
     }
