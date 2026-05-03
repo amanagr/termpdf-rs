@@ -1291,10 +1291,24 @@ pub(crate) fn ensure_overlay(app: &mut App<'_>, page_idx: usize, layout: LayoutK
         return;
     }
 
+    // Reuse the previous overlay buffer if its dimensions match. Saves
+    // an 8 MB malloc/free per Visual-mode keystroke that hits a
+    // selection-touching page: `baked.clone()` allocates a fresh
+    // ~8 MB Vec and copies, while a reused buffer only does the copy.
+    // On dim mismatch (zoom changed) we fall back to clone and the
+    // old buffer's storage drops naturally.
+    let prev_buf = app.overlay_cache.remove(&page_idx).map(|(b, _)| b);
     let Some((baked, _)) = app.highlights_baked_cache.get(&page_idx) else {
         return;
     };
-    let mut img = baked.clone();
+    let mut img = match prev_buf {
+        Some(mut existing) if existing.dimensions() == baked.dimensions() => {
+            let dst: &mut [u8] = existing.as_mut();
+            dst.copy_from_slice(baked.as_raw());
+            existing
+        }
+        _ => baked.clone(),
+    };
 
     // Tier 2: paint the live selection band on top.
     if let Some(sel) = app.text_selection {
