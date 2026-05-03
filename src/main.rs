@@ -314,28 +314,72 @@ fn probe(
 fn run_loop(app: &mut App<'_>) -> Result<()> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut term = Terminal::new(backend)?;
+    // Watchdog: minimum interval between actual paints under sustained
+    // input. 16 ms ≈ 60 Hz. Lets a held-`j` collapse multiple steps
+    // into one paint while keeping single keys feeling responsive.
+    const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+    let mut last_draw = std::time::Instant::now() - MIN_FRAME_INTERVAL;
 
     while !app.should_quit {
-        term.draw(|f| ui::draw(f, app))?;
+        // Pre-draw peek: if more input is already queued, don't paint
+        // the intermediate state — drain first, then paint the result.
+        // The watchdog guarantees we still paint at ~60 Hz so very
+        // long input bursts (mouse drags, autorepeat) don't lock the
+        // screen.
+        let mut should_draw = true;
+        let now = std::time::Instant::now();
+        if now.duration_since(last_draw) < MIN_FRAME_INTERVAL && event::poll(Duration::ZERO)? {
+            should_draw = false;
+        }
+        if should_draw {
+            term.draw(|f| ui::draw(f, app))?;
+            last_draw = std::time::Instant::now();
+        }
 
-        // Block once for the next event (250 ms tick), then drain the
-        // queue without redrawing in between. Two reasons:
-        //   1. Mouse-drag fires 30–100 events/sec; a redraw per event
-        //      thrashes the kitty graphics pipeline. Coalescing keeps
-        //      only the *latest* drag position before the next paint.
-        //   2. Buffered keystrokes (user mashing Space) collapse into
-        //      one redraw — the user just sees the final scroll position
-        //      instead of a slow staircase of full re-encodes.
+        // Block once for the next event (250 ms tick) then drain the
+        // queue. Two reasons to drain in batches:
+        //   1. Mouse-drag fires 30–100 events/sec; one redraw per
+        //      event thrashes the kitty graphics pipeline.
+        //   2. Held-key autorepeat (j/Space/l) collapses into one
+        //      redraw at the final state.
         if event::poll(Duration::from_millis(250))? {
-            dispatch_event(app, event::read()?)?;
-            // Drain any other pending events (poll(0) returns immediately).
-            // Stop early on quit so we don't keep dispatching after a `:q`.
+            dispatch_event_coalesced(app, event::read()?)?;
             while !app.should_quit && event::poll(Duration::ZERO)? {
-                dispatch_event(app, event::read()?)?;
+                dispatch_event_coalesced(app, event::read()?)?;
             }
         }
     }
     Ok(())
+}
+
+/// Same as `dispatch_event` but with explicit per-event coalescing
+/// for mouse drags: when a `Drag` is dispatched, peek for more drags
+/// behind it and skip the intermediate ones. Each Drag mutates
+/// `text_selection.head` and triggers a recompose; the user only
+/// cares about the final position.
+fn dispatch_event_coalesced(app: &mut App<'_>, ev: Event) -> Result<()> {
+    use crossterm::event::{MouseEvent, MouseEventKind};
+    if let Event::Mouse(MouseEvent { kind: MouseEventKind::Drag(btn), .. }) = ev {
+        // Drain consecutive Drag(btn) events; keep only the last.
+        let mut latest = ev;
+        while event::poll(Duration::ZERO)? {
+            // We can't peek without consuming; read and check.
+            let next = event::read()?;
+            match &next {
+                Event::Mouse(MouseEvent { kind: MouseEventKind::Drag(b2), .. }) if *b2 == btn => {
+                    latest = next;
+                }
+                _ => {
+                    // Non-drag event broke the run — dispatch the latest drag,
+                    // then this event normally.
+                    dispatch_event(app, latest)?;
+                    return dispatch_event(app, next);
+                }
+            }
+        }
+        return dispatch_event(app, latest);
+    }
+    dispatch_event(app, ev)
 }
 
 fn dispatch_event(app: &mut App<'_>, ev: Event) -> Result<()> {

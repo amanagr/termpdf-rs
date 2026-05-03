@@ -177,6 +177,20 @@ pub struct App<'doc> {
     pub overlay_cache: HashMap<usize, (RgbaImage, PageOverlayKey)>,
     pub image_proto: Option<StatefulProtocol>,
     pub last_compose_key: Option<ComposeKey>,
+    /// Reused viewport-sized RGBA buffer. Allocating an 8 MB
+    /// `RgbaImage::from_pixel` per recompose was 4–6 ms of pure
+    /// allocator + memset on every j/k tick at 1080p. We hand the
+    /// composer a pre-sized buffer instead and only touch the gap
+    /// rows between pages.
+    pub canvas_buf: Option<RgbaImage>,
+    /// FNV-1a hash of the most recently encoded canvas buffer.
+    /// Used to skip the kitty re-encode when ComposeKey changed but
+    /// the resulting pixels happen to match the previous frame
+    /// (common when the selection moves to/from offscreen, when
+    /// scrolling lands on a page boundary, or when the user mashes
+    /// the same key past a layout edge). 0 means "nothing encoded
+    /// yet."
+    pub last_canvas_hash: u64,
 
     pub highlights: HighlightStore,
     /// Bumped on every highlight add/delete so the compose cache
@@ -336,6 +350,8 @@ impl<'doc> App<'doc> {
             failed_pages: std::collections::HashSet::new(),
             overlay_cache: HashMap::new(),
             image_proto: None,
+            canvas_buf: None,
+            last_canvas_hash: 0,
             last_compose_key: None,
             highlights,
             highlight_revision: 0,
