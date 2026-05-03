@@ -471,9 +471,12 @@ impl<'doc> App<'doc> {
             .and_then(|p| crate::search_index::load(&p, page_count))
             .unwrap_or_else(|| crate::search_index::DocIndex::new(page_count));
         let index_persisted = doc_index.is_complete();
+        // Resolve once and reuse for both KittyPageRegistry init and the
+        // App::is_tmux field. (Previously did std::env::var("TMUX") twice
+        // — harmless at init, but the duplication invited drift.)
+        let is_tmux = std::env::var("TMUX").is_ok();
         let kitty_pages = matches!(picker.protocol_type(), ratatui_image::picker::ProtocolType::Kitty)
             .then(|| {
-                let is_tmux = std::env::var("TMUX").is_ok();
                 crate::kitty_pages::KittyPageRegistry::new(is_tmux, stable_kitty_id())
             });
         let app = Self {
@@ -502,7 +505,7 @@ impl<'doc> App<'doc> {
             mouse_dragging: false,
             picker,
             kitty_image_id: stable_kitty_id(),
-            is_tmux: std::env::var("TMUX").is_ok(),
+            is_tmux,
             page_cache: HashMap::new(),
             page_cache_lru: Vec::new(),
             last_scroll_dir: 0,
