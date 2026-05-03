@@ -156,21 +156,34 @@ impl KittyPageRegistry {
         if self.pages.len() <= MAX_CACHED_PAGES {
             return;
         }
-        let target = MAX_CACHED_PAGES;
         // Scan front (LRU) to back, collecting victims that aren't
-        // pinned. Stop once we've trimmed enough.
-        let mut idx = 0;
-        while self.pages.len() > target && idx < self.lru.len() {
-            let cand = self.lru[idx];
+        // pinned. Stop once we've trimmed enough. Building the
+        // eviction set up-front lets us drop entries from `self.lru`
+        // with one pass instead of an O(N) `VecDeque::remove(idx)`
+        // per evicted page; the previous loop was O(K·N) for K
+        // evictions on a doc that just blew past the cap.
+        let over = self.pages.len() - MAX_CACHED_PAGES;
+        let mut victims: Vec<usize> = Vec::with_capacity(over);
+        for &cand in self.lru.iter() {
+            if victims.len() >= over {
+                break;
+            }
             if pinned.contains(&cand) {
-                idx += 1;
                 continue;
             }
-            self.lru.remove(idx); // shifts; do NOT increment idx
-            if let Some(entry) = self.pages.remove(&cand) {
+            victims.push(cand);
+        }
+        if victims.is_empty() {
+            return;
+        }
+        let victim_set: std::collections::HashSet<usize> =
+            victims.iter().copied().collect();
+        for v in &victims {
+            if let Some(entry) = self.pages.remove(v) {
                 self.queue_delete(entry.image_id);
             }
         }
+        self.lru.retain(|p| !victim_set.contains(p));
     }
 
     fn queue_delete(&mut self, id: u32) {
@@ -289,38 +302,52 @@ impl KittyPageRegistry {
         let id = self.id_for(page_idx);
         let pixel_w = bitmap.width();
         let pixel_h = bitmap.height();
-        let entry = self.pages.entry(page_idx).or_insert(PageEntry {
-            image_id: id,
-            transmitted_layout: None,
-            transmitted_revision: 0,
-            pixel_w,
-            pixel_h,
-            cached_payload: None,
-        });
-        // Pull cached payload if its fingerprint still matches.
-        let cached = entry.cached_payload.as_ref().and_then(|c| {
-            (c.layout == layout
-                && c.revision == revision
-                && c.pixel_w == pixel_w
-                && c.pixel_h == pixel_h)
-                .then_some((c.format_code, c.bytes.clone()))
-        });
-        let (format_code, payload) = if let Some(p) = cached {
-            p
-        } else {
-            let p = encode_payload(bitmap);
-            entry.cached_payload = Some(CachedPayload {
-                layout,
-                revision,
+        let is_tmux = self.is_tmux;
+        // Borrow-scope the entry so the `touch` call below sees a clean
+        // `&mut self`. Within the scope: ensure the cached payload
+        // matches the request fingerprint, then borrow its bytes
+        // directly into `build_transmit_string`. Previously this path
+        // cloned `c.bytes` on every cache hit (~50–300 KB per call,
+        // doubled on miss to populate the cache); the encoded payload
+        // already has one canonical home in the cache, so we let the
+        // transmit-builder borrow it instead of cloning.
+        let result = {
+            let entry = self.pages.entry(page_idx).or_insert(PageEntry {
+                image_id: id,
+                transmitted_layout: None,
+                transmitted_revision: 0,
                 pixel_w,
                 pixel_h,
-                format_code: p.0,
-                bytes: p.1.clone(),
+                cached_payload: None,
             });
-            p
+            let needs_encode = match &entry.cached_payload {
+                Some(c) => {
+                    !(c.layout == layout
+                        && c.revision == revision
+                        && c.pixel_w == pixel_w
+                        && c.pixel_h == pixel_h)
+                }
+                None => true,
+            };
+            if needs_encode {
+                let (format_code, bytes) = encode_payload(bitmap);
+                entry.cached_payload = Some(CachedPayload {
+                    layout,
+                    revision,
+                    pixel_w,
+                    pixel_h,
+                    format_code,
+                    bytes,
+                });
+            }
+            let c = entry
+                .cached_payload
+                .as_ref()
+                .expect("cached_payload populated on the line above");
+            build_transmit_string(&c.bytes, c.format_code, id, pixel_w, pixel_h, is_tmux)
         };
         self.touch(page_idx);
-        build_transmit_string(&payload, format_code, id, pixel_w, pixel_h, self.is_tmux)
+        result
     }
 
     /// Encode the bitmap's payload (PNG or raw RGBA) into the cache
