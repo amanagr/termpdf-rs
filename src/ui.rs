@@ -1421,16 +1421,22 @@ fn compose_into_buffer(app: &mut App<'_>, viewport_w: u32, viewport_h: u32) -> R
 
     {
         // Block-scope the bg_row borrow so the rest of compose can
-        // re-borrow `app` for layout/overlay reads below.
+        // re-borrow `app` for layout/overlay reads below. Reuse the
+        // same cached bg_row for the side margins so we get a single
+        // copy_from_slice per row instead of a chunks_exact_mut loop
+        // populating one pixel quad at a time.
         let bg_row = app.bg_row(viewport_w);
         fill_gaps_bulk(canvas.as_mut(), viewport_w, viewport_h, &covered, bg_row);
-    }
-
-    // If the page is narrower than the viewport (zoomed-out or
-    // portrait page), the side margins between (0..page_x_origin)
-    // and (page_x_origin+fit_width_px..viewport_w) also need bg.
-    if fit_width_px < viewport_w {
-        fill_side_margins(&mut canvas, viewport_w, viewport_h, page_x_origin, fit_width_px, bg);
+        if fit_width_px < viewport_w {
+            fill_side_margins(
+                &mut canvas,
+                viewport_w,
+                viewport_h,
+                page_x_origin,
+                fit_width_px,
+                bg_row,
+            );
+        }
     }
 
     for page_idx in visible {
@@ -1489,35 +1495,38 @@ fn fill_gaps_bulk(
 }
 
 /// Paint side margins (cells outside the page's horizontal extent)
-/// with `bg`. Only called when the page is narrower than the viewport.
-/// Writes a u32 (= packed RGBA) per pixel rather than the previous
-/// per-pixel `copy_from_slice(&bg.0)` — drops the per-pixel bounds
-/// checks the slice path emitted.
+/// with the cached background row. Only called when the page is
+/// narrower than the viewport.
+///
+/// Each row's left and right margins are filled with one
+/// `copy_from_slice` from `bg_row` instead of a per-quad
+/// `chunks_exact_mut` loop. `bg_row` is the same buffer
+/// `compose_into_buffer` already prepared for `fill_gaps_bulk`, so
+/// no extra setup cost.
 fn fill_side_margins(
     canvas: &mut RgbaImage,
     viewport_w: u32,
     viewport_h: u32,
     page_x_origin: i64,
     fit_width_px: u32,
-    bg: Rgba<u8>,
+    bg_row: &[u8],
 ) {
-    let left_end = page_x_origin.max(0).min(viewport_w as i64) as u32;
-    let right_start = (page_x_origin + fit_width_px as i64).max(0).min(viewport_w as i64) as u32;
+    let left_end = page_x_origin.max(0).min(viewport_w as i64) as usize;
+    let right_start =
+        (page_x_origin + fit_width_px as i64).max(0).min(viewport_w as i64) as usize;
+    let viewport_w_usize = viewport_w as usize;
     let buf = canvas.as_mut();
-    let row_bytes = (viewport_w as usize) * 4;
+    let row_bytes = viewport_w_usize * 4;
+    let left_bytes = left_end * 4;
+    let right_start_bytes = right_start * 4;
     for y in 0..viewport_h as usize {
-        let row = &mut buf[y * row_bytes..(y + 1) * row_bytes];
-        // Left margin: cols 0..left_end.
+        let row_off = y * row_bytes;
+        let row = &mut buf[row_off..row_off + row_bytes];
         if left_end > 0 {
-            for chunk in row[..(left_end as usize) * 4].chunks_exact_mut(4) {
-                chunk.copy_from_slice(&bg.0);
-            }
+            row[..left_bytes].copy_from_slice(&bg_row[..left_bytes]);
         }
-        // Right margin: cols right_start..viewport_w.
-        if (right_start as usize) < viewport_w as usize {
-            for chunk in row[(right_start as usize) * 4..].chunks_exact_mut(4) {
-                chunk.copy_from_slice(&bg.0);
-            }
+        if right_start < viewport_w_usize {
+            row[right_start_bytes..].copy_from_slice(&bg_row[right_start_bytes..]);
         }
     }
 }
