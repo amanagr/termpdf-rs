@@ -28,6 +28,10 @@ pub enum Command {
     Nohl,
     Toc,
     Help,
+    /// Jump to the document's references / bibliography section if
+    /// the outline contains one. No-op with informative status if
+    /// the outline doesn't include such a section.
+    Refs,
     /// `:export [path]`. `None` means "derive default path from the
     /// open PDF" (resolved at execute-time so the parser stays pure).
     Export(Option<PathBuf>),
@@ -83,6 +87,7 @@ pub fn parse(line: &str) -> Command {
         "nohl" | "noh" | "nohlsearch" => Command::Nohl,
         "toc" => Command::Toc,
         "help" => Command::Help,
+        "refs" | "ref" | "bib" | "bibliography" | "references" => Command::Refs,
         "export" | "notes" => {
             // `:export some/path/with spaces.md` is rare but possible;
             // collect the rest of the line verbatim rather than split
@@ -112,6 +117,7 @@ pub fn execute(app: &mut App<'_>, line: &str) {
         Command::Nohl => app.clear_search(),
         Command::Toc => app.toggle_toc(),
         Command::Help => app.show_help = true,
+        Command::Refs => app.jump_to_references(),
         Command::Export(maybe_target) => {
             let target = maybe_target.unwrap_or_else(|| {
                 let mut p = app.path.clone();
@@ -223,6 +229,15 @@ mod tests {
             Command::Unknown(s) => assert_eq!(s, "frobnicate"),
             other => panic!("got {:?}", other),
         }
+    }
+
+    #[test]
+    fn refs_aliases() {
+        assert_eq!(parse("refs"), Command::Refs);
+        assert_eq!(parse("ref"), Command::Refs);
+        assert_eq!(parse("bib"), Command::Refs);
+        assert_eq!(parse("bibliography"), Command::Refs);
+        assert_eq!(parse("references"), Command::Refs);
     }
 
     /// Adversarial-input fuzz lite: bytes-as-strings shouldn't panic.

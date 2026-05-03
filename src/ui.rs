@@ -1721,6 +1721,7 @@ pub fn help_overlay_lines() -> Vec<&'static str> {
         "  :nohl                  clear search results",
         "",
         "  ]] / [[                jump to next / prev outline entry",
+        "  :refs / :bib           jump to References / Bibliography section",
         "  o  /  :toc             open outline panel",
         "    j/k Enter            navigate / jump to entry",
         "    / type Enter         filter by substring",

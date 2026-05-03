@@ -801,6 +801,24 @@ impl<'doc> App<'doc> {
     /// page that's mid-section lands on the next/previous *boundary*
     /// (so `]]` from the middle of section 3 goes to section 4, and
     /// `[[` goes to the start of section 3).
+    /// Jump to the document's references / bibliography section.
+    /// Heuristic: scan the outline for an entry titled (case-
+    /// insensitively) "References", "Bibliography", or "Works Cited".
+    /// First match wins. No-op with status if no such entry exists.
+    pub fn jump_to_references(&mut self) {
+        let target = find_references_page(&self.outline);
+        match target {
+            Some(p) => {
+                self.goto_page(p);
+                self.status = format!("→ references (page {})", p + 1);
+            }
+            None => {
+                self.status =
+                    "no References / Bibliography section found in outline".into();
+            }
+        }
+    }
+
     pub fn jump_section(&mut self, dir: i32) {
         if self.outline.is_empty() {
             self.status = "no outline in this document".into();
@@ -2235,6 +2253,39 @@ impl<'doc> App<'doc> {
 /// Process ID hashed with the golden-ratio constant gives us a
 /// well-spread u32 without pulling in `rand`. Kitty IDs are 1..=u32::MAX;
 /// we bump 0 to 1 just in case.
+/// Pure helper: scan an outline for the first entry whose title
+/// matches a "references / bibliography" heading. Returns the
+/// resolved page index, or `None` if no such entry exists.
+///
+/// Match is case-insensitive substring against a small set of
+/// heading words — covers "References", "Bibliography", "Works
+/// Cited", and similar variants. We deliberately don't get clever
+/// with regex: a long-tail of academic books title their refs
+/// section "Notes and References" or "Selected Bibliography" and
+/// substring covers them all.
+pub fn find_references_page(outline: &[OutlineEntry]) -> Option<usize> {
+    const REF_KEYWORDS: &[&str] = &[
+        "reference",     // singular and plural
+        "bibliograph",   // bibliography / bibliographies
+        "works cited",
+        "literature cited",
+    ];
+    for entry in outline {
+        let lower = entry.title.to_lowercase();
+        for kw in REF_KEYWORDS {
+            if lower.contains(kw) {
+                if let Some(p) = entry.page {
+                    return Some(p);
+                }
+                // Title matched but no resolved page — keep searching;
+                // some PDFs split section anchors across siblings.
+                break;
+            }
+        }
+    }
+    None
+}
+
 /// Pure helper: given a sorted-deduped vec of outline page indices,
 /// the user's current page, and a direction (+1 next, -1 prev),
 /// returns the page to jump to. `None` means "no neighbour in that
@@ -2675,6 +2726,61 @@ mod tests {
         assert_eq!(next_section_target(&outline, 12, -1), Some(5));
         // Before first section → None.
         assert_eq!(next_section_target(&outline, 0, -1), None);
+    }
+
+    // ---- find_references_page ------------------------------------
+
+    fn outline_entry(title: &str, page: Option<usize>) -> OutlineEntry {
+        OutlineEntry {
+            title: title.to_string(),
+            lc_title: title.to_lowercase().chars().collect(),
+            depth: 0,
+            page,
+        }
+    }
+
+    #[test]
+    fn find_references_matches_canonical_titles() {
+        let outline = vec![
+            outline_entry("Chapter 1", Some(0)),
+            outline_entry("References", Some(45)),
+        ];
+        assert_eq!(find_references_page(&outline), Some(45));
+    }
+
+    #[test]
+    fn find_references_matches_substring() {
+        let outline = vec![
+            outline_entry("Selected Bibliography", Some(98)),
+            outline_entry("Index", Some(102)),
+        ];
+        assert_eq!(find_references_page(&outline), Some(98));
+    }
+
+    #[test]
+    fn find_references_is_case_insensitive() {
+        let outline = vec![outline_entry("WORKS CITED", Some(7))];
+        assert_eq!(find_references_page(&outline), Some(7));
+    }
+
+    #[test]
+    fn find_references_skips_unresolved_pages() {
+        let outline = vec![
+            outline_entry("References", None),
+            outline_entry("Index", Some(50)),
+        ];
+        // No resolved page on References → returns None (next entry
+        // doesn't match the keyword).
+        assert_eq!(find_references_page(&outline), None);
+    }
+
+    #[test]
+    fn find_references_returns_none_for_missing() {
+        let outline = vec![
+            outline_entry("Chapter 1", Some(0)),
+            outline_entry("Chapter 2", Some(20)),
+        ];
+        assert_eq!(find_references_page(&outline), None);
     }
 
     #[test]
