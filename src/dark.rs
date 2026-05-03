@@ -72,8 +72,8 @@ mod tests {
         let out = invert_luminance(solid(2, 2, Rgba([128, 128, 128, 255])));
         let p = out.get_pixel(0, 0).0;
         // 255 - 128 = 127. Allow off-by-one.
-        for c in 0..3 {
-            assert!((p[c] as i32 - 127).abs() <= 1, "channel {} was {}", c, p[c]);
+        for (c, &v) in p.iter().enumerate().take(3) {
+            assert!((v as i32 - 127).abs() <= 1, "channel {c} was {v}");
         }
     }
 
