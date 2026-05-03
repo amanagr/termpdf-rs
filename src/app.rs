@@ -609,6 +609,20 @@ impl<'doc> App<'doc> {
         });
     }
 
+    /// Read the page's composed bitmap (highlights + search hits +
+    /// optional selection band). When the active selection touches
+    /// this page, an `overlay_cache` entry exists with the selection
+    /// baked on top; otherwise the `highlights_baked_cache` bitmap is
+    /// already exactly what we'd render, so we return it directly
+    /// without paying for a per-page clone in `ensure_overlay`.
+    /// Returns `None` if neither cache has the page.
+    pub fn composed_image(&self, page_idx: usize) -> Option<&RgbaImage> {
+        if let Some((img, _)) = self.overlay_cache.get(&page_idx) {
+            return Some(img);
+        }
+        self.highlights_baked_cache.get(&page_idx).map(|(img, _)| img)
+    }
+
     /// Mark a page as the most-recently-used. Called every time
     /// `ensure_image` reads or inserts a bitmap. Fast-paths the
     /// steady-scroll case where the page is already at MRU — skips

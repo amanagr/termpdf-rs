@@ -549,11 +549,18 @@ fn warm_next_uncached(app: &mut App<'_>) -> Result<bool> {
         // build_transmit method primes its own cache) and ship it
         // directly to stdout. mark_transmitted afterwards so the next
         // draw's is_fresh check returns true and skips the transmit.
-        let pixel_dims = app
+        //
+        // ensure_overlay only inserts into overlay_cache when the
+        // selection touches the page — for any other page we'd find
+        // an empty overlay_cache slot. Fall back to highlights_baked
+        // (which ensure_overlay always populates) so the warm tick
+        // still ships a payload to the terminal.
+        let bm = app
             .overlay_cache
             .get(&pi)
-            .map(|(bm, _)| (bm.width(), bm.height()));
-        let bm = app.overlay_cache.get(&pi).map(|(bm, _)| bm);
+            .map(|(bm, _)| bm)
+            .or_else(|| app.highlights_baked_cache.get(&pi).map(|(bm, _)| bm));
+        let pixel_dims = bm.map(|bm| (bm.width(), bm.height()));
         let kp = app.kitty_pages.as_mut();
         if let (Some(kp), Some(bm), Some((w, h))) = (kp, bm, pixel_dims) {
             let transmit = kp.build_transmit(bm, pi, layout_key, revision);

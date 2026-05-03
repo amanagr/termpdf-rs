@@ -465,7 +465,7 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
 
     let mut blits: Vec<PageBlit> = Vec::with_capacity(visible.len());
     for &page_idx in &visible {
-        let Some((bm, _)) = app.overlay_cache.get(&page_idx) else {
+        let Some(bm) = app.composed_image(page_idx) else {
             continue;
         };
         let pixel_w = bm.width();
@@ -569,9 +569,13 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     }
 
     // Build transmit strings for pages that need them. Split-borrow
-    // app.overlay_cache (read) and app.kitty_pages (write) — Rust's
-    // NLL handles distinct struct fields separately.
+    // app.overlay_cache + highlights_baked_cache (read) and
+    // app.kitty_pages (write) — Rust's NLL handles distinct struct
+    // fields separately. Try the overlay first (it carries the live
+    // selection band when present); fall back to baked for pages
+    // without an overlay entry.
     let overlay_cache = &app.overlay_cache;
+    let baked_cache = &app.highlights_baked_cache;
     let kp = app.kitty_pages.as_mut().unwrap();
     let mut transmits: Vec<Option<String>> = blits
         .iter()
@@ -579,7 +583,10 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
             if !b.need_transmit {
                 return None;
             }
-            let bm = overlay_cache.get(&b.page_idx).map(|(bm, _)| bm)?;
+            let bm = overlay_cache
+                .get(&b.page_idx)
+                .map(|(bm, _)| bm)
+                .or_else(|| baked_cache.get(&b.page_idx).map(|(bm, _)| bm))?;
             Some(kp.build_transmit(bm, b.page_idx, layout_key, b.revision))
         })
         .collect();
@@ -894,7 +901,7 @@ fn try_scroll_shift_canvas(
         if page_bot_in_viewport <= strip_y0 || page_top_in_viewport >= strip_y1 {
             continue;
         }
-        let Some((page_img, _)) = app.overlay_cache.get(&page_idx) else {
+        let Some(page_img) = app.composed_image(page_idx) else {
             continue;
         };
         // Constrain the blit to the strip rows. Easiest: clip the
@@ -1250,6 +1257,20 @@ pub(crate) fn ensure_overlay(app: &mut App<'_>, page_idx: usize, layout: LayoutK
     // Tier 1: highlights baked. Built once per (highlights, search,
     // layout) change and reused across every selection move.
     ensure_highlights_baked(app, page_idx, layout);
+
+    // Fast path: when the active selection doesn't touch this page,
+    // the overlay would just be a verbatim clone of `baked`. Drop any
+    // stale overlay_cache entry (e.g. selection just moved off this
+    // page) and skip the clone — `App::composed_image` falls back to
+    // `highlights_baked_cache` for pages without an overlay entry.
+    // This keeps overlay_cache memory proportional to the *selection
+    // span* instead of all visible pages, and saves a ~10 MB RGBA
+    // copy on every cold compose of a non-selection page.
+    if overlay_key.selection_sig == 0 {
+        app.overlay_cache.remove(&page_idx);
+        return;
+    }
+
     let Some((baked, _)) = app.highlights_baked_cache.get(&page_idx) else {
         return;
     };
@@ -1391,7 +1412,7 @@ fn compose_into_buffer(app: &mut App<'_>, viewport_w: u32, viewport_h: u32) -> R
     }
 
     for page_idx in visible {
-        let Some((page_img, _)) = app.overlay_cache.get(&page_idx) else {
+        let Some(page_img) = app.composed_image(page_idx) else {
             continue;
         };
         let page_doc_y = app.layout.page_y(page_idx);
