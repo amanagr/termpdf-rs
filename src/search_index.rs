@@ -28,6 +28,7 @@
 //! complexity. Even without persistence, idle warm fills the
 //! index well before the user usually triggers their first search.
 
+use std::cell::OnceCell;
 use std::collections::HashSet;
 use std::ops::Range;
 
@@ -51,6 +52,13 @@ pub struct DocIndex {
     /// Bumped on every `add_page`. Lets external code (status line,
     /// invalidation) detect "index grew" without diffing.
     pub revision: u64,
+    /// Cached lowercased copy of `text`. `to_lowercase()` on a 700-page
+    /// book is ~50–100 ms and used to fire on every case-insensitive
+    /// search. We compute it once on demand and reuse across searches;
+    /// `add_page` resets it because the underlying text grew.
+    /// `OnceCell` over `&self` so `match_offsets` doesn't need to take
+    /// a mut borrow just to populate the cache.
+    lower_text_cache: OnceCell<String>,
 }
 
 impl DocIndex {
@@ -61,6 +69,7 @@ impl DocIndex {
             indexed_pages: HashSet::with_capacity(total_pages),
             total_pages,
             revision: 0,
+            lower_text_cache: OnceCell::new(),
         }
     }
 
@@ -110,6 +119,11 @@ impl DocIndex {
         self.text.push('\n');
         self.indexed_pages.insert(page_idx);
         self.revision = self.revision.wrapping_add(1);
+        // The text just grew, so any cached lowercase copy is stale.
+        // Replace the cache cell; the next case-insensitive search
+        // pays the lowercase cost once and subsequent searches against
+        // the (now-larger) text reuse it.
+        self.lower_text_cache = OnceCell::new();
     }
 
     /// Map a byte offset within `text` back to the page that owns it.
@@ -196,13 +210,16 @@ impl DocIndex {
         if case_sensitive {
             Box::new(self.text.match_indices(query).map(|(i, _)| i))
         } else {
-            // Lowercase both sides. Allocates two transient strings
-            // per search; for our query sizes (<100 chars) that's fine.
+            // Lowercase needle each call (small, < 100 chars). The
+            // haystack is a 2 MB+ string for a long book; we cache its
+            // lowercase form across searches to avoid the multi-tens-
+            // of-ms `text.to_lowercase()` per query.
             let needle = query.to_lowercase();
-            let hay = self.text.to_lowercase();
-            // Materialise into a Vec because the iterator borrows
-            // `hay`, which is owned locally. An iterator would have a
-            // self-referential lifetime that doesn't escape this fn.
+            let hay = self.lower_text_cache.get_or_init(|| self.text.to_lowercase());
+            // Materialise into a Vec because Rust can't express the
+            // borrow path "&'a Box<dyn Iterator borrowing &'a String>"
+            // through this signature without GATs. The collect cost is
+            // dominated by the encode-once lowercase we just skipped.
             let v: Vec<usize> = hay.match_indices(&needle).map(|(i, _)| i).collect();
             Box::new(v.into_iter())
         }
@@ -328,6 +345,7 @@ pub fn load(path: &std::path::Path, expected_total: usize) -> Option<DocIndex> {
         indexed_pages,
         total_pages,
         revision: 1,
+        lower_text_cache: OnceCell::new(),
     })
 }
 
@@ -404,6 +422,24 @@ mod tests {
         // "the" appears 3 times across pages.
         assert_eq!(idx.match_count("the", false), 3);
         assert_eq!(idx.match_count("zzz", false), 0);
+    }
+
+    /// add_page must reset the lowercase-text cache, otherwise a search
+    /// after extending the index would miss matches in the newly-added
+    /// page (the cache would still hold the pre-add lowercase string).
+    #[test]
+    fn add_page_invalidates_lowercase_cache() {
+        let mut idx = DocIndex::new(3);
+        idx.add_page(0, "alpha".into());
+        // Prime the cache with one search.
+        assert_eq!(idx.match_count("ALPHA", false), 1);
+        // Add a new page; the new content must be searchable.
+        idx.add_page(1, "BETA".into());
+        assert_eq!(
+            idx.match_count("beta", false),
+            1,
+            "cache should have been invalidated on add_page so new text is searchable"
+        );
     }
 
     #[test]
