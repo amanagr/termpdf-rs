@@ -1337,13 +1337,15 @@ fn ensure_highlights_baked(app: &mut App<'_>, page_idx: usize, layout: LayoutKey
     }
 
     if let Some(s) = &app.search {
-        let current_idx = s.current;
-        for (i, hit) in s.hits.iter().enumerate().filter(|(_, h)| h.page == page_idx) {
-            let rect = norm_to_pixels(hit.rect, img.width(), img.height());
-            let color = (255u8, 165, 0);
-            fill_rect_blend(&mut img, rect, color, 0.45);
-            if i == current_idx {
-                outline_rect(&mut img, rect, (255, 80, 0), 3);
+        if let Some((start, slice)) = s.page_slice(page_idx) {
+            let current_idx = s.current;
+            for (offset, hit) in slice.iter().enumerate() {
+                let rect = norm_to_pixels(hit.rect, img.width(), img.height());
+                let color = (255u8, 165, 0);
+                fill_rect_blend(&mut img, rect, color, 0.45);
+                if start + offset == current_idx {
+                    outline_rect(&mut img, rect, (255, 80, 0), 3);
+                }
             }
         }
     }

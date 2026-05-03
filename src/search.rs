@@ -12,7 +12,7 @@
 //! get a future "budget N pages per frame tick" pass; v1 keeps it
 //! simple.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use pdfium_render::prelude::*;
@@ -53,6 +53,14 @@ pub struct SearchResults {
     /// Big win on doc-wide queries (a query matching ~5000 hits used
     /// to scan the full vec for every visible page on every frame).
     pages_with_hits: HashSet<usize>,
+    /// Per-page contiguous range `[start, end)` into `hits`. Hits are
+    /// added in page order during `run_search`, so all hits for a
+    /// given page live in one slice. The highlights-bake path used
+    /// to walk every hit and filter by page — O(total_hits) per page
+    /// even though the slice we actually need is tiny. This map gives
+    /// O(1) lookup of the per-page slice and the absolute start index
+    /// (so the bake loop can still tell "is this the current hit?").
+    page_hit_ranges: HashMap<usize, (usize, usize)>,
 }
 
 impl SearchResults {
@@ -64,6 +72,7 @@ impl SearchResults {
             revision: 0,
             truncated: false,
             pages_with_hits: HashSet::new(),
+            page_hit_ranges: HashMap::new(),
         }
     }
 
@@ -86,6 +95,34 @@ impl SearchResults {
     pub fn page_has_hits(&self, page_idx: usize) -> bool {
         self.pages_with_hits.contains(&page_idx)
     }
+
+    /// Slice of `hits` belonging to `page_idx` along with the absolute
+    /// index of the first hit in `hits`. The bake loop needs the
+    /// absolute index to compare against `self.current` for the
+    /// "current hit is on this page" outline. Returns `(start_idx,
+    /// slice)` so callers can re-derive `i` as `start_idx + offset`
+    /// without walking the full hits vector.
+    pub fn page_slice(&self, page_idx: usize) -> Option<(usize, &[SearchHit])> {
+        let (start, end) = self.page_hit_ranges.get(&page_idx).copied()?;
+        Some((start, &self.hits[start..end]))
+    }
+}
+
+/// Build the per-page-range index from a hits vector that's already
+/// sorted by page (run_search adds hits in candidate-page order, so
+/// same-page hits are contiguous). Pulled out for testability.
+fn build_page_hit_ranges(hits: &[SearchHit]) -> HashMap<usize, (usize, usize)> {
+    let mut out: HashMap<usize, (usize, usize)> = HashMap::new();
+    let mut i = 0;
+    while i < hits.len() {
+        let p = hits[i].page;
+        let start = i;
+        while i < hits.len() && hits[i].page == p {
+            i += 1;
+        }
+        out.insert(p, (start, i));
+    }
+    out
 }
 
 /// Run a full-document search. Errors only on pdfium failures —
@@ -163,6 +200,7 @@ pub fn run_search(
     }
 
     let pages_with_hits: HashSet<usize> = hits.iter().map(|h| h.page).collect();
+    let page_hit_ranges = build_page_hit_ranges(&hits);
     Ok(SearchResults {
         query: trimmed.to_string(),
         hits,
@@ -170,6 +208,7 @@ pub fn run_search(
         revision: 1,
         truncated,
         pages_with_hits,
+        page_hit_ranges,
     })
 }
 
@@ -216,6 +255,7 @@ mod tests {
 
     fn fake_results(hits: Vec<SearchHit>) -> SearchResults {
         let pages_with_hits: HashSet<usize> = hits.iter().map(|h| h.page).collect();
+        let page_hit_ranges = build_page_hit_ranges(&hits);
         SearchResults {
             query: "x".into(),
             hits,
@@ -223,6 +263,7 @@ mod tests {
             revision: 0,
             truncated: false,
             pages_with_hits,
+            page_hit_ranges,
         }
     }
 
@@ -288,6 +329,30 @@ mod tests {
     fn truncated_flag_defaults_false() {
         let r = SearchResults::empty("x".into());
         assert!(!r.truncated);
+    }
+
+    #[test]
+    fn page_slice_returns_contiguous_range() {
+        // Hits arranged in page order: page 1 has 2 hits, page 4 has 1, page 7 has 3.
+        let hits = vec![
+            SearchHit { page: 1, rect: Rect01 { x: 0.0, y: 0.0, w: 0.1, h: 0.1 } },
+            SearchHit { page: 1, rect: Rect01 { x: 0.5, y: 0.5, w: 0.1, h: 0.1 } },
+            SearchHit { page: 4, rect: Rect01 { x: 0.0, y: 0.0, w: 0.1, h: 0.1 } },
+            SearchHit { page: 7, rect: Rect01 { x: 0.0, y: 0.0, w: 0.1, h: 0.1 } },
+            SearchHit { page: 7, rect: Rect01 { x: 0.2, y: 0.2, w: 0.1, h: 0.1 } },
+            SearchHit { page: 7, rect: Rect01 { x: 0.4, y: 0.4, w: 0.1, h: 0.1 } },
+        ];
+        let r = fake_results(hits);
+        // Page 1: 2 hits starting at index 0.
+        let (start1, slice1) = r.page_slice(1).expect("page 1 slice");
+        assert_eq!(start1, 0);
+        assert_eq!(slice1.len(), 2);
+        // Page 7: 3 hits starting at index 3.
+        let (start7, slice7) = r.page_slice(7).expect("page 7 slice");
+        assert_eq!(start7, 3);
+        assert_eq!(slice7.len(), 3);
+        // Page with no hits: None.
+        assert!(r.page_slice(99).is_none());
     }
 
     #[test]
