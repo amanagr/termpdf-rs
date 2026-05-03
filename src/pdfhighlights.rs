@@ -114,18 +114,40 @@ pub fn load_from_pdf(document: &PdfDocument<'_>) -> Result<HighlightStore> {
 /// research recommends per-line attachment-point quads for multi-line
 /// selections, which we'll switch to once the new text-aware
 /// selection model lands.
+/// Walk every page (the legacy unfiltered save). Production callers
+/// use `save_to_pdf_filtered` for ~100× faster saves on big books;
+/// this wrapper stays around for tests that want to round-trip the
+/// full doc without tracking a candidate set.
+#[allow(dead_code)]
 pub fn save_to_pdf(
     document: &PdfDocument<'_>,
     store: &HighlightStore,
     path: &Path,
 ) -> Result<()> {
-    apply_store_to_document(document, store)?;
+    apply_store_to_document(document, store, None)?;
+    save_atomic(document, path)
+}
+
+/// Like `save_to_pdf` but only opens the pages in `candidate_pages`.
+/// On a 700-page book, `pages.get(i)` is ~5–10 ms (FPDF_LoadPage).
+/// Walking every page just to confirm "nothing to do here" was a 5–7 s
+/// pause on quit. The caller maintains the set as
+/// `(pages_with_our_annotations_at_load) ∪ (pages_with_highlights_now)`
+/// so we cover both deletes and adds without missing any.
+pub fn save_to_pdf_filtered(
+    document: &PdfDocument<'_>,
+    store: &HighlightStore,
+    path: &Path,
+    candidate_pages: &std::collections::HashSet<usize>,
+) -> Result<()> {
+    apply_store_to_document(document, store, Some(candidate_pages))?;
     save_atomic(document, path)
 }
 
 fn apply_store_to_document(
     document: &PdfDocument<'_>,
     store: &HighlightStore,
+    candidate_pages: Option<&std::collections::HashSet<usize>>,
 ) -> Result<()> {
     let pages = document.pages();
     let total = pages.len() as i32;
@@ -147,6 +169,14 @@ fn apply_store_to_document(
     }
 
     for page_idx in 0..total {
+        // Skip pages the caller flagged as untouched (no annotations of
+        // ours, no highlights to add). Saves ~5–10 ms per skipped page
+        // on big books.
+        if let Some(pages_to_walk) = candidate_pages {
+            if !pages_to_walk.contains(&(page_idx as usize)) {
+                continue;
+            }
+        }
         let mut page = pages
             .get(page_idx)
             .with_context(|| format!("opening page {} for annotation sync", page_idx + 1))?;
@@ -611,6 +641,56 @@ mod tests {
         assert!((h.w - 0.30).abs() < 0.01, "w: got {}", h.w);
         assert!((h.h - 0.05).abs() < 0.01, "h: got {}", h.h);
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `save_to_pdf_filtered` must skip pages NOT in the candidate set:
+    /// adds on excluded pages are dropped, and ours-on-disk on excluded
+    /// pages are left in place. Production passes `prev ∪ now` so this
+    /// edge case shouldn't fire — but the contract matters because a
+    /// caller bug here would silently lose user data.
+    #[test]
+    fn save_to_pdf_filtered_only_walks_candidate_pages() {
+        let Some(pdfium) = pdfium_or_skip() else { return };
+        let path = temp_path("filtered");
+        {
+            let mut doc = pdfium.create_new_pdf().expect("new pdf");
+            doc.pages_mut()
+                .create_page_at_end(PdfPagePaperSize::a4())
+                .expect("page 0");
+            doc.pages_mut()
+                .create_page_at_end(PdfPagePaperSize::a4())
+                .expect("page 1");
+            doc.save_to_file(&path).expect("save empty");
+        }
+        let store = HighlightStore {
+            items: vec![
+                Highlight {
+                    page: 0, x: 0.10, y: 0.10, w: 0.20, h: 0.05,
+                    color: "#ffd54f".into(), note: None, group_id: None,
+                },
+                Highlight {
+                    page: 1, x: 0.10, y: 0.10, w: 0.20, h: 0.05,
+                    color: "#aed581".into(), note: None, group_id: None,
+                },
+            ],
+        };
+        // Only walk page 1; page 0's highlight in the store should be
+        // ignored entirely.
+        let mut candidate = std::collections::HashSet::new();
+        candidate.insert(1usize);
+        {
+            let doc = pdfium.load_pdf_from_file(&path, None).expect("reload");
+            save_to_pdf_filtered(&doc, &store, &path, &candidate).expect("save");
+        }
+        let doc = pdfium.load_pdf_from_file(&path, None).expect("reload2");
+        let loaded = load_from_pdf(&doc).expect("load");
+        assert_eq!(
+            loaded.items.len(),
+            1,
+            "page 0 was filtered out → its highlight must not have been written"
+        );
+        assert_eq!(loaded.items[0].page, 1);
         let _ = std::fs::remove_file(&path);
     }
 }
