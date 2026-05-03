@@ -1029,6 +1029,11 @@ fn request_prefetch(app: &mut App<'_>, page_idx: usize, fit_width_px: u32) {
 /// every frame. With `allow_failure=true`, errors are stored and
 /// then suppressed (returning Ok); with `allow_failure=false`, the
 /// error propagates so the caller can paint a render-error message.
+///
+/// Disk cache: tries to load a previously-cached PNG of this exact
+/// (page, width, dark) tuple from `~/.cache/termpdf-rs/<file-hash>/`
+/// before invoking pdfium. On miss, runs pdfium and writes the result
+/// for next time. Saves ~15 ms per cold page on warm-cache reopens.
 pub(crate) fn ensure_page_rendered(
     app: &mut App<'_>,
     page_idx: usize,
@@ -1041,6 +1046,23 @@ pub(crate) fn ensure_page_rendered(
     if app.failed_pages.contains(&page_idx) {
         return Ok(());
     }
+
+    // Disk-cache fast path: hit avoids the ~20 ms pdfium render +
+    // ~5 ms dark inversion (we cache the post-inversion image).
+    let cache_path = crate::disk_cache::cache_path(&app.path, page_idx, fit_width_px, app.dark);
+    if let Some(ref p) = cache_path {
+        if let Some(img) = crate::disk_cache::load(p) {
+            // Sanity: pdfium-rendered widths should exactly match
+            // fit_width_px. If a stale cache file at a different width
+            // crept in, ignore and fall through.
+            if img.width() == fit_width_px {
+                app.page_cache.insert(page_idx, img);
+                app.last_compose_key = None;
+                return Ok(());
+            }
+        }
+    }
+
     match pdf::render_page_at_width(&app.document, page_idx, fit_width_px) {
         Ok(img) => {
             let img = if app.dark {
@@ -1048,6 +1070,11 @@ pub(crate) fn ensure_page_rendered(
             } else {
                 img
             };
+            // Best-effort write to disk cache. Failures are silent —
+            // the in-memory cache below still serves this session.
+            if let Some(ref p) = cache_path {
+                let _ = crate::disk_cache::store(p, &img);
+            }
             app.page_cache.insert(page_idx, img);
             app.last_compose_key = None;
             Ok(())

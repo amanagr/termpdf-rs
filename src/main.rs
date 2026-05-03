@@ -19,6 +19,7 @@ mod clipboard;
 mod cmd;
 mod compose;
 mod dark;
+mod disk_cache;
 mod highlight;
 mod keys;
 mod kitty_pages;
