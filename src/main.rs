@@ -390,6 +390,67 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
             // draw immediately.
             needs_settle_redraw = false;
             last_draw = std::time::Instant::now() - MIN_FRAME_INTERVAL;
+        } else {
+            // True idle: no input pending and no settle to do. Use
+            // the moment to warm one upcoming page so the next j/k
+            // press hits the cache instead of a 20 ms pdfium render.
+            // Bounded to one page per idle tick so input lag is at
+            // most one pdfium call.
+            let idle_long_enough = app
+                .last_input_at
+                .map(|t| t.elapsed() >= Duration::from_millis(200))
+                .unwrap_or(true);
+            if idle_long_enough {
+                let _ = warm_one_idle(app);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Idle-time prefetch. Renders one upcoming page in the user's
+/// scroll direction so the next j/k press lands on a cached page
+/// instead of a synchronous 20 ms pdfium call. Searches a few pages
+/// ahead so a quick pdfium failure on one page (corrupt, password,
+/// etc.) doesn't dead-end the prefetch.
+///
+/// Bounded by design to **one** render per idle tick — if the user
+/// presses a key while we're inside pdfium, they wait at most one
+/// render time. The event loop's own poll interval (down to 120 ms
+/// when settle is pending) guarantees we still notice the keypress
+/// quickly between ticks.
+fn warm_one_idle(app: &mut App<'_>) -> Result<()> {
+    let viewport_h = app.viewport_px.1;
+    if viewport_h == 0 {
+        // Layout never built (no draw yet). Nothing useful to do.
+        return Ok(());
+    }
+    let visible: Vec<usize> = app
+        .layout
+        .visible_pages(app.scroll_y_px, viewport_h)
+        .collect();
+    if visible.is_empty() {
+        return Ok(());
+    }
+    let dir: i64 = if app.last_scroll_dir >= 0 { 1 } else { -1 };
+    let start: i64 = if dir > 0 {
+        *visible.last().unwrap() as i64 + 1
+    } else {
+        *visible.first().unwrap() as i64 - 1
+    };
+    // Look up to 5 pages ahead in the scroll direction for the first
+    // un-cached one. Past 5 is wasted work — the user's unlikely to
+    // get there before something else changes (zoom, jump, search).
+    const PREFETCH_DEPTH: i64 = 5;
+    let fit_width_px = app.layout.fit_width_px;
+    for offset in 0..PREFETCH_DEPTH {
+        let cand = start + offset * dir;
+        if cand < 0 || (cand as usize) >= app.page_count {
+            break;
+        }
+        let pi = cand as usize;
+        if !app.page_cache.contains_key(&pi) && !app.failed_pages.contains(&pi) {
+            return ui::ensure_page_rendered(app, pi, fit_width_px, /*allow_failure=*/ true);
         }
     }
     Ok(())

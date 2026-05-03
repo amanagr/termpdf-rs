@@ -953,7 +953,7 @@ fn request_prefetch(app: &mut App<'_>, page_idx: usize, fit_width_px: u32) {
 /// every frame. With `allow_failure=true`, errors are stored and
 /// then suppressed (returning Ok); with `allow_failure=false`, the
 /// error propagates so the caller can paint a render-error message.
-fn ensure_page_rendered(
+pub(crate) fn ensure_page_rendered(
     app: &mut App<'_>,
     page_idx: usize,
     fit_width_px: u32,
