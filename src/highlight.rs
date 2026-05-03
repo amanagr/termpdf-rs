@@ -157,10 +157,15 @@ mod tests {
 /// falls back to yellow as a *whole* — a partial parse used to
 /// produce Frankenstein colors (e.g. `#zz0000` → red instead of
 /// yellow), which silently disagreed with the saved hex string.
+///
+/// The ASCII guard catches corner cases like a 6-byte string that
+/// contains a multi-byte UTF-8 char (e.g. emoji-derived junk on a
+/// hostile PDF Contents field). Without it, slicing on a non-char
+/// boundary would panic the renderer.
 pub fn rgb_from_hex(hex: &str) -> (u8, u8, u8) {
     const FALLBACK: (u8, u8, u8) = (0xff, 0xd5, 0x4f);
     let h = hex.trim_start_matches('#');
-    if h.len() != 6 {
+    if h.len() != 6 || !h.is_ascii() {
         return FALLBACK;
     }
     match (
@@ -193,5 +198,20 @@ mod color_tests {
         assert_eq!(rgb_from_hex("#zzzzzz"), (0xff, 0xd5, 0x4f));
         assert_eq!(rgb_from_hex(""), (0xff, 0xd5, 0x4f));
         assert_eq!(rgb_from_hex("#abc"), (0xff, 0xd5, 0x4f));
+    }
+
+    /// Hostile / corrupt PDF could embed a 6-byte color string that
+    /// contains a multi-byte UTF-8 char (e.g. "🦀ab" — 6 bytes, 3
+    /// chars). The previous len-only guard let those through; slicing
+    /// on a non-char boundary would panic the renderer. Defence-in-
+    /// depth: bail to fallback when the string isn't pure ASCII.
+    #[test]
+    fn non_ascii_six_byte_input_falls_back_without_panic() {
+        // 🦀 is 4 bytes + "ab" = 6 bytes total but contains a
+        // multi-byte char.
+        assert_eq!(rgb_from_hex("🦀ab"), (0xff, 0xd5, 0x4f));
+        // Mid-position multi-byte: "aï0000" (a=1, ï=2, 0=1, 0=1, 0=1, 0=1 ... wait this is 7 bytes).
+        // Use "ïïï" (3 chars × 2 bytes each = 6 bytes).
+        assert_eq!(rgb_from_hex("ïïï"), (0xff, 0xd5, 0x4f));
     }
 }
