@@ -364,6 +364,7 @@ fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
     }
     app.canvas_buf = Some(canvas);
     app.last_compose_key = Some(compose_key);
+    app.last_selection_range = pages_touched_by_selection(app);
     Ok(())
 }
 
@@ -962,24 +963,34 @@ fn try_selection_only_repaint(
         -(((fit_width_px - viewport_w) as f32) * app.scroll_x).round() as i64
     };
 
-    // Re-blit only the pages whose per-page selection_sig changed
-    // since the last compose. We don't have the previous per-page
-    // sig captured, so use the cheaper proxy: any page that the
-    // selection touches now OR touched on the previous compose. In
-    // practice that's at most one or two pages per Visual-mode
-    // motion. The pages we re-blit overwrite their existing rows
-    // exactly; pages that didn't change keep their pixels.
+    // Re-blit any page whose per-page selection_sig changed since
+    // the last compose. The selection always spans a contiguous
+    // range, so the affected set is the union of the previous range
+    // and the current one — pages that newly entered the selection,
+    // pages that just left it, and the (single) page where the head
+    // is currently moving inside its own range.
     //
-    // The selection always spans a contiguous range of pages, so we
-    // store the (lo, hi) bounds rather than allocating a HashSet on
-    // every Visual-mode keystroke.
-    let touched_range = pages_touched_by_selection(app);
+    // Without the union, a shrink that pulls the selection's tail
+    // off page N would leave page N's old selection band painted on
+    // the canvas — `composed_image(N)` returns an unbanded bitmap
+    // but we'd never re-blit it. The kitty path doesn't need this
+    // because each page transmits independently and the per-page
+    // revision already covers selection_sig=0; canvas mode reuses
+    // one big bitmap across pages and so has to clear stale bands
+    // explicitly.
+    let now = pages_touched_by_selection(app);
+    let prev = app.last_selection_range;
+    let union = match (prev, now) {
+        (None, None) => None,
+        (Some(r), None) | (None, Some(r)) => Some(r),
+        (Some((a, b)), Some((c, d))) => Some((a.min(c), b.max(d))),
+    };
     for page_idx in &visible {
-        let Some((lo, hi)) = touched_range else { break };
+        let Some((lo, hi)) = union else { break };
         if *page_idx < lo || *page_idx > hi {
             continue;
         }
-        let Some((page_img, _)) = app.overlay_cache.get(page_idx) else {
+        let Some(page_img) = app.composed_image(*page_idx) else {
             continue;
         };
         let page_doc_y = app.layout.page_y(*page_idx);

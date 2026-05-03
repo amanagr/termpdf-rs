@@ -242,6 +242,15 @@ pub struct App<'doc> {
     /// Held-j autorepeats fire ~25 events/sec → count climbs fast.
     pub input_burst_count: u32,
     pub last_compose_key: Option<ComposeKey>,
+    /// Inclusive `(lo, hi)` page range the previous compose's
+    /// selection touched. Lets `try_selection_only_repaint` re-blit
+    /// pages that *exited* the selection range — without this, the
+    /// canvas-mode (sixel/iterm2/halfblocks) renderer would keep
+    /// showing a stale selection band on a page the user just
+    /// shrank past. The kitty path doesn't need it (each page
+    /// transmits independently and `compute_page_revision` includes
+    /// the per-page `selection_sig`).
+    pub last_selection_range: Option<(usize, usize)>,
     /// Reused viewport-sized RGBA buffer. Allocating an 8 MB
     /// `RgbaImage::from_pixel` per recompose was 4–6 ms of pure
     /// allocator + memset on every j/k tick at 1080p. We hand the
@@ -487,6 +496,7 @@ impl<'doc> App<'doc> {
             bg_row_key: None,
             last_canvas_hash: 0,
             last_compose_key: None,
+            last_selection_range: None,
             highlights,
             highlight_revision: 0,
             search: None,
@@ -580,6 +590,7 @@ impl<'doc> App<'doc> {
         self.failed_pages.clear();
         self.image_proto = None;
         self.last_compose_key = None;
+        self.last_selection_range = None;
     }
 
     /// Drop cached page bitmaps (and their overlay derivatives) that
