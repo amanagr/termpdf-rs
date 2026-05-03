@@ -318,13 +318,15 @@ impl KittyPageRegistry {
     }
 
     /// Encode the bitmap's payload (PNG or raw RGBA) into the cache
-    /// without transmitting. Used by the idle warm path: encode now
-    /// during the slack between keystrokes so the next draw cycle
-    /// picks the bytes up from cache.
+    /// without transmitting or registering as terminal-side resident.
+    /// Distinct from `build_transmit` which both encodes AND records
+    /// the page as transmitted. Use when you want the encode work
+    /// done in advance but plan to ship the transmit yourself later.
     ///
     /// Returns immediately if the cached payload's fingerprint already
     /// matches — so calling this multiple times for an unchanged page
     /// is free.
+    #[allow(dead_code)] // public extension hook; tests cover the cache contract
     pub fn pre_encode(
         &mut self,
         bitmap: &RgbaImage,

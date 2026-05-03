@@ -435,9 +435,18 @@ fn warm_one_idle(app: &mut App<'_>) -> Result<()> {
 }
 
 /// Render + bake overlay + pre-encode PNG for one upcoming uncached
-/// page. Returns `true` if a page was warmed, `false` if the prefetch
-/// window held no eligible candidate (depth exhausted, all already
-/// cached, or all failed).
+/// page, and proactively transmit the bitmap to the terminal so the
+/// next draw is pure placement (no payload IO). Returns `true` if a
+/// page was warmed, `false` if the prefetch window held no eligible
+/// candidate (depth exhausted, all already cached, or all failed).
+///
+/// Why pre-transmit during idle (not just pre-encode): the next draw
+/// cycle would otherwise pay ~2 ms of pty-write to ship the cached
+/// bytes. By writing them now while the user is idle, scroll-cycle
+/// cost drops to placement-only (~1 ms total). The runtime safety
+/// invariant — that we only write to stdout outside of `term.draw`
+/// — holds because `warm_one_idle` is only called from the idle
+/// branch of `run_loop`.
 fn warm_next_uncached(app: &mut App<'_>) -> Result<bool> {
     let viewport_h = app.viewport_px.1;
     if viewport_h == 0 {
@@ -477,13 +486,29 @@ fn warm_next_uncached(app: &mut App<'_>) -> Result<bool> {
             dark: app.dark,
         };
         ui::ensure_overlay(app, pi, layout_key);
-        // Pre-encode the PNG payload into the kitty registry cache so
-        // the next draw cycle hits the cache.
         let revision = ui::compute_page_revision(app, pi);
+        // Build the transmit string from the cached payload (the
+        // build_transmit method primes its own cache) and ship it
+        // directly to stdout. mark_transmitted afterwards so the next
+        // draw's is_fresh check returns true and skips the transmit.
+        let pixel_dims = app
+            .overlay_cache
+            .get(&pi)
+            .map(|(bm, _)| (bm.width(), bm.height()));
         let bm = app.overlay_cache.get(&pi).map(|(bm, _)| bm);
         let kp = app.kitty_pages.as_mut();
-        if let (Some(kp), Some(bm)) = (kp, bm) {
-            kp.pre_encode(bm, pi, layout_key, revision);
+        if let (Some(kp), Some(bm), Some((w, h))) = (kp, bm, pixel_dims) {
+            let transmit = kp.build_transmit(bm, pi, layout_key, revision);
+            // Write directly to stdout. We're outside of term.draw so
+            // no interleaving with ratatui's own writes — io::Stdout
+            // is line-/byte-flushable and acquires its own lock per
+            // call; we flush explicitly so the terminal sees the
+            // bytes before the next draw.
+            use std::io::Write;
+            let mut stdout = io::stdout().lock();
+            if stdout.write_all(transmit.as_bytes()).is_ok() && stdout.flush().is_ok() {
+                kp.mark_transmitted(pi, layout_key, revision, w, h);
+            }
         }
         return Ok(true);
     }
