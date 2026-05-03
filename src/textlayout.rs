@@ -624,7 +624,6 @@ fn cluster_lines(chars: &mut [CharCell]) -> Vec<LineSpan> {
     let mut line_y_sum = 0.0f32;
     let mut line_count = 0u32;
     let mut char_lines: Vec<usize> = vec![0; chars.len()];
-    let mut last_centre = order[0].1;
 
     for (i, y, _h) in order.iter() {
         let mean = if line_count > 0 {
@@ -639,10 +638,8 @@ fn cluster_lines(chars: &mut [CharCell]) -> Vec<LineSpan> {
         }
         line_y_sum += y;
         line_count += 1;
-        last_centre = *y;
         char_lines[*i] = line_id;
     }
-    let _ = last_centre;
 
     // Apply line ids back to chars.
     for (i, c) in chars.iter_mut().enumerate() {
