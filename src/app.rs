@@ -2103,6 +2103,20 @@ impl<'doc> App<'doc> {
     }
 
     pub fn persist_highlights(&self) -> Result<()> {
+        // Skip the save entirely when the user didn't touch a highlight
+        // this session. `save_to_pdf` walks every page in the document
+        // (pdfium has no per-doc annotation index) and on a 700-page
+        // book that's a 5–7 s pause after `:q`. Read-only sessions are
+        // common — a no-op short-circuit makes them quit instantly.
+        //
+        // Safe because the on-disk annotations were the source of truth
+        // at load time, the in-memory store is the unedited mirror, and
+        // the PDF file hasn't been touched since. Any external editor
+        // that modified the PDF mid-session would race with our save
+        // anyway.
+        if self.highlight_revision == 0 {
+            return Ok(());
+        }
         // Write highlights as PDF annotations on the document itself
         // (atomic via temp + rename inside save_to_pdf). The legacy
         // sidecar JSON is no longer the source of truth — but we
