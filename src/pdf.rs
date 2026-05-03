@@ -155,7 +155,14 @@ pub fn render_page_at_width(
     let page = pages.get(idx)?;
     let target = target_width_px.max(1);
     let scale = render_scale();
-    let render_w = ((target as f32 * scale).round() as u32).max(target);
+    // Cap supersample at ~6000 px so wide pages at extreme zoom don't
+    // blow up to multi-hundred-MB pdfium renders. Above this width the
+    // page is already so big on screen the marginal sharpness gain
+    // from supersampling isn't worth the latency hit.
+    const RENDER_W_CAP: u32 = 6000;
+    let render_w = ((target as f32 * scale).round() as u32)
+        .max(target)
+        .min(RENDER_W_CAP.max(target));
     let config = PdfRenderConfig::new()
         .set_target_width(render_w as i32)
         // LCD-style text anti-aliasing — sharper edges than greyscale AA.
