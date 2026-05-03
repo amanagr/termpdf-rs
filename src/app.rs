@@ -1938,11 +1938,7 @@ impl<'doc> App<'doc> {
                 }
             }
         };
-        if count == 0 {
-            self.awaiting_highlight_delete_confirm = false;
-        } else {
-            self.awaiting_highlight_delete_confirm = true;
-        }
+        self.awaiting_highlight_delete_confirm = count != 0;
         count
     }
 
