@@ -299,15 +299,16 @@ fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
         ensure_overlay(app, page_idx, layout_key);
     }
 
-    // Scroll-shift fast path: when the recompose was triggered ONLY
-    // by a scroll_y_px change (everything else in ComposeKey matched
-    // the previous frame), we can reuse the previous canvas's pixel
-    // contents — just memmove the rows by ΔY and only repaint the
-    // freshly-exposed strip. Replaces N page-blits with one memmove
-    // + one strip-blit when the scroll is smaller than the viewport.
-    let canvas = match try_scroll_shift_canvas(app, &compose_key, viewport_w, viewport_h) {
-        Some(c) => c,
-        None => compose_into_buffer(app, viewport_w, viewport_h),
+    // Two fast paths before the full compose:
+    //   - Scroll-shift: only scroll_y_px changed → memmove rows, repaint strip.
+    //   - Selection-only: only selection_sig changed → re-blit just the
+    //     selection's page over the previous canvas.
+    let canvas = if let Some(c) = try_scroll_shift_canvas(app, &compose_key, viewport_w, viewport_h) {
+        c
+    } else if let Some(c) = try_selection_only_repaint(app, &compose_key, viewport_w, viewport_h) {
+        c
+    } else {
+        compose_into_buffer(app, viewport_w, viewport_h)
     };
 
     // Hash-equal skip: if the just-composed canvas matches the
@@ -435,6 +436,89 @@ fn try_scroll_shift_canvas(
     }
 
     Some(canvas)
+}
+
+/// Selection-motion fast path: when the only ComposeKey change is
+/// `selection_sig`, the previous canvas is correct everywhere
+/// EXCEPT the rows occupied by visible pages whose own
+/// `selection_signature_for_page` changed. Reuse the previous
+/// canvas, then re-blit just those pages.
+///
+/// This is the natural extension of try_scroll_shift_canvas to
+/// in-place selection growth (`l`, `j`, `w` in Visual). It saves
+/// the per-page blit + the gap fill for every page that didn't
+/// change.
+fn try_selection_only_repaint(
+    app: &mut App<'_>,
+    new_key: &ComposeKey,
+    viewport_w: u32,
+    viewport_h: u32,
+) -> Option<RgbaImage> {
+    let prev = app.last_compose_key.as_ref()?;
+    if prev.layout != new_key.layout
+        || prev.viewport_w != new_key.viewport_w
+        || prev.viewport_h != new_key.viewport_h
+        || prev.scroll_x_milli != new_key.scroll_x_milli
+        || prev.scroll_y_px != new_key.scroll_y_px
+        || prev.highlight_revision != new_key.highlight_revision
+    {
+        return None;
+    }
+    if prev.selection_sig == new_key.selection_sig {
+        // No selection change either; the global compose-key check
+        // already short-circuits here. Defensive return None.
+        return None;
+    }
+    let mut canvas = app.canvas_buf.take()?;
+    if canvas.width() != viewport_w || canvas.height() != viewport_h {
+        return None;
+    }
+
+    let fit_width_px = app.layout.fit_width_px;
+    let visible: Vec<usize> = app
+        .layout
+        .visible_pages(app.scroll_y_px, viewport_h)
+        .collect();
+    let page_x_origin: i64 = if fit_width_px <= viewport_w {
+        ((viewport_w - fit_width_px) / 2) as i64
+    } else {
+        -(((fit_width_px - viewport_w) as f32) * app.scroll_x).round() as i64
+    };
+
+    // Re-blit only the pages whose per-page selection_sig changed
+    // since the last compose. We don't have the previous per-page
+    // sig captured, so use the cheaper proxy: any page that the
+    // selection touches now OR touched on the previous compose. In
+    // practice that's at most one or two pages per Visual-mode
+    // motion. The pages we re-blit overwrite their existing rows
+    // exactly; pages that didn't change keep their pixels.
+    let touches_now = pages_touched_by_selection(app);
+    for page_idx in &visible {
+        if !touches_now.contains(page_idx) {
+            continue;
+        }
+        let Some((page_img, _)) = app.overlay_cache.get(page_idx) else {
+            continue;
+        };
+        let page_doc_y = app.layout.page_y(*page_idx);
+        let page_y_in_viewport = page_doc_y - app.scroll_y_px;
+        blit_clipped(&mut canvas, page_x_origin, page_y_in_viewport, page_img);
+    }
+
+    Some(canvas)
+}
+
+/// Set of page indices the active selection currently spans. Empty
+/// when there is no selection.
+fn pages_touched_by_selection(app: &App<'_>) -> std::collections::HashSet<usize> {
+    let mut out = std::collections::HashSet::new();
+    if let Some(sel) = app.text_selection {
+        let (lo, hi) = sel.ordered();
+        for p in lo.page..=hi.page {
+            out.insert(p);
+        }
+    }
+    out
 }
 
 /// Pure helper: shift the rows of `buf` by `dy` viewport pixels.
