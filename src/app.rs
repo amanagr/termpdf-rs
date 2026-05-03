@@ -806,29 +806,17 @@ impl<'doc> App<'doc> {
             self.status = "no outline in this document".into();
             return;
         }
-        let cur = self.current_page();
-        let mut targets: Vec<usize> = self
+        let outline_pages: Vec<usize> = self
             .outline
             .iter()
             .filter_map(|e| e.page)
             .filter(|p| *p < self.page_count)
             .collect();
-        targets.sort_unstable();
-        targets.dedup();
-        if targets.is_empty() {
+        if outline_pages.is_empty() {
             self.status = "outline has no resolved pages".into();
             return;
         }
-        let target = if dir > 0 {
-            targets.into_iter().find(|p| *p > cur)
-        } else {
-            // For `[[`: if we're on a section's first page, go to the
-            // PREVIOUS section. Otherwise go to the start of the
-            // current section.
-            let mut prevs = targets.into_iter().filter(|p| *p < cur);
-            prevs.next_back()
-        };
-        match target {
+        match next_section_target(&outline_pages, self.current_page(), dir) {
             Some(p) => {
                 self.goto_page(p);
                 self.status = format!("→ page {}", p + 1);
@@ -2247,6 +2235,28 @@ impl<'doc> App<'doc> {
 /// Process ID hashed with the golden-ratio constant gives us a
 /// well-spread u32 without pulling in `rand`. Kitty IDs are 1..=u32::MAX;
 /// we bump 0 to 1 just in case.
+/// Pure helper: given a sorted-deduped vec of outline page indices,
+/// the user's current page, and a direction (+1 next, -1 prev),
+/// returns the page to jump to. `None` means "no neighbour in that
+/// direction". Extracted so it can be unit-tested without an App.
+pub fn next_section_target(
+    outline_pages: &[usize],
+    current_page: usize,
+    dir: i32,
+) -> Option<usize> {
+    let mut sorted: Vec<usize> = outline_pages.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if dir > 0 {
+        sorted.into_iter().find(|p| *p > current_page)
+    } else {
+        // For `[[`: from a page mid-section, land on the section's
+        // first page. From the section's first page, land on the
+        // previous section's first page.
+        sorted.into_iter().filter(|p| *p < current_page).next_back()
+    }
+}
+
 /// f32 → ordered key for sorting. f32 isn't `Ord`; this maps NaN to
 /// u32::MAX so it sorts last and otherwise preserves IEEE order.
 fn ordered_float(f: f32) -> u32 {
@@ -2641,6 +2651,37 @@ mod tests {
         assert_eq!(filter2, "aa");
         assert!(matches!(action2, Some(LinkAction::GoToPage(1))));
         assert!(exit2);
+    }
+
+    // ---- section jump --------------------------------------------
+
+    #[test]
+    fn next_section_forward_picks_next_outline_page() {
+        let outline = vec![0, 5, 12, 20];
+        // Mid-section page 7 → next is 12.
+        assert_eq!(next_section_target(&outline, 7, 1), Some(12));
+        // On a section start (5) → next is 12.
+        assert_eq!(next_section_target(&outline, 5, 1), Some(12));
+        // Past last section → None.
+        assert_eq!(next_section_target(&outline, 25, 1), None);
+    }
+
+    #[test]
+    fn next_section_back_picks_previous_outline_page() {
+        let outline = vec![0, 5, 12, 20];
+        // Mid-section page 15 → previous is 12 (start of current).
+        assert_eq!(next_section_target(&outline, 15, -1), Some(12));
+        // On a section start (12) → previous is 5.
+        assert_eq!(next_section_target(&outline, 12, -1), Some(5));
+        // Before first section → None.
+        assert_eq!(next_section_target(&outline, 0, -1), None);
+    }
+
+    #[test]
+    fn next_section_handles_unsorted_dup_input() {
+        let outline = vec![20, 5, 12, 5, 0]; // unsorted, with dupes
+        assert_eq!(next_section_target(&outline, 7, 1), Some(12));
+        assert_eq!(next_section_target(&outline, 7, -1), Some(5));
     }
 
     #[test]
