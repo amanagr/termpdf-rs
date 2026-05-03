@@ -190,6 +190,13 @@ pub struct App<'doc> {
     /// byte budget — whichever is tighter wins. Insertion order is
     /// tracked separately so we can LRU-evict when over budget.
     pub page_cache: HashMap<usize, DynamicImage>,
+    /// Pages currently in `page_cache` at `RenderQuality::Fast` —
+    /// they were rendered hot during a scroll and want a Sharp upgrade
+    /// once the user is idle. Pages loaded from the disk cache or
+    /// rendered at Sharp directly are NOT in this set, so the idle
+    /// path can scan it cheaply to find upgrade candidates.
+    /// See pdf::RenderQuality + main.rs::upgrade_one_visible_to_sharp.
+    pub pages_at_fast_quality: std::collections::HashSet<usize>,
     /// LRU order — most-recently-used page is at the back. Touched
     /// every time `ensure_image` reads or inserts a page.
     pub page_cache_lru: Vec<usize>,
@@ -395,6 +402,13 @@ pub struct App<'doc> {
     /// page render. `None` when the cache dir can't be determined.
     pub cache_dir: Option<PathBuf>,
 
+    /// In-app process telemetry: CPU%, temperature, RSS. Sampled at
+    /// ~1 Hz from the run-loop and rendered in the status line so the
+    /// user sees a heat / CPU spike at the moment it's caused. Built
+    /// in response to a "scrolling heats CPU 50→74°C" report — the
+    /// HUD is the truth source for diagnosing whether a fix worked.
+    pub sysinfo: crate::sysinfo::SysInfo,
+
     pub should_quit: bool,
 }
 
@@ -519,6 +533,7 @@ impl<'doc> App<'doc> {
             kitty_image_id: stable_kitty_id(),
             is_tmux,
             page_cache: HashMap::new(),
+            pages_at_fast_quality: std::collections::HashSet::new(),
             page_cache_lru: Vec::new(),
             last_scroll_dir: 0,
             failed_pages: std::collections::HashSet::new(),
@@ -566,6 +581,7 @@ impl<'doc> App<'doc> {
             next_highlight_group_id,
             awaiting_highlight_delete_confirm: false,
             cache_dir,
+            sysinfo: crate::sysinfo::SysInfo::new(),
             should_quit: false,
         };
         Ok(app)

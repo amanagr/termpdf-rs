@@ -242,6 +242,21 @@ impl KittyPageRegistry {
             .is_some_and(|e| e.transmitted_layout.is_some())
     }
 
+    /// Force `is_fresh` to return false on the next call for this
+    /// page so the next draw re-transmits, even when the per-page
+    /// revision and layout key are unchanged. Used by the Fast→Sharp
+    /// upgrade path: the bitmap content changes but neither revision
+    /// nor layout does, so without this nudge the terminal would keep
+    /// showing the Fast-quality pixels indefinitely.
+    pub fn invalidate_transmit(&mut self, page_idx: usize) {
+        if let Some(entry) = self.pages.get_mut(&page_idx) {
+            entry.transmitted_layout = None;
+            // Drop any cached encoded payload too — its bytes no
+            // longer match what we'd want to ship.
+            entry.cached_payload = None;
+        }
+    }
+
     /// True if the cached transmit for this page is fresh — caller
     /// can skip the transmit step. Read-only; pairs with
     /// `mark_transmitted` after the actual transmit string has been

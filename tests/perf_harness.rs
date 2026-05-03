@@ -636,6 +636,38 @@ fn scenarios() -> Vec<Scenario> {
                 Keys(b"-", Duration::from_millis(600)),
             ],
         },
+        // Long idle after open on a large doc — surfaces the steady-
+        // state CPU cost. With the prefetch window full, idle warm
+        // falls through to text indexing.
+        Scenario {
+            name: "idle_after_open_large",
+            fixture: FixtureSize::Large,
+            setup: vec![
+                Keys(b"g", Duration::from_millis(100)),
+                Idle(Duration::from_millis(300)),
+            ],
+            measured: vec![Idle(Duration::from_secs(5))],
+        },
+        // Casual scroll on a large book — what the user reported.
+        // Each j press lands on an uncached page; the per-scroll
+        // cost path runs end-to-end (pdfium render + bake +
+        // PNG encode + transmit + disk cache write). 30 scrolls
+        // simulates ~10 seconds of page flipping at user pace; the
+        // cpu_ms column is the heat canary.
+        Scenario {
+            name: "scroll_casual_large",
+            fixture: FixtureSize::Large,
+            setup: vec![
+                Keys(b"g", Duration::from_millis(100)),
+                Keys(b"k", Duration::from_millis(150)),
+                Idle(Duration::from_millis(300)),
+            ],
+            measured: vec![Repeat {
+                keys: b"j",
+                n: 30,
+                max_wait: Duration::from_millis(500),
+            }],
+        },
     ]
 }
 

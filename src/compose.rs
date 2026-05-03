@@ -116,6 +116,42 @@ pub fn fill_rect_blend(
     }
 }
 
+/// Paint a rectangle of fixed RGBA pixels onto `img`, OVERWRITING
+/// whatever's there. Distinct from `fill_rect_blend`: that one alpha-
+/// blends a color over the existing bitmap content (selection band
+/// over a rendered page); this one writes the alpha byte directly.
+///
+/// Used for the standalone selection-band overlay image, where the
+/// alpha byte is what makes kitty's terminal-side compositor blend
+/// the band over the page beneath. A 0.45 blend in the bake path
+/// becomes `alpha = (0.45 * 255).round() as u8 = 115` here.
+#[allow(dead_code)] // wired up by the selection-overlay-as-separate-image work
+pub fn fill_rect_rgba(
+    img: &mut RgbaImage,
+    rect: (u32, u32, u32, u32),
+    rgba: [u8; 4],
+) {
+    let (x, y, w, h) = rect;
+    let img_w = img.width() as usize;
+    let img_h = img.height() as usize;
+    let x = x as usize;
+    let y = y as usize;
+    let x2 = (x + w as usize).min(img_w);
+    let y2 = (y + h as usize).min(img_h);
+    if x >= x2 || y >= y2 {
+        return;
+    }
+    let buf: &mut [u8] = img.as_mut();
+    let stride = img_w * 4;
+    let span = (x2 - x) * 4;
+    for py in y..y2 {
+        let off = py * stride + x * 4;
+        for chunk in buf[off..off + span].chunks_exact_mut(4) {
+            chunk.copy_from_slice(&rgba);
+        }
+    }
+}
+
 pub fn outline_rect(
     img: &mut RgbaImage,
     rect: (u32, u32, u32, u32),

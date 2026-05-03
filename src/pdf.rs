@@ -114,17 +114,36 @@ pub fn page_metrics(document: &PdfDocument<'_>) -> Result<Vec<PageMetrics>> {
     Ok(out)
 }
 
-/// Supersampling factor read from `$TERMPDF_RENDER_SCALE`. The
-/// pdfium render runs at `target_width_px * scale`, then we
-/// downsample with Lanczos3 to the requested width. Net effect:
-/// crisper text and edges than rendering directly at `target_width_px`,
-/// because pdfium's anti-aliasing has more pixels to work with and
-/// Lanczos preserves the high-frequency detail when downscaling.
+/// Render-quality tier. `Fast` is the on-the-wire scroll path:
+/// render at `target_width_px` directly with pdfium's own AA. `Sharp`
+/// supersamples by `TERMPDF_RENDER_SCALE` (default 2×) then Lanczos3-
+/// downsamples; it's perceptibly crisper at the cost of ~3-4× CPU per
+/// page.
 ///
-/// Default 2.0 — empirically the sweet spot between sharpness and
-/// cold-render latency. 1.0 disables supersampling (fastest, but
-/// matches the pre-supersample blur). 3.0 squeezes a tiny bit more
-/// out at significantly higher render cost.
+/// The point of having a tiered API: cold renders fired during a
+/// scroll keystroke pay just enough work to land a readable bitmap on
+/// the wire (`Fast`), and the idle path quietly upgrades visible
+/// pages to `Sharp` while the user is reading. The user reported a
+/// 50→74°C scroll-induced heat spike on a 600-page book — that
+/// thermal envelope was almost entirely the Sharp-tier render +
+/// Lanczos3 cost firing on every scrolled-into uncached page. Fast
+/// pulls the per-scroll work down by ~70%; Sharp keeps the visible
+/// quality the same once the scroll settles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderQuality {
+    /// Render directly at `target_width_px` (no supersampling, no
+    /// downsample). ~6-10 ms for a typical 1600 px page on x86_64.
+    /// Used during active reading.
+    Fast,
+    /// Render at `target_width_px * TERMPDF_RENDER_SCALE` then
+    /// downsample with Lanczos3. ~25-40 ms for a typical 1600 px page.
+    /// Used during long-idle background refinement.
+    Sharp,
+}
+
+/// Supersampling factor for `RenderQuality::Sharp`, read from
+/// `$TERMPDF_RENDER_SCALE`. Default 2.0 is the sweet spot between
+/// sharpness and latency; 1.0 makes Sharp identical to Fast.
 fn render_scale() -> f32 {
     use std::sync::OnceLock;
     static CACHED: OnceLock<f32> = OnceLock::new();
@@ -137,18 +156,35 @@ fn render_scale() -> f32 {
     })
 }
 
-/// Render `page_idx` at exactly `target_width_px` pixels wide. The
-/// height comes from the page's aspect ratio and matches what
-/// `PageLayout::build` predicted from `PageMetrics`.
-///
-/// Internally renders at `target_width_px * render_scale()` for
-/// supersampling, then downsamples with Lanczos3 to the requested
-/// width. The supersample-then-downsample pipeline produces visibly
-/// sharper text than rendering directly at the display resolution.
+/// Render `page_idx` at exactly `target_width_px` pixels wide using
+/// `RenderQuality::Fast` — pdfium's native AA, no supersampling. The
+/// scroll path's default. ~70% faster than Sharp; visibly slightly
+/// fuzzier on ultra-fine text, indistinguishable on body copy at
+/// typical terminal cell sizes.
 pub fn render_page_at_width(
     document: &PdfDocument<'_>,
     page_idx: usize,
     target_width_px: u32,
+) -> Result<DynamicImage> {
+    render_page_at_width_quality(document, page_idx, target_width_px, RenderQuality::Fast)
+}
+
+/// Sharp variant: supersample then Lanczos3-downsample. Used by the
+/// idle refinement worker so the user reads sharp text once their
+/// scroll settles.
+pub fn render_page_sharp(
+    document: &PdfDocument<'_>,
+    page_idx: usize,
+    target_width_px: u32,
+) -> Result<DynamicImage> {
+    render_page_at_width_quality(document, page_idx, target_width_px, RenderQuality::Sharp)
+}
+
+fn render_page_at_width_quality(
+    document: &PdfDocument<'_>,
+    page_idx: usize,
+    target_width_px: u32,
+    quality: RenderQuality,
 ) -> Result<DynamicImage> {
     let pages = document.pages();
     let total = pages.len();
@@ -158,15 +194,18 @@ pub fn render_page_at_width(
     let idx = (page_idx as i32).clamp(0, total - 1);
     let page = pages.get(idx)?;
     let target = target_width_px.max(1);
-    let scale = render_scale();
     // Cap supersample at ~6000 px so wide pages at extreme zoom don't
-    // blow up to multi-hundred-MB pdfium renders. Above this width the
-    // page is already so big on screen the marginal sharpness gain
-    // from supersampling isn't worth the latency hit.
+    // blow up to multi-hundred-MB pdfium renders.
     const RENDER_W_CAP: u32 = 6000;
-    let render_w = ((target as f32 * scale).round() as u32)
-        .max(target)
-        .min(RENDER_W_CAP.max(target));
+    let render_w = match quality {
+        RenderQuality::Fast => target,
+        RenderQuality::Sharp => {
+            let scale = render_scale();
+            ((target as f32 * scale).round() as u32)
+                .max(target)
+                .min(RENDER_W_CAP.max(target))
+        }
+    };
     let config = PdfRenderConfig::new()
         .set_target_width(render_w as i32)
         // LCD-style text anti-aliasing — sharper edges than greyscale AA.
@@ -178,8 +217,6 @@ pub fn render_page_at_width(
     if render_w == target {
         return Ok(img);
     }
-    // Downsample to the display resolution. Lanczos3 preserves
-    // detail much better than Triangle/Nearest at the cost of CPU.
     let scaled_h = ((img.height() as u64 * target as u64) / render_w as u64) as u32;
     Ok(img.resize_exact(target, scaled_h.max(1), image::imageops::FilterType::Lanczos3))
 }

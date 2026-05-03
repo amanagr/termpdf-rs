@@ -253,7 +253,30 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
         draw_resume_marker(f, app, img_area);
     }
 
-    f.render_widget(status_line(app), status_area);
+    // Perf HUD pinned to the bottom-right corner. Rendered *before*
+    // the status line so the status_line area can shrink to leave
+    // room — otherwise long status messages would overpaint the HUD
+    // glyphs at the right edge. Hidden entirely if SysInfo is
+    // disabled (TERMPDF_NO_PERF_HUD=1).
+    let status_inner = if let Some((hud, hud_w)) = perf_hud(app) {
+        let hud_w = hud_w.min(status_area.width);
+        let hud_area = Rect {
+            x: status_area.x + status_area.width.saturating_sub(hud_w),
+            y: status_area.y,
+            width: hud_w,
+            height: status_area.height,
+        };
+        f.render_widget(hud, hud_area);
+        Rect {
+            x: status_area.x,
+            y: status_area.y,
+            width: status_area.width.saturating_sub(hud_w),
+            height: status_area.height,
+        }
+    } else {
+        status_area
+    };
+    f.render_widget(status_line(app), status_inner);
 
     // Confine popups to the image area so their bottom border doesn't
     // overpaint the 1-row status line below it.
@@ -1339,28 +1362,31 @@ pub(crate) fn ensure_page_rendered(
         return Ok(());
     }
 
-    // Disk-cache fast path: hit avoids the ~20 ms pdfium render +
-    // ~5 ms dark inversion (we cache the post-inversion image).
-    // `cache_dir` was resolved once at App::new — calling cache_path
-    // here would re-stat the PDF and re-scan environ on every cold
-    // page render.
+    // Disk-cache fast path: hit avoids the pdfium render entirely.
+    // Disk only stores Sharp-quality renders, so a hit means we get
+    // the highest-fidelity image for free — no upgrade needed.
     let cache_path = app
         .cache_dir
         .as_deref()
         .map(|d| crate::disk_cache::cache_path_in_dir(d, page_idx, fit_width_px, app.dark));
     if let Some(ref p) = cache_path {
         if let Some(img) = crate::disk_cache::load(p) {
-            // Sanity: pdfium-rendered widths should exactly match
-            // fit_width_px. If a stale cache file at a different width
-            // crept in, ignore and fall through.
             if img.width() == fit_width_px {
                 app.page_cache.insert(page_idx, img);
+                app.pages_at_fast_quality.remove(&page_idx);
                 app.last_compose_key = None;
                 return Ok(());
             }
         }
     }
 
+    // No disk hit → render at Fast quality (~6-10 ms vs ~25-40 ms
+    // for Sharp). Disk write is DEFERRED — the idle upgrade path
+    // re-renders this page at Sharp later and only then writes to
+    // disk, so the scroll hot path never pays for PNG encode + atomic
+    // file write. The user reported a 50→74°C scroll-induced spike
+    // on a 600-page book; this is the half of the fix that lands on
+    // the keystroke path.
     match pdf::render_page_at_width(&app.document, page_idx, fit_width_px) {
         Ok(img) => {
             let img = if app.dark {
@@ -1368,18 +1394,12 @@ pub(crate) fn ensure_page_rendered(
             } else {
                 img
             };
-            // Best-effort write to disk cache. Failures are silent —
-            // the in-memory cache below still serves this session.
-            if let Some(ref p) = cache_path {
-                let _ = crate::disk_cache::store(p, &img);
-            }
             app.page_cache.insert(page_idx, img);
+            app.pages_at_fast_quality.insert(page_idx);
             app.last_compose_key = None;
             Ok(())
         }
         Err(e) => {
-            // Mark the page so we don't keep re-attempting; surface
-            // a one-shot status line so the user knows.
             app.failed_pages.insert(page_idx);
             app.status = format!("page {}: render failed", page_idx + 1);
             if allow_failure {
@@ -1389,6 +1409,59 @@ pub(crate) fn ensure_page_rendered(
             }
         }
     }
+}
+
+/// Re-render `page_idx` at `RenderQuality::Sharp`, replacing the
+/// existing Fast-quality entry and persisting the result to the disk
+/// cache. Invalidates the per-page baked + overlay caches since their
+/// source bitmap just changed. Called from the idle path so the heat
+/// of the upgrade lands when the user's hands aren't moving.
+///
+/// Returns `Ok(true)` if an upgrade actually happened, `Ok(false)`
+/// if the page wasn't a Fast-quality candidate, and propagates render
+/// errors otherwise.
+pub(crate) fn upgrade_page_to_sharp(
+    app: &mut App<'_>,
+    page_idx: usize,
+    fit_width_px: u32,
+) -> Result<bool> {
+    if !app.pages_at_fast_quality.contains(&page_idx) {
+        return Ok(false);
+    }
+    if app.failed_pages.contains(&page_idx) {
+        return Ok(false);
+    }
+    let img = match pdf::render_page_sharp(&app.document, page_idx, fit_width_px) {
+        Ok(i) => i,
+        Err(_) => {
+            // Don't poison `failed_pages` — the Fast version is still
+            // usable. Just leave the Fast entry and try again next idle.
+            return Ok(false);
+        }
+    };
+    let img = if app.dark {
+        DynamicImage::ImageRgba8(dark::invert_luminance(img))
+    } else {
+        img
+    };
+    if let Some(d) = app.cache_dir.as_deref() {
+        let p = crate::disk_cache::cache_path_in_dir(d, page_idx, fit_width_px, app.dark);
+        let _ = crate::disk_cache::store(&p, &img);
+    }
+    app.page_cache.insert(page_idx, img);
+    app.pages_at_fast_quality.remove(&page_idx);
+    // Source pixels changed — drop the derived per-page caches and
+    // force the kitty registry to re-transmit. Neither revision nor
+    // layout key changes on a Fast→Sharp upgrade, so without
+    // explicit invalidation the next is_fresh would return true and
+    // the terminal would keep showing the Fast pixels forever.
+    app.highlights_baked_cache.remove(&page_idx);
+    app.overlay_cache.remove(&page_idx);
+    if let Some(kp) = app.kitty_pages.as_mut() {
+        kp.invalidate_transmit(page_idx);
+    }
+    app.last_compose_key = None;
+    Ok(true)
 }
 
 fn page_overlay_key(app: &App<'_>, page_idx: usize, layout: LayoutKey) -> PageOverlayKey {
@@ -1919,6 +1992,49 @@ fn status_line(app: &App<'_>) -> Paragraph<'static> {
     }
 
     Paragraph::new(Line::from(spans))
+}
+
+/// Bottom-right perf HUD: CPU% and instantaneous power draw. Color-
+/// coded so a spike draws the eye without parsing digits — green
+/// (cool) → yellow → red. Returns the rendered Paragraph plus the
+/// width in cells it should consume so the caller can right-align
+/// it without measuring the formatted width separately. Zero-cost
+/// when sysinfo is disabled.
+fn perf_hud(app: &App<'_>) -> Option<(Paragraph<'static>, u16)> {
+    if app.sysinfo.disabled {
+        return None;
+    }
+    let s = app.sysinfo.cur;
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(4);
+    let cpu_color = if s.cpu_pct >= 50.0 {
+        Color::Red
+    } else if s.cpu_pct >= 25.0 {
+        Color::Yellow
+    } else {
+        Color::Green
+    };
+    let cpu_text = format!("cpu {:>3.0}%", s.cpu_pct);
+    let cpu_text_w = cpu_text.chars().count() as u16;
+    spans.push(Span::styled(cpu_text, Style::default().fg(cpu_color)));
+
+    let mut total_w = cpu_text_w;
+    if let Some(p) = s.power_w {
+        // Color thresholds for power: <8 W idle/light, 8–15 W moderate,
+        // ≥15 W heavy. Tuned for laptop-class hardware; AC-only systems
+        // tend to read 0 W and the column color stays green.
+        let p_color = if p >= 15.0 {
+            Color::Red
+        } else if p >= 8.0 {
+            Color::Yellow
+        } else {
+            Color::Green
+        };
+        let pw = format!("  {:>4.1} W", p);
+        let pw_w = pw.chars().count() as u16;
+        spans.push(Span::styled(pw, Style::default().fg(p_color)));
+        total_w = total_w.saturating_add(pw_w);
+    }
+    Some((Paragraph::new(Line::from(spans)), total_w))
 }
 
 fn draw_toc(f: &mut Frame, app: &mut App<'_>, area: Rect) {

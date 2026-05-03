@@ -33,6 +33,7 @@ mod render_worker;
 mod search;
 mod search_index;
 mod session;
+mod sysinfo;
 mod textlayout;
 mod ui;
 
@@ -365,6 +366,10 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
             should_draw = false;
         }
         if should_draw {
+            // Refresh CPU/temp/RSS HUD before the draw reads them.
+            // maybe_sample is throttled internally to ~1 Hz so the
+            // per-frame call cost is one Instant::now + comparison.
+            app.sysinfo.maybe_sample();
             let _draw = profile::span(profile::Phase::Draw);
             term.draw(|f| ui::draw(f, app))?;
             drop(_draw);
@@ -495,6 +500,17 @@ fn warm_one_idle(app: &mut App<'_>, action: IdleAction) -> Result<()> {
     let do_text = action == IdleAction::BitmapWarmAndTextIndex;
     for _ in 0..MAX_WARMS_PER_IDLE {
         if !warm_next_uncached(app)? {
+            // Bitmap prefetch is full → spend the rest of the idle
+            // tick on whichever quality / index work remains. Order:
+            //   1. Upgrade one visible page from Fast → Sharp so the
+            //      user sees crisp text after a settle.
+            //   2. Then text indexing if we're past the deeper idle
+            //      threshold.
+            // Doing the upgrade FIRST keeps the visible quality
+            // converging quickly; text indexing has a longer runway
+            // (its results enter via `n` after a `/` query) and is
+            // fine to run after.
+            let _ = upgrade_one_visible_to_sharp(app);
             if do_text {
                 index_one_page_text(app);
             }
@@ -508,6 +524,31 @@ fn warm_one_idle(app: &mut App<'_>, action: IdleAction) -> Result<()> {
         index_one_page_text(app);
     }
     Ok(())
+}
+
+/// Re-render at most one visible Fast-quality page at Sharp quality.
+/// Returns Ok(true) on a successful upgrade, Ok(false) if no candidate.
+/// Caller is the idle path so the ~25-40 ms pdfium hit lands while
+/// the user's hands aren't moving.
+fn upgrade_one_visible_to_sharp(app: &mut App<'_>) -> Result<bool> {
+    let viewport_h = app.viewport_px.1;
+    if viewport_h == 0 {
+        return Ok(false);
+    }
+    if app.pages_at_fast_quality.is_empty() {
+        return Ok(false);
+    }
+    let visible: Vec<usize> = app
+        .layout
+        .visible_pages(app.scroll_y_px, viewport_h)
+        .collect();
+    let fit_width_px = app.layout.fit_width_px;
+    for &pi in &visible {
+        if app.pages_at_fast_quality.contains(&pi) {
+            return ui::upgrade_page_to_sharp(app, pi, fit_width_px);
+        }
+    }
+    Ok(false)
 }
 
 /// Extract text for the next un-indexed page and add to the search
