@@ -735,15 +735,14 @@ fn draw_link_hints(
 
         // Write the label chars across consecutive cells.
         let label = &hint.label;
+        let mut utf8_buf = [0u8; 4];
         for (i, ch) in label.chars().enumerate() {
             let x = cell_x.saturating_add(i as u16);
             if x >= area.right() || cell_y >= area.bottom() {
                 break;
             }
             if let Some(cell) = buf.cell_mut((x, cell_y)) {
-                let mut s = String::new();
-                s.push(ch);
-                cell.set_symbol(&s);
+                cell.set_symbol(ch.encode_utf8(&mut utf8_buf));
                 cell.set_style(style);
                 cell.set_skip(false);
             }
@@ -1412,7 +1411,7 @@ fn compose_into_buffer(app: &mut App<'_>, viewport_w: u32, viewport_h: u32) -> R
 
     let fit_width_px = app.layout.fit_width_px;
     let scroll_y = app.scroll_y_px;
-    let visible: Vec<usize> = app.layout.visible_pages(scroll_y, viewport_h).collect();
+    let visible = app.layout.visible_pages(scroll_y, viewport_h);
 
     let page_x_origin: i64 = if fit_width_px <= viewport_w {
         ((viewport_w - fit_width_px) / 2) as i64
@@ -1423,7 +1422,7 @@ fn compose_into_buffer(app: &mut App<'_>, viewport_w: u32, viewport_h: u32) -> R
     // Build a list of (start_row, end_row) extents that the visible
     // pages cover in the viewport. Then fill the inverse with bg.
     let mut covered: Vec<(i64, i64)> = Vec::with_capacity(visible.len());
-    for &page_idx in &visible {
+    for page_idx in visible.clone() {
         let page_doc_y = app.layout.page_y(page_idx);
         let page_h = app.layout.page_h(page_idx) as i64;
         let top = (page_doc_y - scroll_y).max(0);
