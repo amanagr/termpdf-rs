@@ -391,7 +391,19 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     let layout_key = LayoutKey { fit_width_px, dark: app.dark };
 
     let visible_range = app.layout.visible_pages(app.scroll_y_px, viewport_h);
-    let visible: Vec<usize> = visible_range.clone().collect();
+    // Filter out pages whose visible region rounds to 0 cells. The
+    // layout treats a page with even 1 pixel intersecting the
+    // viewport as "visible", but after cell-quantization the
+    // placement loop would discard it — we'd pay pdfium + overlay
+    // + transmit cost for a page the user can't even see. Common at
+    // the inter-page gap when the user lands a scroll between two
+    // page boundaries.
+    let visible: Vec<usize> = visible_range
+        .clone()
+        .filter(|&pi| {
+            visible_cell_height(&app.layout, app.scroll_y_px, area.height, pi, app.picker.font_size().1 as u32) > 0
+        })
+        .collect();
     if visible.is_empty() {
         return Ok(());
     }
@@ -626,6 +638,35 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     kp.evict_to_budget(&visible);
 
     Ok(())
+}
+
+/// How many cell-rows of this page actually intersect the viewport
+/// after cell-quantizing the scroll offset. Returns 0 for pages whose
+/// pixel intersection rounds away — common at inter-page gaps.
+///
+/// Pre-render check used to filter `visible_pages` so we don't pay
+/// pdfium + overlay + transmit cost for pages the user can't see.
+fn visible_cell_height(
+    layout: &crate::layout::PageLayout,
+    scroll_y_px: i64,
+    viewport_h_cells: u16,
+    page_idx: usize,
+    cell_h_px: u32,
+) -> u16 {
+    let cell_h = cell_h_px.max(1);
+    let page_doc_y = layout.page_y(page_idx);
+    let page_h_px = layout.page_h(page_idx);
+    if page_h_px == 0 {
+        return 0;
+    }
+    let src_top_px = (scroll_y_px - page_doc_y).max(0) as u32;
+    let dst_top_px = (page_doc_y - scroll_y_px).max(0) as u32;
+    let dst_top_cell = (dst_top_px / cell_h) as u16;
+    let src_top_cell = (src_top_px / cell_h) as u16;
+    let img_h_cells = (page_h_px / cell_h) as u16;
+    let max_dst_rows = viewport_h_cells.saturating_sub(dst_top_cell);
+    let max_src_rows = img_h_cells.saturating_sub(src_top_cell);
+    max_dst_rows.min(max_src_rows)
 }
 
 /// Per-page revision: hash of every overlay-affecting field except
@@ -2098,5 +2139,40 @@ mod tests {
             content.contains("? help"),
             "help title not rendered: contents=\n{content}"
         );
+    }
+
+    // ---- visible_cell_height -----------------------------------------
+
+    #[test]
+    fn visible_cell_height_zero_when_below_source_grid() {
+        use crate::layout::PageLayout;
+        use crate::pdf::PageMetrics;
+        // Two 100×100 pages with no gap. Cell height = 16 px.
+        // 100 / 16 = 6 source cells per page (last 4 px lost to
+        // cell-quantization on purpose).
+        let m = vec![
+            PageMetrics { width_pts: 100.0, height_pts: 100.0 },
+            PageMetrics { width_pts: 100.0, height_pts: 100.0 },
+        ];
+        let l = PageLayout::build(&m, 100, 0);
+        // Scroll to y=96: src_top_cell=6 ≥ img_h_cells=6, so page 0
+        // has no source cells left to draw — function must return 0.
+        // (Pixel-wise 4 px of page 0 still intersect the viewport,
+        // but cell quantization rounds those away.)
+        let h0 = visible_cell_height(&l, 96, /*viewport_h_cells*/ 50, 0, /*cell_h_px*/ 16);
+        assert_eq!(h0, 0, "page 0 should have no source cells past row 96");
+        let h1 = visible_cell_height(&l, 96, 50, 1, 16);
+        assert!(h1 > 0, "page 1 should be visible");
+    }
+
+    #[test]
+    fn visible_cell_height_positive_for_top_of_doc() {
+        use crate::layout::PageLayout;
+        use crate::pdf::PageMetrics;
+        let m = vec![PageMetrics { width_pts: 100.0, height_pts: 100.0 }];
+        let l = PageLayout::build(&m, 100, 0);
+        let h = visible_cell_height(&l, 0, /*viewport_h_cells*/ 10, 0, /*cell_h_px*/ 16);
+        // 100 px / 16 px/cell = 6 cells; viewport allows 10, so 6 wins.
+        assert_eq!(h, 6);
     }
 }
