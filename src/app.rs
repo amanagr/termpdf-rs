@@ -2499,7 +2499,12 @@ impl<'doc> App<'doc> {
             .text_cache
             .get_or_load(&self.document, h.page, &metrics)
             .ok()?;
-        let mut idxs: Vec<usize> = Vec::new();
+        // We only need the first and last hits to feed `extract`, so
+        // track them directly instead of materialising the full index
+        // list. On a long highlight this avoids growing a Vec to
+        // hundreds of usizes per call.
+        let mut start: Option<usize> = None;
+        let mut end: usize = 0;
         for (i, c) in pt.chars.iter().enumerate() {
             if c.is_generated {
                 continue;
@@ -2507,14 +2512,13 @@ impl<'doc> App<'doc> {
             let cx = c.bbox.x + c.bbox.w * 0.5;
             let cy = c.bbox.y + c.bbox.h * 0.5;
             if cx >= h.x && cx <= h.x + h.w && cy >= h.y && cy <= h.y + h.h {
-                idxs.push(i);
+                if start.is_none() {
+                    start = Some(i);
+                }
+                end = i;
             }
         }
-        if idxs.is_empty() {
-            return None;
-        }
-        let start = *idxs.first().unwrap();
-        let end = *idxs.last().unwrap();
+        let start = start?;
         Some(pt.extract(start, end))
     }
 }
