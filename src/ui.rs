@@ -863,17 +863,11 @@ fn try_scroll_shift_canvas(
     if abs_dy >= viewport_h as usize {
         return None;
     }
-    // Peek at dimensions before taking — if the buffer is from a
-    // previous viewport size we don't want to consume it here only
-    // to drop it and force compose_into_buffer to reallocate. By
-    // returning None *without* taking, the buffer survives for the
-    // next try_selection_only_repaint or compose_into_buffer call,
-    // which can either resize-replace it or use it as-is.
-    match app.canvas_buf.as_ref() {
-        Some(c) if c.width() == viewport_w && c.height() == viewport_h => {}
-        _ => return None,
-    }
     let mut canvas = app.canvas_buf.take()?;
+    if canvas.width() != viewport_w || canvas.height() != viewport_h {
+        // Stale buffer from a previous size; force the fallback.
+        return None;
+    }
 
     let stride = (viewport_w as usize) * 4;
     shift_canvas_rows(canvas.as_mut(), viewport_w, viewport_h, dy);
@@ -962,15 +956,10 @@ fn try_selection_only_repaint(
         // already short-circuits here. Defensive return None.
         return None;
     }
-    // Peek at the buffer's dimensions before taking. Same trick as
-    // in try_scroll_shift_canvas: returning None without consuming
-    // the buffer lets compose_into_buffer reuse the allocation
-    // instead of throwing it away and reallocating 8 MB at 1080p.
-    match app.canvas_buf.as_ref() {
-        Some(c) if c.width() == viewport_w && c.height() == viewport_h => {}
-        _ => return None,
-    }
     let mut canvas = app.canvas_buf.take()?;
+    if canvas.width() != viewport_w || canvas.height() != viewport_h {
+        return None;
+    }
 
     let fit_width_px = app.layout.fit_width_px;
     let visible: Vec<usize> = app
