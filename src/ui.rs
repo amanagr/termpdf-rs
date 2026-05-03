@@ -27,7 +27,7 @@ use ratatui::Frame;
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::StatefulImage;
 
-use crate::app::{App, ComposeKey, LayoutKey, Mode, PageOverlayKey};
+use crate::app::{App, ComposeKey, HighlightsBakedKey, LayoutKey, Mode, PageOverlayKey};
 use crate::compose::{fill_rect_blend, norm_to_pixels, outline_rect};
 use crate::dark;
 use crate::highlight::{rgb_from_hex, Rect01, HIGHLIGHT_COLORS};
@@ -299,11 +299,16 @@ fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
         ensure_overlay(app, page_idx, layout_key);
     }
 
-    // Reuse a viewport-sized canvas across recomposes; only allocate
-    // when the viewport changes size. The compose step paints over
-    // every pixel that comes from a visible page; we only need to
-    // refresh the inter-page gap rows (cheap) before blitting.
-    let canvas = compose_into_buffer(app, viewport_w, viewport_h);
+    // Scroll-shift fast path: when the recompose was triggered ONLY
+    // by a scroll_y_px change (everything else in ComposeKey matched
+    // the previous frame), we can reuse the previous canvas's pixel
+    // contents — just memmove the rows by ΔY and only repaint the
+    // freshly-exposed strip. Replaces N page-blits with one memmove
+    // + one strip-blit when the scroll is smaller than the viewport.
+    let canvas = match try_scroll_shift_canvas(app, &compose_key, viewport_w, viewport_h) {
+        Some(c) => c,
+        None => compose_into_buffer(app, viewport_w, viewport_h),
+    };
 
     // Hash-equal skip: if the just-composed canvas matches the
     // previously-encoded one byte-for-byte, no need to rebuild
@@ -321,6 +326,142 @@ fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
     app.canvas_buf = Some(canvas);
     app.last_compose_key = Some(compose_key);
     Ok(())
+}
+
+/// Scroll-shift optimisation: when the only ComposeKey field that
+/// changed since the last frame is `scroll_y_px`, and the absolute
+/// delta is < viewport_h, reuse the previous canvas by `copy_within`-
+/// shifting its rows by ΔY and repainting only the newly-exposed
+/// strip (top or bottom). Saves all the per-page blit work for pages
+/// that were already on the canvas at their new position.
+///
+/// Returns `None` when:
+///   - this is the first frame (no previous compose_key)
+///   - any non-scroll field of ComposeKey differs (layout change,
+///     viewport resize, highlight edit, selection move)
+///   - the canvas dims don't match (resize)
+///   - |ΔY| ≥ viewport_h (full rebuild is cheaper than chasing
+///     pages whose entire frame is now off-canvas)
+///   - canvas_buf is missing
+///
+/// In any of those cases the caller falls back to the full compose
+/// path, which still benefits from canvas reuse + the highlights-baked
+/// tier.
+fn try_scroll_shift_canvas(
+    app: &mut App<'_>,
+    new_key: &ComposeKey,
+    viewport_w: u32,
+    viewport_h: u32,
+) -> Option<RgbaImage> {
+    let prev = app.last_compose_key.as_ref()?;
+    // Every field except scroll_y_px must match.
+    if prev.layout != new_key.layout
+        || prev.viewport_w != new_key.viewport_w
+        || prev.viewport_h != new_key.viewport_h
+        || prev.scroll_x_milli != new_key.scroll_x_milli
+        || prev.highlight_revision != new_key.highlight_revision
+        || prev.selection_sig != new_key.selection_sig
+    {
+        return None;
+    }
+    let dy = new_key.scroll_y_px - prev.scroll_y_px;
+    if dy == 0 {
+        // No-op scroll. Caller's hash-skip will catch the canvas
+        // reuse; nothing to do here.
+        return app.canvas_buf.take();
+    }
+    let abs_dy = dy.unsigned_abs() as usize;
+    if abs_dy >= viewport_h as usize {
+        return None;
+    }
+    let mut canvas = app.canvas_buf.take()?;
+    if canvas.width() != viewport_w || canvas.height() != viewport_h {
+        // Stale buffer from a previous size; force the fallback.
+        return None;
+    }
+
+    let stride = (viewport_w as usize) * 4;
+    shift_canvas_rows(canvas.as_mut(), viewport_w, viewport_h, dy);
+
+    // Repaint only the freshly-exposed strip.
+    let (strip_y0, strip_y1) = if dy > 0 {
+        (viewport_h as i64 - abs_dy as i64, viewport_h as i64)
+    } else {
+        (0, abs_dy as i64)
+    };
+
+    let bg = if app.dark {
+        Rgba([20, 20, 20, 255])
+    } else {
+        Rgba([240, 240, 240, 255])
+    };
+    let bg_row: Vec<u8> = (0..viewport_w).flat_map(|_| bg.0).collect();
+    let buf = canvas.as_mut();
+    for y in strip_y0..strip_y1 {
+        let off = (y as usize) * stride;
+        buf[off..off + stride].copy_from_slice(&bg_row);
+    }
+
+    // Now blit the visible pages over the strip. The pages outside
+    // the strip already have correct pixels (carried over by the
+    // memmove). For pages that intersect the strip, we re-blit the
+    // whole page; blit_clipped naturally clips the parts that are
+    // outside the strip.
+    let fit_width_px = app.layout.fit_width_px;
+    let visible = app.layout.visible_pages(app.scroll_y_px, viewport_h);
+    let page_x_origin: i64 = if fit_width_px <= viewport_w {
+        ((viewport_w - fit_width_px) / 2) as i64
+    } else {
+        -(((fit_width_px - viewport_w) as f32) * app.scroll_x).round() as i64
+    };
+    for page_idx in visible {
+        let page_doc_y = app.layout.page_y(page_idx);
+        let page_h = app.layout.page_h(page_idx) as i64;
+        let page_top_in_viewport = page_doc_y - app.scroll_y_px;
+        let page_bot_in_viewport = page_top_in_viewport + page_h;
+        // Skip pages that don't touch the exposed strip.
+        if page_bot_in_viewport <= strip_y0 || page_top_in_viewport >= strip_y1 {
+            continue;
+        }
+        let Some((page_img, _)) = app.overlay_cache.get(&page_idx) else {
+            continue;
+        };
+        // Constrain the blit to the strip rows. Easiest: clip the
+        // canvas writes by writing to a scratch view. Cheapest
+        // implementation: just blit the whole page — pixels outside
+        // the strip get rewritten with the same content they
+        // already had (this page didn't move). Correctness guaranteed.
+        blit_clipped(&mut canvas, page_x_origin, page_top_in_viewport, page_img);
+    }
+
+    Some(canvas)
+}
+
+/// Pure helper: shift the rows of `buf` by `dy` viewport pixels.
+/// `dy > 0` = scroll down (content moves UP on the canvas). `dy < 0`
+/// = scroll up (content moves DOWN). Caller is responsible for
+/// repainting the freshly-exposed strip; this only does the memmove.
+///
+/// Extracted so the row-shift arithmetic has a regression test that
+/// doesn't need an App or a full render pipeline.
+pub fn shift_canvas_rows(buf: &mut [u8], viewport_w: u32, viewport_h: u32, dy: i64) {
+    if dy == 0 {
+        return;
+    }
+    let stride = (viewport_w as usize) * 4;
+    let abs_dy = dy.unsigned_abs() as usize;
+    if abs_dy >= viewport_h as usize {
+        return;
+    }
+    if dy > 0 {
+        let src_start = abs_dy * stride;
+        let src_end = (viewport_h as usize) * stride;
+        buf.copy_within(src_start..src_end, 0);
+    } else {
+        let src_end = ((viewport_h as usize) - abs_dy) * stride;
+        let dst = abs_dy * stride;
+        buf.copy_within(0..src_end, dst);
+    }
 }
 
 /// FNV-1a 64-bit over the raw RGBA bytes. Cheap (~1 GB/s on a single
@@ -402,45 +543,38 @@ fn page_overlay_key(app: &App<'_>, page_idx: usize, layout: LayoutKey) -> PageOv
     }
 }
 
-/// Build (or refresh) the cached overlay bitmap for `page_idx`. The
-/// overlay bitmap is the raw pdfium output with saved highlights
-/// for this page alpha-blended in, plus the Visual-mode selection
-/// if it currently lives on this page. During a mouse-drag this
-/// runs only for the page under the cursor — every other visible
-/// page reuses its already-overlaid bitmap.
+/// Build (or refresh) the cached overlay bitmap for `page_idx`.
+/// Two-tier:
+///   1. **highlights_baked**: page bitmap with saved highlights and
+///      search hits blended in. Keyed without selection_sig, so it
+///      survives every Visual-mode keystroke.
+///   2. **overlay_cache**: highlights_baked + the live selection
+///      band. Keyed with selection_sig so it rebuilds on motion.
+///
+/// Net win: on selection move we no longer re-blend the saved
+/// highlights / search hits; we clone the highlights_baked image
+/// and paint just the selection band on top. For a heavily
+/// highlighted page the saved-N×fill_rect_blend disappears.
 fn ensure_overlay(app: &mut App<'_>, page_idx: usize, layout: LayoutKey) {
-    let key = page_overlay_key(app, page_idx, layout);
+    let overlay_key = page_overlay_key(app, page_idx, layout);
     if app
         .overlay_cache
         .get(&page_idx)
-        .map(|(_, k)| *k == key)
+        .map(|(_, k)| *k == overlay_key)
         .unwrap_or(false)
     {
         return;
     }
-    let Some(src) = app.page_cache.get(&page_idx) else {
+
+    // Tier 1: highlights baked. Built once per (highlights, search,
+    // layout) change and reused across every selection move.
+    ensure_highlights_baked(app, page_idx, layout);
+    let Some((baked, _)) = app.highlights_baked_cache.get(&page_idx) else {
         return;
     };
-    let mut img = src.to_rgba8();
+    let mut img = baked.clone();
 
-    // Saved highlights for this page → translucent fill, no border.
-    for h in app.highlights.for_page(page_idx) {
-        let rect = norm_to_pixels(
-            Rect01 { x: h.x, y: h.y, w: h.w, h: h.h },
-            img.width(),
-            img.height(),
-        );
-        let rgb = rgb_from_hex(&h.color);
-        fill_rect_blend(&mut img, rect, rgb, 0.35);
-    }
-    // Active Visual-mode selection (if it lives on this page) → bake
-    // a slightly stronger translucent fill at the same position the
-    // saved highlight would land. This goes through the kitty re-upload
-    // path that already works in tmux+Ghostty, instead of trying to
-    // overwrite placeholder cells (which the renderer skips because
-    // ratatui-image packs each row's escape into col 0 and uses the
-    // remaining cells' width attribute to advance the cursor — a
-    // post-image cell write never reaches the wire).
+    // Tier 2: paint the live selection band on top.
     if let Some(sel) = app.text_selection {
         if let Some(pt) = app.text_cache.get(page_idx) {
             bake_selection_into_page(
@@ -454,14 +588,57 @@ fn ensure_overlay(app: &mut App<'_>, page_idx: usize, layout: LayoutKey) {
         }
     }
 
-    // Search hits on this page → orange translucent fill; the
-    // current hit additionally gets a thicker outline so the user
-    // can see *which* match `n`/`N` is on without reading the count.
+    app.overlay_cache.insert(page_idx, (img, overlay_key));
+}
+
+/// Build the highlights-baked tier for `page_idx` if its key changed.
+/// Touches the per-highlight loop and the per-search-hit loop —
+/// both of which used to run on every Visual-mode keystroke. Now
+/// they only run when the highlights/search state itself changes.
+fn ensure_highlights_baked(app: &mut App<'_>, page_idx: usize, layout: LayoutKey) {
+    let (search_revision, has_search_hits, current_hit_on_this_page) = match &app.search {
+        Some(s) => {
+            let any = s.hits.iter().any(|h| h.page == page_idx);
+            let cur = s.current_hit().map(|h| h.page == page_idx).unwrap_or(false);
+            (s.revision, any, cur)
+        }
+        None => (0, false, false),
+    };
+    let key = HighlightsBakedKey {
+        layout,
+        highlight_revision: app.highlight_revision,
+        search_revision,
+        has_search_hits,
+        current_hit_on_this_page,
+    };
+    if app
+        .highlights_baked_cache
+        .get(&page_idx)
+        .map(|(_, k)| *k == key)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let Some(src) = app.page_cache.get(&page_idx) else {
+        return;
+    };
+    let mut img = src.to_rgba8();
+
+    for h in app.highlights.for_page(page_idx) {
+        let rect = norm_to_pixels(
+            Rect01 { x: h.x, y: h.y, w: h.w, h: h.h },
+            img.width(),
+            img.height(),
+        );
+        let rgb = rgb_from_hex(&h.color);
+        fill_rect_blend(&mut img, rect, rgb, 0.35);
+    }
+
     if let Some(s) = &app.search {
         let current_idx = s.current;
         for (i, hit) in s.hits.iter().enumerate().filter(|(_, h)| h.page == page_idx) {
             let rect = norm_to_pixels(hit.rect, img.width(), img.height());
-            let color = (255u8, 165, 0); // orange
+            let color = (255u8, 165, 0);
             fill_rect_blend(&mut img, rect, color, 0.45);
             if i == current_idx {
                 outline_rect(&mut img, rect, (255, 80, 0), 3);
@@ -469,7 +646,7 @@ fn ensure_overlay(app: &mut App<'_>, page_idx: usize, layout: LayoutKey) {
         }
     }
 
-    app.overlay_cache.insert(page_idx, (img, key));
+    app.highlights_baked_cache.insert(page_idx, (img, key));
 }
 
 /// Paint the viewport canvas: stitch the cached overlay bitmap of
@@ -922,6 +1099,71 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::Terminal;
     use crate::textlayout::{Caret, CharCell, LineSpan, PageText, SelMode, TextSelection};
+
+    // ---- Scroll-shift fast path -------------------------------------
+
+    /// Building block: rows shift, exposed strip is left untouched
+    /// for the caller to repaint. Use a tiny 4×4 buffer where each
+    /// pixel's R channel encodes its original row index, so the
+    /// shift result is trivial to verify.
+    #[test]
+    fn shift_canvas_rows_scrolls_content_down_then_up() {
+        // 4 rows × 1 column-equivalent (pretend cell is 4 bytes/row).
+        let w = 1u32;
+        let h = 4u32;
+        let stride = 4usize;
+        let mut buf = vec![0u8; (h as usize) * stride];
+        for y in 0..h {
+            // R = row index, G/B/A = 0/0/255 so we can identify each row.
+            let off = (y as usize) * stride;
+            buf[off] = y as u8;
+            buf[off + 3] = 255;
+        }
+
+        // dy = +1: scroll down ⇒ content moves UP. Row 0 should now
+        // hold what was at row 1, row 1 ← row 2, row 2 ← row 3.
+        // Row 3 is the exposed strip — caller will overwrite, but
+        // we're not testing that here.
+        shift_canvas_rows(&mut buf, w, h, 1);
+        assert_eq!(buf[0 * stride], 1, "row 0 should hold ex-row-1");
+        assert_eq!(buf[1 * stride], 2, "row 1 should hold ex-row-2");
+        assert_eq!(buf[2 * stride], 3, "row 2 should hold ex-row-3");
+
+        // Reset.
+        for y in 0..h {
+            let off = (y as usize) * stride;
+            buf[off] = y as u8;
+        }
+        // dy = -2: scroll up by 2. Content moves DOWN by 2 rows.
+        // Row 2 ← row 0, row 3 ← row 1. Rows 0,1 are exposed.
+        shift_canvas_rows(&mut buf, w, h, -2);
+        assert_eq!(buf[2 * stride], 0, "row 2 should hold ex-row-0");
+        assert_eq!(buf[3 * stride], 1, "row 3 should hold ex-row-1");
+    }
+
+    /// `dy == 0` and `|dy| >= viewport_h` are both no-ops (the latter
+    /// because the entire canvas would be exposed and a memmove is
+    /// pointless). The buffer must be unchanged in both cases.
+    #[test]
+    fn shift_canvas_rows_no_op_at_boundaries() {
+        let w = 1u32;
+        let h = 4u32;
+        let stride = 4usize;
+        let mut buf = vec![0u8; (h as usize) * stride];
+        for y in 0..h {
+            buf[(y as usize) * stride] = y as u8;
+        }
+        let snapshot = buf.clone();
+
+        shift_canvas_rows(&mut buf, w, h, 0);
+        assert_eq!(buf, snapshot, "dy=0 must leave buffer untouched");
+
+        shift_canvas_rows(&mut buf, w, h, 4);
+        assert_eq!(buf, snapshot, "dy >= viewport_h must leave buffer untouched");
+
+        shift_canvas_rows(&mut buf, w, h, -4);
+        assert_eq!(buf, snapshot, "|dy| >= viewport_h must leave buffer untouched");
+    }
 
     // ---- Selection bake (the real "is the user seeing it" test) ----
 

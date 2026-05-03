@@ -37,6 +37,23 @@ pub struct LayoutKey {
     pub dark: bool,
 }
 
+/// Cache key for the *highlights-baked* tier — page bitmap with
+/// saved highlights and search hits alpha-blended in, but NO live
+/// selection. Rebuilt only when highlights or search results change;
+/// reused across every Visual-mode keystroke. The overlay tier
+/// (which adds the live selection) clones from this instead of from
+/// the raw page bitmap, so selection-only motions never re-blend
+/// the saved-highlights list — a big win on heavily-highlighted
+/// pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HighlightsBakedKey {
+    pub layout: LayoutKey,
+    pub highlight_revision: u64,
+    pub search_revision: u64,
+    pub has_search_hits: bool,
+    pub current_hit_on_this_page: bool,
+}
+
 /// Cache key for the *per-page overlay* tier. The composited
 /// (with-overlays) RgbaImage cached in `overlay_cache` is keyed on
 /// this so a mouse-drag selection only rebuilds the bitmap of the
@@ -175,6 +192,13 @@ pub struct App<'doc> {
     /// what the drag-time hot path reads — without it, every
     /// mouse-move event re-cloned every visible page.
     pub overlay_cache: HashMap<usize, (RgbaImage, PageOverlayKey)>,
+    /// Per-page bitmap with saved highlights and search hits blended
+    /// in — but NOT the live selection. Reused across every
+    /// Visual-mode keystroke (selection_sig is intentionally absent
+    /// from `HighlightsBakedKey`). On selection move we clone from
+    /// here instead of from `page_cache`, skipping the per-highlight
+    /// blend loop.
+    pub highlights_baked_cache: HashMap<usize, (RgbaImage, HighlightsBakedKey)>,
     pub image_proto: Option<StatefulProtocol>,
     pub last_compose_key: Option<ComposeKey>,
     /// Reused viewport-sized RGBA buffer. Allocating an 8 MB
@@ -349,6 +373,7 @@ impl<'doc> App<'doc> {
             last_scroll_dir: 0,
             failed_pages: std::collections::HashSet::new(),
             overlay_cache: HashMap::new(),
+            highlights_baked_cache: HashMap::new(),
             image_proto: None,
             canvas_buf: None,
             last_canvas_hash: 0,
@@ -426,6 +451,7 @@ impl<'doc> App<'doc> {
         self.last_layout_key = Some(key);
         self.page_cache.clear();
         self.overlay_cache.clear();
+        self.highlights_baked_cache.clear();
         // A page can OOM at huge zoom but render fine after the user
         // zooms back out — don't keep it permanently blacklisted.
         self.failed_pages.clear();
@@ -442,6 +468,7 @@ impl<'doc> App<'doc> {
         let hi = visible.end.saturating_add(MARGIN);
         self.page_cache.retain(|&k, _| k >= lo && k < hi);
         self.overlay_cache.retain(|&k, _| k >= lo && k < hi);
+        self.highlights_baked_cache.retain(|&k, _| k >= lo && k < hi);
         self.page_cache_lru.retain(|&k| k >= lo && k < hi);
         // The text-layout cache holds char bbox + line index per page;
         // a few hundred KB per page in dense documents. Drop any entry
@@ -503,6 +530,9 @@ impl<'doc> App<'doc> {
                 total = total.saturating_sub((img.width() * img.height() * 4) as usize);
             }
             if let Some((img, _)) = self.overlay_cache.remove(&p) {
+                total = total.saturating_sub((img.width() * img.height() * 4) as usize);
+            }
+            if let Some((img, _)) = self.highlights_baked_cache.remove(&p) {
                 total = total.saturating_sub((img.width() * img.height() * 4) as usize);
             }
             self.page_cache_lru.retain(|&x| x != p);
