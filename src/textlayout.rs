@@ -248,46 +248,58 @@ impl PageText {
     /// Index of the next word-start at or after `from`, walking
     /// forward across lines if necessary. Returns the last char on
     /// the page if no further word-start exists.
+    ///
+    /// Walks through lines until it finds one with a word_start —
+    /// previously this stopped after the very next line, so a `w`
+    /// motion across two consecutive blank/whitespace-only lines
+    /// would land on the whitespace instead of the actual next word
+    /// (vim's `w` keeps walking).
     pub fn next_word_start(&self, from: usize) -> usize {
-        let mut from_line = self.line_of(from).unwrap_or(0);
-        // First check the rest of the current line.
-        loop {
-            let span = match self.lines.get(from_line) {
-                Some(s) => s,
-                None => break,
-            };
+        let start_line = self.line_of(from).unwrap_or(0);
+        // First, look on the current line for any word-start past `from`.
+        if let Some(span) = self.lines.get(start_line) {
             for &ws in &span.word_starts {
                 if ws > from {
                     return ws;
                 }
             }
-            from_line += 1;
-            // Wrap into the next line — its first word_start (if any)
-            // is the next word; otherwise its start_idx.
-            if let Some(next) = self.lines.get(from_line) {
-                if let Some(&ws) = next.word_starts.first() {
-                    return ws;
-                }
-                return next.start_idx;
+        }
+        // Otherwise, walk subsequent lines until we hit one that
+        // genuinely starts a word.
+        let mut line_idx = start_line + 1;
+        while let Some(span) = self.lines.get(line_idx) {
+            if let Some(&ws) = span.word_starts.first() {
+                return ws;
             }
-            break;
+            line_idx += 1;
         }
         self.chars.len().saturating_sub(1)
     }
 
     /// Index of the previous word-start at or before `from`. Returns
     /// `0` if none.
+    ///
+    /// Walks through preceding lines until one with an actual
+    /// word_start is found, mirroring `next_word_start`. The earlier
+    /// version only inspected the immediately previous line, so a
+    /// `b` motion across two whitespace-only lines could land on
+    /// pure whitespace instead of the closest real word.
     pub fn prev_word_start(&self, from: usize) -> usize {
-        let mut line_idx = self.line_of(from).unwrap_or(0);
-        loop {
-            let span = match self.lines.get(line_idx) {
-                Some(s) => s,
-                None => return 0,
-            };
-            // Walk word_starts in reverse, looking for one strictly
-            // less than `from`.
+        let start_line = self.line_of(from).unwrap_or(0);
+        if let Some(span) = self.lines.get(start_line) {
             for &ws in span.word_starts.iter().rev() {
                 if ws < from {
+                    return ws;
+                }
+            }
+        }
+        if start_line == 0 {
+            return 0;
+        }
+        let mut line_idx = start_line - 1;
+        loop {
+            if let Some(span) = self.lines.get(line_idx) {
+                if let Some(&ws) = span.word_starts.last() {
                     return ws;
                 }
             }
@@ -295,12 +307,6 @@ impl PageText {
                 return 0;
             }
             line_idx -= 1;
-            if let Some(prev) = self.lines.get(line_idx) {
-                if let Some(&ws) = prev.word_starts.last() {
-                    return ws;
-                }
-                return prev.start_idx;
-            }
         }
     }
 
@@ -703,11 +709,18 @@ impl TextCache {
         page_idx: usize,
         metrics: &PageMetrics,
     ) -> Result<&PageText> {
-        if !self.map.contains_key(&page_idx) {
-            let pt = PageText::load(document, page_idx, metrics)?;
-            self.map.insert(page_idx, pt);
+        // Entry-API match avoids the previous double-lookup pattern
+        // (contains_key + insert + get = 3 hashes); this does at
+        // most one. Distinct branches because `Entry::or_insert_with`
+        // can't propagate the `?` from the fallible loader.
+        use std::collections::hash_map::Entry;
+        match self.map.entry(page_idx) {
+            Entry::Occupied(e) => Ok(&*e.into_mut()),
+            Entry::Vacant(e) => {
+                let pt = PageText::load(document, page_idx, metrics)?;
+                Ok(&*e.insert(pt))
+            }
         }
-        Ok(self.map.get(&page_idx).unwrap())
     }
 
     pub fn get(&self, page_idx: usize) -> Option<&PageText> {
@@ -843,6 +856,46 @@ mod tests {
         assert_eq!(pt.next_word_start(3), 6);
         // From last char, returns last.
         assert_eq!(pt.next_word_start(7), 7);
+    }
+
+    /// REGRESSION: `w` motion across two adjacent whitespace-only
+    /// lines used to land on the *whitespace* of the immediately-
+    /// next line because the loop body bailed out after a single
+    /// iteration. With multi-line walking the caret now lands on
+    /// the actual next word ('c'), matching vim's behaviour.
+    #[test]
+    fn next_word_start_skips_whitespace_only_lines() {
+        let pt = page_with(vec![
+            cell(0, 0.10, 0.10, 0.05, 0.04, 'a'),
+            cell(1, 0.16, 0.10, 0.05, 0.04, 'b'),
+            // Line of pure whitespace.
+            cell(2, 0.10, 0.30, 0.05, 0.04, ' '),
+            cell(3, 0.16, 0.30, 0.05, 0.04, ' '),
+            // Real word on line 2.
+            cell(4, 0.10, 0.50, 0.05, 0.04, 'c'),
+            cell(5, 0.16, 0.50, 0.05, 0.04, 'd'),
+        ]);
+        // From end of line 0, the next word is 'c' (idx 4) — the
+        // whitespace-only line in between must be skipped.
+        assert_eq!(pt.next_word_start(1), 4);
+    }
+
+    /// REGRESSION: mirror test for `b` (prev_word_start). Walking
+    /// backwards from line 2 across a whitespace-only line should
+    /// land on the actual previous word, not on the whitespace.
+    #[test]
+    fn prev_word_start_skips_whitespace_only_lines() {
+        let pt = page_with(vec![
+            cell(0, 0.10, 0.10, 0.05, 0.04, 'a'),
+            cell(1, 0.16, 0.10, 0.05, 0.04, 'b'),
+            cell(2, 0.10, 0.30, 0.05, 0.04, ' '),
+            cell(3, 0.16, 0.30, 0.05, 0.04, ' '),
+            cell(4, 0.10, 0.50, 0.05, 0.04, 'c'),
+            cell(5, 0.16, 0.50, 0.05, 0.04, 'd'),
+        ]);
+        // From line 2's first char, the previous word is 'a'
+        // (idx 0) — whitespace-only line 1 must be skipped.
+        assert_eq!(pt.prev_word_start(4), 0);
     }
 
     #[test]
