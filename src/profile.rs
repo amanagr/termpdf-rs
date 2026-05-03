@@ -30,6 +30,11 @@ pub enum Phase {
     /// of the canvas and the actual write to the pty. This is the
     /// suspected steady-scroll bottleneck.
     Draw,
+    /// `warm_one_idle` — between-draw prefetch + pre-encode + pre-
+    /// transmit. Not on the keypress hot path, but shows the CPU
+    /// cost of the prefetch budget. If this dominates, prefetch is
+    /// overfetching; if it's near-zero, prefetch is underfetching.
+    IdleWarm,
 }
 
 pub fn enabled() -> bool {

@@ -401,6 +401,7 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
                 .map(|t| t.elapsed() >= Duration::from_millis(200))
                 .unwrap_or(true);
             if idle_long_enough {
+                let _s = profile::span(profile::Phase::IdleWarm);
                 let _ = warm_one_idle(app);
             }
         }
