@@ -94,6 +94,18 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
         // becomes its own kitty image, transmitted once. Steady scroll
         // is then just a few hundred bytes of placeholder cells per
         // frame instead of a multi-MB canvas re-encode.
+        //
+        // Background fill first: pages may not span the full image
+        // area (centered layouts, narrower-than-viewport pages,
+        // inter-page gaps). The canvas path used to fill the gap
+        // pixels with `bg` during compose; here we paint a Block
+        // across img_area so any cell the placement loop doesn't
+        // touch falls back to the right page-background color.
+        let bg = if app.dark { Color::Rgb(20, 20, 20) } else { Color::Rgb(240, 240, 240) };
+        f.render_widget(
+            Block::default().style(Style::default().bg(bg)),
+            img_area,
+        );
         if let Err(e) = draw_pages_kitty(f, app, img_area) {
             f.render_widget(
                 Paragraph::new(format!("render error: {e:#}"))
@@ -384,9 +396,17 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
         return Ok(());
     }
 
+    // During a rapid-scroll burst, also skip pdfium render for cold
+    // pages. Otherwise we pay ~20 ms per cold page in pdfium even
+    // though the placement loop will discard them. The settle redraw
+    // after the burst will render whatever's then visible.
+    let rapid = app.is_rapid_scrolling();
     {
         let _s = crate::profile::span(crate::profile::Phase::EnsureRendered);
         for &pi in &visible {
+            if rapid && !app.page_cache.contains_key(&pi) {
+                continue;
+            }
             ensure_page_rendered(app, pi, fit_width_px, /*allow_failure=*/ true)?;
             app.touch_page(pi);
         }
@@ -398,6 +418,8 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     {
         let _s = crate::profile::span(crate::profile::Phase::EnsureOverlay);
         for &pi in &visible {
+            // ensure_overlay early-returns when page_cache is missing,
+            // so the rapid-scroll skip above propagates here for free.
             ensure_overlay(app, pi, layout_key);
         }
     }
