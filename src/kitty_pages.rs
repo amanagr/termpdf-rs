@@ -449,6 +449,14 @@ fn build_transmit_string(
         write!(data, "{escape}\\").unwrap();
         data.push_str(end);
     }
+    // Create the virtual placement for this image. Required by Ghostty
+    // (and a no-op-cost on kitty) — without it, Ghostty floods its log
+    // with `missing image for virtual placement, ignoring image_id=…`
+    // for every placeholder cell, eventually starving the renderer.
+    // No c/r → use the image's natural cell dimensions.
+    data.push_str(start);
+    write!(data, "{escape}_Ga=p,U=1,i={id},q=2;{escape}\\").unwrap();
+    data.push_str(end);
     data
 }
 
@@ -723,6 +731,27 @@ mod tests {
         assert!(s.contains("v=8"));
         assert!(s.contains("U=1"));
         assert!(s.contains("a=T"));
+    }
+
+    /// Ghostty requires an explicit virtual placement (a=p,U=1) after
+    /// the image transmit, otherwise placeholder cells log a
+    /// `missing image for virtual placement` warning per cell and the
+    /// terminal goes unresponsive under load. Regression test for the
+    /// 14:42 incident.
+    #[test]
+    fn transmit_string_creates_virtual_placement() {
+        let bm = RgbaImage::new(8, 8);
+        let s = transmit(&bm, 12345, false);
+        assert!(
+            s.contains("a=p,U=1,i=12345"),
+            "transmit must end with a virtual placement command for the same image_id; got {s:?}"
+        );
+        // The placement should sit AFTER the final transmit chunk —
+        // otherwise some terminals see the placement before the image
+        // is fully stored and reject it.
+        let last_t = s.rfind("a=T").expect("transmit start present");
+        let placement = s.find("a=p,U=1").expect("placement present");
+        assert!(placement > last_t, "placement must come after a=T transmit");
     }
 
     #[test]
