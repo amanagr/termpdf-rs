@@ -58,6 +58,12 @@ pub fn pdf_cache_dir(pdf_path: &Path) -> Option<PathBuf> {
     Some(cache_root.join(format!("{:016x}", hash)))
 }
 
+/// Render-pipeline version. Bump when changing pdfium config (LCD,
+/// smoothing, supersampling factor) so older cached pages — which
+/// were rendered with the old pipeline — don't get served back at
+/// lower quality after an upgrade.
+const RENDER_VERSION: u32 = 2;
+
 /// Compose the cache file path for one rendered page. Returns `None`
 /// when no cache directory is available (no `XDG_CACHE_HOME`, no
 /// `$HOME`, etc.) or when the source file's metadata can't be read.
@@ -68,7 +74,10 @@ pub fn cache_path(
     dark: bool,
 ) -> Option<PathBuf> {
     let dir = pdf_cache_dir(pdf_path)?;
-    let file = format!("{}_{}_{}.png", page_idx, fit_width_px, dark as u8);
+    let file = format!(
+        "{}_{}_{}_v{}.png",
+        page_idx, fit_width_px, dark as u8, RENDER_VERSION
+    );
     Some(dir.join(file))
 }
 
