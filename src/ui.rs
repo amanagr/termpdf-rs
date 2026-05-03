@@ -1686,7 +1686,10 @@ pub(crate) fn reading_percent_pure(scroll_y_px: i64, viewport_h_px: i64, total_h
 }
 
 fn status_line(app: &App<'_>) -> Paragraph<'static> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
+    // Up to ~7 spans: mode label, page/percent, DARK, zoom, pending,
+    // status, help hint. Pre-size so the per-frame status line build
+    // doesn't grow through the 4/8/16 doubling steps.
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(7);
 
     let mode_label = match app.mode {
         Mode::Normal => "",
