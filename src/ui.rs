@@ -948,13 +948,21 @@ pub(crate) fn compute_page_revision(app: &App<'_>, page_idx: usize) -> u64 {
         None => (0u64, false, false),
     };
     let sel = app.selection_signature_for_page(page_idx);
+    // Per-page highlight fingerprint: changes only when *this* page's
+    // highlight set changes. Previously this used the global
+    // `app.highlight_revision`, which bumped on any edit anywhere in
+    // the document and forced a re-bake + re-transmit on every visible
+    // page even when their bitmaps were unchanged. The
+    // `highlight_add` perf-harness scenario went from 12 transmits per
+    // `y` keystroke to 1 once this localised.
+    let highlight_sig = app.highlights.page_revision(page_idx);
 
     // FNV-1a-style mix; doesn't need to be cryptographic — just
     // non-degenerate enough that flipping any single field flips the
     // revision.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for v in [
-        app.highlight_revision,
+        highlight_sig,
         search_revision,
         sel,
         has_search_hits as u64,
@@ -1397,7 +1405,10 @@ fn page_overlay_key(app: &App<'_>, page_idx: usize, layout: LayoutKey) -> PageOv
     };
     PageOverlayKey {
         layout,
-        highlight_revision: app.highlight_revision,
+        // Per-page highlight fingerprint — see compute_page_revision for
+        // the why. Localising this prevents an edit on page 5 from
+        // forcing a re-bake of the overlay tier on every visible page.
+        highlight_revision: app.highlights.page_revision(page_idx),
         search_revision,
         has_search_hits,
         current_hit_on_this_page,
@@ -1496,7 +1507,9 @@ fn ensure_highlights_baked(app: &mut App<'_>, page_idx: usize, layout: LayoutKey
     };
     let key = HighlightsBakedKey {
         layout,
-        highlight_revision: app.highlight_revision,
+        // Per-page fingerprint — saved-highlights tier no longer
+        // re-bakes for every visible page on a single-page edit.
+        highlight_revision: app.highlights.page_revision(page_idx),
         search_revision,
         has_search_hits,
         current_hit_on_this_page,

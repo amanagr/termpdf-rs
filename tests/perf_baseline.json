@@ -1,96 +1,96 @@
 {
   "version": 1,
-  "note": "generated unix=1777831135",
+  "note": "generated unix=1777831585",
   "scenarios": {
     "dark_toggle": {
       "wall_ms": 62,
       "per_action_p50_ms": 62,
       "per_action_p95_ms": 62,
-      "bytes_out": 192465,
+      "bytes_out": 192463,
       "transmits": 0,
       "placements": 1,
       "cpu_ms": 0,
-      "peak_rss_kb": 19140
+      "peak_rss_kb": 19092
     },
     "highlight_add": {
-      "wall_ms": 88,
-      "per_action_p50_ms": 88,
-      "per_action_p95_ms": 88,
-      "bytes_out": 2731647,
+      "wall_ms": 89,
+      "per_action_p50_ms": 89,
+      "per_action_p95_ms": 89,
+      "bytes_out": 2733831,
       "transmits": 13,
       "placements": 14,
-      "cpu_ms": 30,
-      "peak_rss_kb": 23484
+      "cpu_ms": 40,
+      "peak_rss_kb": 23480
     },
     "jump_to_end_large": {
-      "wall_ms": 61,
-      "per_action_p50_ms": 61,
-      "per_action_p95_ms": 61,
+      "wall_ms": 62,
+      "per_action_p50_ms": 62,
+      "per_action_p95_ms": 62,
       "bytes_out": 25828,
       "transmits": 0,
       "placements": 0,
       "cpu_ms": 0,
-      "peak_rss_kb": 23448
+      "peak_rss_kb": 23272
     },
     "open_medium": {
+      "wall_ms": 84,
+      "per_action_p50_ms": 10,
+      "per_action_p95_ms": 10,
+      "bytes_out": 183749,
+      "transmits": 0,
+      "placements": 1,
+      "cpu_ms": 0,
+      "peak_rss_kb": 19004
+    },
+    "open_tiny": {
       "wall_ms": 86,
       "per_action_p50_ms": 10,
       "per_action_p95_ms": 10,
-      "bytes_out": 183751,
+      "bytes_out": 114439,
       "transmits": 0,
       "placements": 1,
       "cpu_ms": 0,
-      "peak_rss_kb": 18892
-    },
-    "open_tiny": {
-      "wall_ms": 73,
-      "per_action_p50_ms": 10,
-      "per_action_p95_ms": 10,
-      "bytes_out": 114437,
-      "transmits": 0,
-      "placements": 1,
-      "cpu_ms": 0,
-      "peak_rss_kb": 17980
+      "peak_rss_kb": 17832
     },
     "scroll_steady_30": {
-      "wall_ms": 2183,
-      "per_action_p50_ms": 47,
-      "per_action_p95_ms": 168,
-      "bytes_out": 4742116,
+      "wall_ms": 2076,
+      "per_action_p50_ms": 41,
+      "per_action_p95_ms": 163,
+      "bytes_out": 4756144,
       "transmits": 19,
       "placements": 20,
-      "cpu_ms": 1640,
-      "peak_rss_kb": 135468
+      "cpu_ms": 1530,
+      "peak_rss_kb": 135352
     },
     "search_advance_5": {
       "wall_ms": 220,
       "per_action_p50_ms": 44,
-      "per_action_p95_ms": 45,
-      "bytes_out": 1359158,
+      "per_action_p95_ms": 44,
+      "bytes_out": 1359361,
       "transmits": 6,
       "placements": 7,
-      "cpu_ms": 10,
-      "peak_rss_kb": 20444
+      "cpu_ms": 20,
+      "peak_rss_kb": 20312
     },
     "selection_drag_30": {
-      "wall_ms": 1313,
+      "wall_ms": 1305,
       "per_action_p50_ms": 43,
-      "per_action_p95_ms": 45,
-      "bytes_out": 6469754,
+      "per_action_p95_ms": 44,
+      "bytes_out": 6468797,
       "transmits": 32,
       "placements": 33,
-      "cpu_ms": 80,
-      "peak_rss_kb": 23432
+      "cpu_ms": 70,
+      "peak_rss_kb": 23520
     },
     "zoom_cycle": {
-      "wall_ms": 214,
-      "per_action_p50_ms": 64,
-      "per_action_p95_ms": 149,
-      "bytes_out": 639802,
+      "wall_ms": 205,
+      "per_action_p50_ms": 65,
+      "per_action_p95_ms": 141,
+      "bytes_out": 640044,
       "transmits": 2,
       "placements": 3,
-      "cpu_ms": 90,
-      "peak_rss_kb": 65540
+      "cpu_ms": 80,
+      "peak_rss_kb": 65612
     }
   }
 }
