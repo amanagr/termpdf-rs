@@ -328,7 +328,18 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
     // input. 16 ms ≈ 60 Hz. Lets a held-`j` collapse multiple steps
     // into one paint while keeping single keys feeling responsive.
     const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+    /// Must match the `RAPID_SCROLL_THRESHOLD_MS` in
+    /// `App::is_rapid_scrolling`. Quick enough that letting up a held
+    /// key feels instant; long enough that brief pauses during fast
+    /// keymashing don't trigger an expensive catch-up draw mid-burst.
+    const SETTLE_MS: u128 = 120;
     let mut last_draw = std::time::Instant::now() - MIN_FRAME_INTERVAL;
+
+    // After a rapid-input burst settles, we want to schedule one
+    // catch-up draw that does the deferred cold-page transmits.
+    // Tracked here in the loop rather than per-event so we don't
+    // forget if multiple events arrive within the threshold.
+    let mut needs_settle_redraw = false;
 
     while !app.should_quit {
         // Pre-draw peek: if more input is already queued, don't paint
@@ -348,17 +359,37 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
             last_draw = std::time::Instant::now();
         }
 
-        // Block once for the next event (250 ms tick) then drain the
-        // queue. Two reasons to drain in batches:
+        // Settle-redraw poll timing: when the user is mid-burst we
+        // don't want to wait 250 ms before noticing the burst ended.
+        // Drop the poll wait to ~SETTLE_MS so the catch-up draw fires
+        // promptly once input goes idle.
+        let poll_dur = if needs_settle_redraw {
+            Duration::from_millis(SETTLE_MS as u64)
+        } else {
+            Duration::from_millis(250)
+        };
+
+        // Block once for the next event (poll_dur tick) then drain
+        // the queue. Two reasons to drain in batches:
         //   1. Mouse-drag fires 30–100 events/sec; one redraw per
         //      event thrashes the kitty graphics pipeline.
         //   2. Held-key autorepeat (j/Space/l) collapses into one
         //      redraw at the final state.
-        if event::poll(Duration::from_millis(250))? {
+        if event::poll(poll_dur)? {
             dispatch_event_coalesced(app, event::read()?)?;
+            app.note_input();
+            needs_settle_redraw = true;
             while !app.should_quit && event::poll(Duration::ZERO)? {
                 dispatch_event_coalesced(app, event::read()?)?;
+                app.note_input();
             }
+        } else if needs_settle_redraw {
+            // Poll timed out → input is idle. The next iteration's
+            // draw will see is_rapid_scrolling() == false and do the
+            // deferred transmits. Force the watchdog to allow that
+            // draw immediately.
+            needs_settle_redraw = false;
+            last_draw = std::time::Instant::now() - MIN_FRAME_INTERVAL;
         }
     }
     Ok(())

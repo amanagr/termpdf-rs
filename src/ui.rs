@@ -489,6 +489,29 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
         });
     }
 
+    // During a rapid input burst (held j/k, mouse wheel spam) defer
+    // any cold-page transmit. Each cold transmit ships ~5 MB of
+    // base64; doing 5 of them per frame is what tanked draw time
+    // from 58 ms to 184 ms in the user's hold-j stress test. The
+    // event loop forces a catch-up draw once input goes idle (see
+    // SETTLE_MS in main.rs::run_loop) so the deferred pages render
+    // the moment the user lets up.
+    if app.is_rapid_scrolling() {
+        for b in blits.iter_mut() {
+            if b.need_transmit {
+                // Skip placement too — the terminal has no image
+                // cached under this ID yet, so emitting a placeholder
+                // would just render garbled fg-color cells. Setting
+                // height_cells=0 makes the placement loop below skip
+                // this entry. The catch-up redraw scheduled by the
+                // event loop after input goes idle will pick the
+                // page up at full transmit + placement.
+                b.need_transmit = false;
+                b.height_cells = 0;
+            }
+        }
+    }
+
     // Build transmit strings for pages that need them. Held outside
     // the draw loop so the immutable borrow on overlay_cache doesn't
     // overlap the mutable borrow on kitty_pages.

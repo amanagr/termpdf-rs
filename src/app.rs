@@ -217,6 +217,11 @@ pub struct App<'doc> {
     /// unicode-placeholder cells. Drops the per-frame Draw cost from
     /// ~150 ms (full canvas re-encode + pty write) to ~5 ms.
     pub kitty_pages: Option<crate::kitty_pages::KittyPageRegistry>,
+    /// Most recent input event time. Used by `is_rapid_scrolling` to
+    /// detect a sustained autorepeat / mouse-wheel burst so the kitty
+    /// draw path can defer cold-page transmits until the burst ends.
+    /// `None` until the first event arrives.
+    pub last_input_at: Option<std::time::Instant>,
     pub last_compose_key: Option<ComposeKey>,
     /// Reused viewport-sized RGBA buffer. Allocating an 8 MB
     /// `RgbaImage::from_pixel` per recompose was 4–6 ms of pure
@@ -400,6 +405,7 @@ impl<'doc> App<'doc> {
             pages_in_flight: std::collections::HashSet::new(),
             image_proto: None,
             kitty_pages,
+            last_input_at: None,
             canvas_buf: None,
             last_canvas_hash: 0,
             last_compose_key: None,
@@ -621,6 +627,29 @@ impl<'doc> App<'doc> {
 
     pub fn invalidate_compose(&mut self) {
         self.last_compose_key = None;
+    }
+
+    /// True if the user is in a sustained input burst (autorepeat
+    /// j/k, mouse-wheel spam, held-arrow). Used by the kitty draw
+    /// path to defer cold-page transmits — each cold transmit ships
+    /// ~5 MB of base64, and shipping 5 of them per frame during a
+    /// rapid scroll cliffs us into 200 ms+ frames. Holding the
+    /// transmit until the burst ends keeps per-frame work bounded;
+    /// the deferred pages render blank during the burst and fill in
+    /// the moment the user lets up.
+    pub fn is_rapid_scrolling(&self) -> bool {
+        const RAPID_SCROLL_THRESHOLD_MS: u128 = 120;
+        match self.last_input_at {
+            Some(t) => t.elapsed().as_millis() < RAPID_SCROLL_THRESHOLD_MS,
+            None => false,
+        }
+    }
+
+    /// Record that an input event just arrived. Called from the event
+    /// loop's dispatch — the freshness window is what
+    /// `is_rapid_scrolling` reads.
+    pub fn note_input(&mut self) {
+        self.last_input_at = Some(std::time::Instant::now());
     }
 
     /// Derive the active selection's per-page fingerprint for the
