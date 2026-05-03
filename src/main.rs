@@ -484,7 +484,7 @@ fn index_one_page_text(app: &mut App<'_>) {
     // First time the index becomes complete, snapshot it to disk.
     // Failure is silent (cache is best-effort).
     if app.doc_index.is_complete() && !app.index_persisted {
-        if let Some(dir) = disk_cache::pdf_cache_dir(&app.path) {
+        if let Some(dir) = app.cache_dir.as_ref() {
             let p = dir.join("index.bin");
             let _ = search_index::save(&app.doc_index, &p);
         }
