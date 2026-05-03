@@ -15,6 +15,7 @@ use crate::layout::PageLayout;
 use crate::outline::{self, OutlineEntry};
 use crate::pdf::{self, PageMetrics};
 use crate::pdfhighlights;
+use crate::links::LinkAction;
 use crate::search::SearchResults;
 use crate::session::Session;
 use crate::textlayout::{Caret, SelMode, TextCache, TextSelection};
@@ -35,6 +36,19 @@ pub enum Mode {
 pub struct LayoutKey {
     pub fit_width_px: u32,
     pub dark: bool,
+}
+
+/// One hint shown over a clickable link region. Rendered as a 1-2
+/// char label by the UI; the action fires on disambiguation.
+#[derive(Debug, Clone)]
+pub struct HintEntry {
+    pub page_idx: usize,
+    /// Link rect in normalised page coords (origin top-left).
+    pub rect: Rect01,
+    /// What happens if the user picks this hint.
+    pub action: LinkAction,
+    /// 1-2 char label rendered over the link.
+    pub label: String,
 }
 
 /// Cache key for the *highlights-baked* tier — page bitmap with
@@ -260,6 +274,16 @@ pub struct App<'doc> {
     /// 4 100-page docs go from ~5 s search to ~0.03 s once filled.
     pub doc_index: crate::search_index::DocIndex,
 
+    /// Vimium-style link-follow state. `true` while the user has
+    /// pressed `f` and is typing the hint chars to pick a target.
+    pub link_hint_mode: bool,
+    /// Hints offered in the current hint-mode session, populated when
+    /// the user presses `f`. Empty when `link_hint_mode = false`.
+    pub link_hints: Vec<HintEntry>,
+    /// Chars typed so far during hint mode; narrows `link_hints` to
+    /// the still-matching subset for incremental disambiguation.
+    pub hint_filter: String,
+
     /// Document outline, eager-loaded once at startup. Empty Vec
     /// means "loaded, no outline" (vs `None` which would be "not
     /// yet loaded" — we avoid that state by loading in `App::new`).
@@ -425,6 +449,9 @@ impl<'doc> App<'doc> {
             search: None,
             last_query: None,
             doc_index: crate::search_index::DocIndex::new(page_count),
+            link_hint_mode: false,
+            link_hints: Vec::new(),
+            hint_filter: String::new(),
             outline,
             show_toc: false,
             toc_cursor: 0,
@@ -1182,6 +1209,132 @@ impl<'doc> App<'doc> {
                 self.invalidate_compose();
             }
         }
+    }
+
+    /// Enter link-hint mode: enumerate every link on the currently
+    /// visible pages, assign hint chars, and flip `link_hint_mode`.
+    /// No-op if no links exist on screen (status line tells the user).
+    #[allow(clippy::useless_conversion)] // ordered_float helper for stable sort
+    pub fn enter_link_hint_mode(&mut self) {
+        let viewport_h = self.viewport_px.1;
+        if viewport_h == 0 {
+            return;
+        }
+        let visible: Vec<usize> = self
+            .layout
+            .visible_pages(self.scroll_y_px, viewport_h)
+            .collect();
+        if visible.is_empty() {
+            self.status = "no links: no pages in viewport".into();
+            return;
+        }
+
+        // Collect raw links per visible page.
+        let mut entries: Vec<HintEntry> = Vec::new();
+        let pages = self.document.pages();
+        for &page_idx in &visible {
+            let Ok(page) = pages.get(page_idx as i32) else { continue };
+            let Some(metrics) = self.page_metrics.get(page_idx) else { continue };
+            for link in crate::links::enumerate(&page, metrics) {
+                entries.push(HintEntry {
+                    page_idx,
+                    rect: link.rect,
+                    action: link.action,
+                    label: String::new(), // assigned below
+                });
+            }
+        }
+        if entries.is_empty() {
+            self.status = "no links on visible pages".into();
+            return;
+        }
+
+        // Assign hints in screen-reading order (page index, then top-
+        // to-bottom, then left-to-right within a page) so the hint
+        // labels feel predictable.
+        entries.sort_by(|a, b| {
+            (a.page_idx, ordered_float(a.rect.y), ordered_float(a.rect.x)).cmp(&(
+                b.page_idx,
+                ordered_float(b.rect.y),
+                ordered_float(b.rect.x),
+            ))
+        });
+        let labels = crate::links::gen_hints(entries.len());
+        for (e, l) in entries.iter_mut().zip(labels.into_iter()) {
+            e.label = l;
+        }
+
+        self.link_hints = entries;
+        self.hint_filter.clear();
+        self.link_hint_mode = true;
+        self.status = format!("link mode: {} hints (Esc to cancel)", self.link_hints.len());
+        self.invalidate_compose();
+    }
+
+    /// Append `c` to the hint filter; returns the action to dispatch
+    /// if a unique hint matched, `None` if still ambiguous.
+    /// Side-effect: on no-match or full-match, exits hint mode.
+    pub fn hint_keystroke(&mut self, c: char) -> Option<LinkAction> {
+        if !self.link_hint_mode {
+            return None;
+        }
+        self.hint_filter.push(c);
+        let filter = self.hint_filter.clone();
+        let matches: Vec<&HintEntry> = self
+            .link_hints
+            .iter()
+            .filter(|e| e.label.starts_with(&filter))
+            .collect();
+        match matches.len() {
+            0 => {
+                self.exit_link_hint_mode();
+                self.status = format!("no hint matches `{filter}`");
+                None
+            }
+            1 => {
+                let action = matches[0].action.clone();
+                self.exit_link_hint_mode();
+                Some(action)
+            }
+            _ => {
+                // Still ambiguous; redraw with narrowed hints.
+                self.invalidate_compose();
+                None
+            }
+        }
+    }
+
+    pub fn exit_link_hint_mode(&mut self) {
+        self.link_hint_mode = false;
+        self.link_hints.clear();
+        self.hint_filter.clear();
+        self.invalidate_compose();
+    }
+
+    /// Dispatch a chosen link-hint action.
+    pub fn follow_link_action(&mut self, action: LinkAction) {
+        match action {
+            LinkAction::GoToPage(page_idx) => {
+                let p = page_idx.min(self.page_count.saturating_sub(1));
+                self.goto_page(p);
+                self.status = format!("→ page {}", p + 1);
+            }
+            LinkAction::Url(url) => {
+                // Spawn xdg-open detached so the binary doesn't block
+                // on the browser launch. We don't wait for status —
+                // success vs failure is tedious to report and the
+                // user will notice if their browser doesn't open.
+                let r = std::process::Command::new("xdg-open").arg(&url).spawn();
+                match r {
+                    Ok(_) => self.status = format!("opened: {url}"),
+                    Err(e) => self.status = format!("xdg-open failed for {url}: {e}"),
+                }
+            }
+            LinkAction::Other => {
+                self.status = "unsupported link type".into();
+            }
+        }
+        self.invalidate_compose();
     }
 
     /// Move to the next/previous search hit, wrapping at the ends.
@@ -2029,6 +2182,20 @@ impl<'doc> App<'doc> {
 /// Process ID hashed with the golden-ratio constant gives us a
 /// well-spread u32 without pulling in `rand`. Kitty IDs are 1..=u32::MAX;
 /// we bump 0 to 1 just in case.
+/// f32 → ordered key for sorting. f32 isn't `Ord`; this maps NaN to
+/// u32::MAX so it sorts last and otherwise preserves IEEE order.
+fn ordered_float(f: f32) -> u32 {
+    if f.is_nan() {
+        return u32::MAX;
+    }
+    let bits = f.to_bits();
+    if (bits as i32) >= 0 {
+        bits ^ 0x8000_0000
+    } else {
+        !bits
+    }
+}
+
 fn stable_kitty_id() -> u32 {
     let mixed = (std::process::id() as u64).wrapping_mul(0x9E37_79B1_185E_BCA1);
     let id = ((mixed >> 32) ^ mixed) as u32;

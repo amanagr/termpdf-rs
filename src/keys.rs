@@ -30,6 +30,25 @@ pub fn dispatch(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         return Ok(());
     }
 
+    // Link-hint mode hijacks every keystroke until the user picks a
+    // hint (or cancels). Handled before mode dispatch so it overrides
+    // every other binding.
+    if app.link_hint_mode {
+        match k.code {
+            KeyCode::Esc => {
+                app.exit_link_hint_mode();
+                app.status = "link mode cancelled".into();
+            }
+            KeyCode::Char(c) => {
+                if let Some(action) = app.hint_keystroke(c) {
+                    app.follow_link_action(action);
+                }
+            }
+            _ => { /* ignore other keys */ }
+        }
+        return Ok(());
+    }
+
     if app.show_toc {
         return toc_keys(app, k);
     }
@@ -196,6 +215,9 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         }
         KeyCode::Char('v') => app.enter_visual(),
         KeyCode::Char('o') => app.toggle_toc(),
+        // `f` enters link-hint mode (vimium-style): every clickable
+        // link on visible pages gets a 1-2 char overlay; type to pick.
+        KeyCode::Char('f') => app.enter_link_hint_mode(),
 
         // Marks: `m{a-z}` to set, `'{a-z}` to jump. Two-stroke pattern
         // matched in the awaiting_mark_* prelude above.

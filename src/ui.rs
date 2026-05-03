@@ -637,7 +637,89 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     }
     kp.evict_to_budget(&visible);
 
+    // Link-hint overlay: rendered last so labels sit on top of
+    // placeholder cells. Cells we paint here override ratatui's
+    // skip-from-placement marker — that's fine because hints occupy
+    // a 1-2 cell region and the rest of the page is unaffected.
+    if app.link_hint_mode {
+        draw_link_hints(f.buffer_mut(), app, area, cell_w, cell_h);
+    }
+
     Ok(())
+}
+
+/// Paint each unfiltered hint label over its link's centre cell.
+/// Black-on-yellow for visibility against arbitrary page content.
+fn draw_link_hints(
+    buf: &mut ratatui::buffer::Buffer,
+    app: &App<'_>,
+    area: Rect,
+    cell_w: u32,
+    cell_h: u32,
+) {
+    use ratatui::style::{Color, Modifier, Style};
+    let style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+
+    let scroll_y = app.scroll_y_px;
+    let viewport_h = app.viewport_px.1;
+
+    for hint in &app.link_hints {
+        // Only show hints whose label still matches what the user
+        // has typed so far. Already-typed prefix is dimmed visually
+        // by greying the matched portion.
+        if !hint.label.starts_with(&app.hint_filter) {
+            continue;
+        }
+
+        let page_doc_y = app.layout.page_y(hint.page_idx);
+        let page_h_px = app.layout.page_h(hint.page_idx);
+        if page_h_px == 0 {
+            continue;
+        }
+        // Page-px coordinates of the link rect's top-left.
+        let pixel_w = app.layout.fit_width_px;
+        let link_x_px = (hint.rect.x * pixel_w as f32) as i64;
+        let link_y_px = (hint.rect.y * page_h_px as f32) as i64;
+        // Doc-y of the link's centre.
+        let doc_y = page_doc_y + link_y_px;
+        // Skip if the link is outside the viewport vertically.
+        let dy_px = doc_y - scroll_y;
+        if dy_px < 0 || dy_px >= viewport_h as i64 {
+            continue;
+        }
+        let cell_y = area.top().saturating_add((dy_px / cell_h as i64).max(0) as u16);
+
+        // Center horizontally within the page area: the page may
+        // have been centered if narrower than viewport.
+        let img_w_cells = (pixel_w / cell_w.max(1)) as u16;
+        let dst_left_cell = if img_w_cells < area.width {
+            (area.width - img_w_cells) / 2
+        } else {
+            0
+        };
+        let cell_x = area.left()
+            .saturating_add(dst_left_cell)
+            .saturating_add((link_x_px / cell_w as i64).max(0) as u16);
+
+        // Write the label chars across consecutive cells.
+        let label = &hint.label;
+        for (i, ch) in label.chars().enumerate() {
+            let x = cell_x.saturating_add(i as u16);
+            if x >= area.right() || cell_y >= area.bottom() {
+                break;
+            }
+            if let Some(cell) = buf.cell_mut((x, cell_y)) {
+                let mut s = String::new();
+                s.push(ch);
+                cell.set_symbol(&s);
+                cell.set_style(style);
+                cell.set_skip(false);
+            }
+        }
+    }
 }
 
 /// How many cell-rows of this page actually intersect the viewport
@@ -1642,6 +1724,11 @@ pub fn help_overlay_lines() -> Vec<&'static str> {
         "    j/k Enter            navigate / jump to entry",
         "    / type Enter         filter by substring",
         "    Esc                  close panel",
+        "",
+        "  f                      link-hint mode (vimium-style)",
+        "                         type the 1-2 char label over a link to follow it",
+        "                         internal links jump pages; URLs open via xdg-open",
+        "                         Esc cancels",
         "  :<n>  /  :goto N       jump to page n",
         "  :export [path]         dump highlights as Markdown notes",
         "  :q                     quit",

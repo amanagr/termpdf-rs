@@ -24,6 +24,7 @@ mod highlight;
 mod keys;
 mod kitty_pages;
 mod layout;
+mod links;
 mod outline;
 mod pdf;
 mod pdfhighlights;
