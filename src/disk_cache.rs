@@ -41,15 +41,9 @@ use image::DynamicImage;
 /// of recent PDFs without unbounded growth on a long-running setup.
 const DISK_CACHE_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 
-/// Compose the cache file path for one rendered page. Returns `None`
-/// when no cache directory is available (no `XDG_CACHE_HOME`, no
-/// `$HOME`, etc.) or when the source file's metadata can't be read.
-pub fn cache_path(
-    pdf_path: &Path,
-    page_idx: usize,
-    fit_width_px: u32,
-    dark: bool,
-) -> Option<PathBuf> {
+/// Returns the per-PDF cache directory. Same hashing scheme as
+/// `cache_path` so the search index sits alongside the PNG cache.
+pub fn pdf_cache_dir(pdf_path: &Path) -> Option<PathBuf> {
     let cache_root = dirs::cache_dir()?.join("termpdf-rs");
     let meta = std::fs::metadata(pdf_path).ok()?;
     let mtime_secs = meta
@@ -59,13 +53,21 @@ pub fn cache_path(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let size = meta.len();
-    let path_str = pdf_path.to_string_lossy();
-    // 64-bit FNV-1a of path|size|mtime → hex. Stable, collision
-    // probability negligible for the cache count we expect (a few
-    // hundred PDFs).
-    let key_str = format!("{}|{}|{}", path_str, size, mtime_secs);
+    let key_str = format!("{}|{}|{}", pdf_path.to_string_lossy(), size, mtime_secs);
     let hash = fnv1a_hash_str(&key_str);
-    let dir = cache_root.join(format!("{:016x}", hash));
+    Some(cache_root.join(format!("{:016x}", hash)))
+}
+
+/// Compose the cache file path for one rendered page. Returns `None`
+/// when no cache directory is available (no `XDG_CACHE_HOME`, no
+/// `$HOME`, etc.) or when the source file's metadata can't be read.
+pub fn cache_path(
+    pdf_path: &Path,
+    page_idx: usize,
+    fit_width_px: u32,
+    dark: bool,
+) -> Option<PathBuf> {
+    let dir = pdf_cache_dir(pdf_path)?;
     let file = format!("{}_{}_{}.png", page_idx, fit_width_px, dark as u8);
     Some(dir.join(file))
 }

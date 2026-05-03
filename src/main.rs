@@ -454,6 +454,10 @@ fn warm_one_idle(app: &mut App<'_>) -> Result<()> {
 /// index. ~5 ms per page on a typical doc. Bounded to one call per
 /// `warm_one_idle` so a held-key burst that interrupts us costs at
 /// most one text extract.
+///
+/// On the transition from incomplete → complete, persists the index
+/// to disk so the next open of the same PDF skips the indexing
+/// cost entirely.
 fn index_one_page_text(app: &mut App<'_>) {
     if app.doc_index.is_complete() {
         return;
@@ -461,11 +465,8 @@ fn index_one_page_text(app: &mut App<'_>) {
     let Some(page_idx) = app.doc_index.next_page_to_index() else {
         return;
     };
-    // pdfium-render: load page, get text, extract.
     let pages = app.document.pages();
     let Ok(page) = pages.get(page_idx as i32) else {
-        // Skip on failure but mark indexed so we don't loop. We stash
-        // an empty string — page_for_offset still works correctly.
         app.doc_index.add_page(page_idx, String::new());
         return;
     };
@@ -474,6 +475,16 @@ fn index_one_page_text(app: &mut App<'_>) {
         Err(_) => String::new(),
     };
     app.doc_index.add_page(page_idx, text);
+
+    // First time the index becomes complete, snapshot it to disk.
+    // Failure is silent (cache is best-effort).
+    if app.doc_index.is_complete() && !app.index_persisted {
+        if let Some(dir) = disk_cache::pdf_cache_dir(&app.path) {
+            let p = dir.join("index.bin");
+            let _ = search_index::save(&app.doc_index, &p);
+        }
+        app.index_persisted = true;
+    }
 }
 
 /// Render + bake overlay + pre-encode PNG for one upcoming uncached

@@ -273,6 +273,11 @@ pub struct App<'doc> {
     /// definitely don't contain the query. Sioyek-style win:
     /// 4 100-page docs go from ~5 s search to ~0.03 s once filled.
     pub doc_index: crate::search_index::DocIndex,
+    /// Has the *complete* index been written to disk yet? Set once
+    /// after the first `is_complete()` save so we don't re-write
+    /// every frame. Reset implicitly on file-mtime change via the
+    /// disk_cache hash key (loaded index won't be found).
+    pub index_persisted: bool,
 
     /// Vimium-style link-follow state. `true` while the user has
     /// pressed `f` and is typing the hint chars to pick a target.
@@ -397,6 +402,14 @@ impl<'doc> App<'doc> {
         // Empty layout — first `ensure_image` call builds a real one
         // once the viewport size is known.
         let layout = PageLayout::build(&[], 0, 0);
+        // Try to load a previously-built search index from disk.
+        // Hit saves ~5 ms × N pages of pdfium text extraction
+        // (~3.5 s for a 700-page book on second open).
+        let doc_index = crate::disk_cache::pdf_cache_dir(path)
+            .map(|d| d.join("index.bin"))
+            .and_then(|p| crate::search_index::load(&p, page_count))
+            .unwrap_or_else(|| crate::search_index::DocIndex::new(page_count));
+        let index_persisted = doc_index.is_complete();
         let kitty_pages = matches!(picker.protocol_type(), ratatui_image::picker::ProtocolType::Kitty)
             .then(|| {
                 let is_tmux = std::env::var("TMUX").is_ok();
@@ -448,7 +461,8 @@ impl<'doc> App<'doc> {
             highlight_revision: 0,
             search: None,
             last_query: None,
-            doc_index: crate::search_index::DocIndex::new(page_count),
+            doc_index,
+            index_persisted,
             link_hint_mode: false,
             link_hints: Vec::new(),
             hint_filter: String::new(),

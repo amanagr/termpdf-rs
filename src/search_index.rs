@@ -226,6 +226,107 @@ impl DocIndex {
     }
 }
 
+/// File format magic + version. Bumping the version invalidates
+/// existing on-disk indexes (gracefully — we just rebuild).
+const INDEX_MAGIC: &[u8; 8] = b"TPDFIDX1";
+
+/// Save the index to `path`. Best-effort: any IO failure returns
+/// `Ok(false)` so callers can ignore disk-cache failures.
+///
+/// File layout:
+///   8 bytes   magic "TPDFIDX1"
+///   8 bytes   total_pages (u64 LE)
+///   8 bytes   indexed_count (u64 LE)
+///   8 bytes   text_len (u64 LE)
+///   N×8 bytes page_starts vector (u64 LE per entry)
+///   M bytes   text payload
+pub fn save(index: &DocIndex, path: &std::path::Path) -> std::io::Result<bool> {
+    let parent = match path.parent() {
+        Some(p) => p,
+        None => return Ok(false),
+    };
+    if let Err(e) = std::fs::create_dir_all(parent) {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Ok(false);
+        }
+    }
+    let mut buf =
+        Vec::with_capacity(8 + 8 + 8 + 8 + index.page_starts.len() * 8 + index.text.len());
+    buf.extend_from_slice(INDEX_MAGIC);
+    buf.extend_from_slice(&(index.total_pages as u64).to_le_bytes());
+    buf.extend_from_slice(&(index.indexed_count() as u64).to_le_bytes());
+    buf.extend_from_slice(&(index.text.len() as u64).to_le_bytes());
+    for &p in &index.page_starts {
+        buf.extend_from_slice(&(p as u64).to_le_bytes());
+    }
+    buf.extend_from_slice(index.text.as_bytes());
+
+    // Atomic write via rename so a crash mid-write doesn't leave a
+    // truncated index that later loads as garbage.
+    let tmp = path.with_extension("idx.tmp");
+    if std::fs::write(&tmp, &buf).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return Ok(false);
+    }
+    if std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Load an index from `path`. Returns `None` on any read / parse
+/// error (caller treats this as cache miss → builds from scratch).
+///
+/// Validates that the on-disk total_pages matches the supplied
+/// `expected_total` — invalidates the cache when the document's
+/// page count differs (e.g. user replaced the PDF with a different
+/// version). Hash-key invalidation upstream catches most cases;
+/// this is a belt-and-suspenders extra check.
+pub fn load(path: &std::path::Path, expected_total: usize) -> Option<DocIndex> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() < 8 + 8 + 8 + 8 {
+        return None;
+    }
+    if &bytes[..8] != INDEX_MAGIC {
+        return None;
+    }
+    let total_pages = u64::from_le_bytes(bytes[8..16].try_into().ok()?) as usize;
+    if total_pages != expected_total {
+        return None;
+    }
+    let indexed_count = u64::from_le_bytes(bytes[16..24].try_into().ok()?) as usize;
+    let text_len = u64::from_le_bytes(bytes[24..32].try_into().ok()?) as usize;
+    let header_end = 32usize;
+    let starts_end = header_end + total_pages * 8;
+    if bytes.len() < starts_end + text_len {
+        return None;
+    }
+    let mut page_starts = Vec::with_capacity(total_pages);
+    for i in 0..total_pages {
+        let base = header_end + i * 8;
+        let v = u64::from_le_bytes(bytes[base..base + 8].try_into().ok()?) as usize;
+        page_starts.push(v);
+    }
+    let text = std::str::from_utf8(&bytes[starts_end..starts_end + text_len])
+        .ok()?
+        .to_string();
+    let indexed_pages: HashSet<usize> = (0..total_pages)
+        .filter(|i| page_starts[*i] != NOT_INDEXED)
+        .collect();
+    if indexed_pages.len() != indexed_count {
+        // Length mismatch hints at corruption; reject so we rebuild.
+        return None;
+    }
+    Some(DocIndex {
+        text,
+        page_starts,
+        indexed_pages,
+        total_pages,
+        revision: 1,
+    })
+}
+
 /// Range mapping: given a slice's start in `text`, return
 /// (page, in-page byte offset, in-page byte length). Helper for
 /// callers that want to highlight not just the page but the actual
@@ -342,6 +443,66 @@ mod tests {
         let (page, range) = slice_to_page_range(&idx, off..off + 3).expect("page mapped");
         assert_eq!(page, 0);
         assert_eq!(range, 16..19);
+    }
+
+    #[test]
+    fn save_then_load_roundtrips_text_and_pages() {
+        let dir = std::env::temp_dir().join(format!("idx_save_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("idx.bin");
+        let idx = populated_index();
+        let written = save(&idx, &path).unwrap();
+        assert!(written, "save should report success on temp dir");
+        let loaded = load(&path, idx.total_pages).expect("load on hit");
+        assert_eq!(loaded.total_pages, idx.total_pages);
+        assert_eq!(loaded.indexed_count(), idx.indexed_count());
+        assert_eq!(loaded.text(), idx.text());
+        // Search results match.
+        assert_eq!(loaded.pages_matching("the", false), idx.pages_matching("the", false));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_rejects_wrong_total_pages() {
+        let dir = std::env::temp_dir().join(format!("idx_wrong_total_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("idx.bin");
+        let idx = populated_index();
+        save(&idx, &path).unwrap();
+        // Lie about total — must reject.
+        assert!(load(&path, 99).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_rejects_wrong_magic() {
+        let dir = std::env::temp_dir().join(format!("idx_bad_magic_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("idx.bin");
+        std::fs::write(&path, b"NOPE0001\x00\x00\x00\x00\x00\x00\x00\x00").unwrap();
+        assert!(load(&path, 1).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_missing_file_returns_none() {
+        let path = std::env::temp_dir().join("nonexistent-index-file.bin");
+        assert!(load(&path, 5).is_none());
+    }
+
+    #[test]
+    fn load_truncated_returns_none() {
+        let dir = std::env::temp_dir().join(format!("idx_trunc_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("idx.bin");
+        let idx = populated_index();
+        save(&idx, &path).unwrap();
+        // Truncate the file mid-header.
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.truncate(20);
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(load(&path, idx.total_pages).is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
