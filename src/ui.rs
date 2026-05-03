@@ -296,11 +296,20 @@ fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
     }
 
     // Speculatively render a few pages outside the viewport in the
-    // user's scroll direction. Sent to the background worker (if
-    // available) so cold prefetch never blocks the UI.
-    let prefetch = app.prefetch_targets(visible.clone());
-    for page_idx in prefetch {
-        request_prefetch(app, page_idx, fit_width_px);
+    // user's scroll direction. Sent to the background worker if one's
+    // available; otherwise falls through to a sync render. The render
+    // worker is currently a stub (see render_worker.rs), so each
+    // prefetch is a synchronous ~20 ms pdfium call here.
+    //
+    // During a rapid-scroll burst, skip prefetch entirely. Otherwise
+    // a held-`j` pays ~40 ms of pdfium on every frame for pages the
+    // user is about to scroll past anyway. The settle redraw fired
+    // when input goes idle warms whatever's actually visible.
+    if !app.is_rapid_scrolling() {
+        let prefetch = app.prefetch_targets(visible.clone());
+        for page_idx in prefetch {
+            request_prefetch(app, page_idx, fit_width_px);
+        }
     }
 
     app.evict_far_pages(visible.clone());
