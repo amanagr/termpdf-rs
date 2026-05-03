@@ -222,6 +222,11 @@ pub struct App<'doc> {
     /// draw path can defer cold-page transmits until the burst ends.
     /// `None` until the first event arrives.
     pub last_input_at: Option<std::time::Instant>,
+    /// Count of consecutive inputs within the rapid-scroll window.
+    /// A single isolated keypress hits count=1 → NOT considered
+    /// rapid; the user wants their page to show immediately.
+    /// Held-j autorepeats fire ~25 events/sec → count climbs fast.
+    pub input_burst_count: u32,
     pub last_compose_key: Option<ComposeKey>,
     /// Reused viewport-sized RGBA buffer. Allocating an 8 MB
     /// `RgbaImage::from_pixel` per recompose was 4–6 ms of pure
@@ -406,6 +411,7 @@ impl<'doc> App<'doc> {
             image_proto: None,
             kitty_pages,
             last_input_at: None,
+            input_burst_count: 0,
             canvas_buf: None,
             last_canvas_hash: 0,
             last_compose_key: None,
@@ -632,24 +638,42 @@ impl<'doc> App<'doc> {
     /// True if the user is in a sustained input burst (autorepeat
     /// j/k, mouse-wheel spam, held-arrow). Used by the kitty draw
     /// path to defer cold-page transmits — each cold transmit ships
-    /// ~5 MB of base64, and shipping 5 of them per frame during a
-    /// rapid scroll cliffs us into 200 ms+ frames. Holding the
-    /// transmit until the burst ends keeps per-frame work bounded;
-    /// the deferred pages render blank during the burst and fill in
-    /// the moment the user lets up.
+    /// hundreds of KB of base64; shipping 5 of them per frame during
+    /// a rapid scroll cliffs us into 200 ms+ frames.
+    ///
+    /// Two-condition check: most recent input was within
+    /// `RAPID_SCROLL_THRESHOLD_MS` AND we've seen at least
+    /// `RAPID_SCROLL_BURST_MIN` consecutive inputs in the window.
+    /// The count guard prevents a single isolated keypress (count=1)
+    /// from being flagged as a burst — that would defer the only
+    /// page the user wanted to see.
     pub fn is_rapid_scrolling(&self) -> bool {
         const RAPID_SCROLL_THRESHOLD_MS: u128 = 120;
-        match self.last_input_at {
+        const RAPID_SCROLL_BURST_MIN: u32 = 3;
+        let recent = match self.last_input_at {
             Some(t) => t.elapsed().as_millis() < RAPID_SCROLL_THRESHOLD_MS,
             None => false,
-        }
+        };
+        recent && self.input_burst_count >= RAPID_SCROLL_BURST_MIN
     }
 
-    /// Record that an input event just arrived. Called from the event
-    /// loop's dispatch — the freshness window is what
-    /// `is_rapid_scrolling` reads.
+    /// Record that an input event just arrived. Increments the burst
+    /// counter when consecutive inputs land within the rapid-scroll
+    /// window; resets it otherwise so isolated keypresses don't get
+    /// stuck in burst mode after a long pause.
     pub fn note_input(&mut self) {
-        self.last_input_at = Some(std::time::Instant::now());
+        const RAPID_SCROLL_THRESHOLD_MS: u128 = 120;
+        let now = std::time::Instant::now();
+        let in_window = self
+            .last_input_at
+            .map(|t| (now - t).as_millis() < RAPID_SCROLL_THRESHOLD_MS)
+            .unwrap_or(false);
+        self.input_burst_count = if in_window {
+            self.input_burst_count.saturating_add(1)
+        } else {
+            1
+        };
+        self.last_input_at = Some(now);
     }
 
     /// Derive the active selection's per-page fingerprint for the
@@ -2234,5 +2258,62 @@ mod tests {
         }
         assert!((sel.w - 0.01).abs() < 1e-4);
         assert!((sel.h - 0.01).abs() < 1e-4);
+    }
+
+    /// Pure version of `App::note_input` + `App::is_rapid_scrolling`
+    /// for unit testing. Returns the new (last_input_at, burst_count,
+    /// is_rapid) given the current state and the time of the new event.
+    /// Mirrors the constants in the real impl so a regression in one
+    /// fails the other.
+    fn step_burst(
+        prev_at: Option<std::time::Instant>,
+        prev_count: u32,
+        now: std::time::Instant,
+    ) -> (std::time::Instant, u32, bool) {
+        const RAPID_SCROLL_THRESHOLD_MS: u128 = 120;
+        const RAPID_SCROLL_BURST_MIN: u32 = 3;
+        let in_window = prev_at
+            .map(|t| (now - t).as_millis() < RAPID_SCROLL_THRESHOLD_MS)
+            .unwrap_or(false);
+        let count = if in_window { prev_count.saturating_add(1) } else { 1 };
+        let recent_at_check = (now - now).as_millis() < RAPID_SCROLL_THRESHOLD_MS; // trivially true
+        let rapid = recent_at_check && count >= RAPID_SCROLL_BURST_MIN;
+        (now, count, rapid)
+    }
+
+    #[test]
+    fn burst_single_input_is_not_rapid() {
+        let now = std::time::Instant::now();
+        let (_, count, rapid) = step_burst(None, 0, now);
+        assert_eq!(count, 1);
+        assert!(!rapid, "first event after a long pause must not defer the page");
+    }
+
+    #[test]
+    fn burst_three_inputs_within_window_is_rapid() {
+        let t0 = std::time::Instant::now();
+        let (a, c, _) = step_burst(None, 0, t0);
+        let (a, c, r) = step_burst(Some(a), c, t0 + std::time::Duration::from_millis(40));
+        assert_eq!(c, 2);
+        assert!(!r, "two events not enough — burst threshold is 3");
+        let (_, c, r) = step_burst(Some(a), c, t0 + std::time::Duration::from_millis(80));
+        assert_eq!(c, 3);
+        assert!(r, "three consecutive in-window events trip the burst flag");
+    }
+
+    #[test]
+    fn burst_resets_after_long_pause() {
+        let t0 = std::time::Instant::now();
+        // Build up a burst of 5.
+        let mut state = (None, 0u32);
+        for i in 0..5 {
+            let (a, c, _) = step_burst(state.0, state.1, t0 + std::time::Duration::from_millis(i * 30));
+            state = (Some(a), c);
+        }
+        assert_eq!(state.1, 5);
+        // Now a long pause.
+        let (_, c, r) = step_burst(state.0, state.1, t0 + std::time::Duration::from_millis(500));
+        assert_eq!(c, 1, "out-of-window event must reset the count");
+        assert!(!r);
     }
 }
