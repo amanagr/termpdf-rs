@@ -1678,7 +1678,7 @@ fn status_line(app: &App<'_>) -> Paragraph<'static> {
 
     if !mode_label.is_empty() {
         spans.push(Span::styled(
-            mode_label.to_string(),
+            mode_label,
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Yellow)
@@ -1701,7 +1701,7 @@ fn status_line(app: &App<'_>) -> Paragraph<'static> {
         ));
         if app.dark {
             spans.push(Span::styled(
-                "DARK  ".to_string(),
+                "DARK  ",
                 Style::default().fg(Color::Cyan),
             ));
         }
@@ -1721,7 +1721,7 @@ fn status_line(app: &App<'_>) -> Paragraph<'static> {
             ));
         }
         spans.push(Span::styled(
-            "    ?  for help".to_string(),
+            "    ?  for help",
             Style::default().fg(Color::DarkGray),
         ));
     }
@@ -1929,8 +1929,8 @@ mod tests {
         // Row 3 is the exposed strip — caller will overwrite, but
         // we're not testing that here.
         shift_canvas_rows(&mut buf, w, h, 1);
-        assert_eq!(buf[0 * stride], 1, "row 0 should hold ex-row-1");
-        assert_eq!(buf[1 * stride], 2, "row 1 should hold ex-row-2");
+        assert_eq!(buf[0], 1, "row 0 should hold ex-row-1");
+        assert_eq!(buf[stride], 2, "row 1 should hold ex-row-2");
         assert_eq!(buf[2 * stride], 3, "row 2 should hold ex-row-3");
 
         // Reset.

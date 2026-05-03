@@ -2856,8 +2856,7 @@ mod tests {
             .map(|t| (now - t).as_millis() < RAPID_SCROLL_THRESHOLD_MS)
             .unwrap_or(false);
         let count = if in_window { prev_count.saturating_add(1) } else { 1 };
-        let recent_at_check = (now - now).as_millis() < RAPID_SCROLL_THRESHOLD_MS; // trivially true
-        let rapid = recent_at_check && count >= RAPID_SCROLL_BURST_MIN;
+        let rapid = count >= RAPID_SCROLL_BURST_MIN;
         (now, count, rapid)
     }
 
