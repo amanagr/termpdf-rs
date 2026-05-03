@@ -47,7 +47,7 @@ struct AnnotMeta {
 pub fn load_from_pdf(document: &PdfDocument<'_>) -> Result<HighlightStore> {
     let mut items: Vec<Highlight> = Vec::new();
     let pages = document.pages();
-    let total = pages.len() as i32;
+    let total = pages.len();
 
     for page_idx in 0..total {
         let Ok(page) = pages.get(page_idx) else {
@@ -150,7 +150,7 @@ fn apply_store_to_document(
     candidate_pages: Option<&std::collections::HashSet<usize>>,
 ) -> Result<()> {
     let pages = document.pages();
-    let total = pages.len() as i32;
+    let total = pages.len();
 
     // Surface — rather than silently drop — highlights that point past
     // the end of the document (e.g. a session restored from a longer

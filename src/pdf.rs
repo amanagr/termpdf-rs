@@ -102,7 +102,7 @@ pub struct PageMetrics {
 
 pub fn page_metrics(document: &PdfDocument<'_>) -> Result<Vec<PageMetrics>> {
     let pages = document.pages();
-    let total = pages.len() as i32;
+    let total = pages.len();
     let mut out = Vec::with_capacity(total.max(0) as usize);
     for i in 0..total {
         let p = pages.get(i)?;
@@ -151,7 +151,7 @@ pub fn render_page_at_width(
     target_width_px: u32,
 ) -> Result<DynamicImage> {
     let pages = document.pages();
-    let total = pages.len() as i32;
+    let total = pages.len();
     if total <= 0 {
         anyhow::bail!("PDF has zero pages");
     }

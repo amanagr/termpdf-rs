@@ -141,7 +141,7 @@ impl PageText {
         // push doesn't grow the Vec mid-build. A typical PDF page has
         // 500-3000 chars; growing from 0 takes ~9 reallocs at small N
         // and a final 32-128 KB malloc at large N.
-        let mut chars: Vec<CharCell> = Vec::with_capacity(chars_collection.len() as usize);
+        let mut chars: Vec<CharCell> = Vec::with_capacity(chars_collection.len());
         for ch in chars_collection.iter() {
             let bbox = match ch.loose_bounds() {
                 Ok(r) => r,
@@ -153,7 +153,7 @@ impl PageText {
             let top = ((h - bbox.top().value) / h).clamp(0.0, 1.0);
             let bot = ((h - bbox.bottom().value) / h).clamp(0.0, 1.0);
             chars.push(CharCell {
-                idx: ch.index() as usize,
+                idx: ch.index(),
                 ch: ch.unicode_char(),
                 bbox: Rect01 {
                     x,
