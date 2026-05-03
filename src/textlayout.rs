@@ -459,14 +459,19 @@ impl PageText {
         }
         let from = from.min(self.chars.len() - 1);
         let cur_line = self.line_of(from)?;
-        // Median line height as gap threshold.
+        // Median line height as gap threshold. `select_nth_unstable_by`
+        // partitions in O(n) for the single value we need, vs the
+        // O(n log n) of a full sort.
         let mut heights: Vec<f32> = self
             .lines
             .iter()
             .map(|l| (l.y_bot - l.y_top).max(1e-6))
             .collect();
-        heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let med = heights[heights.len() / 2].max(1e-4);
+        let mid = heights.len() / 2;
+        let (_, &mut med_raw, _) = heights.select_nth_unstable_by(mid, |a, b| {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let med = med_raw.max(1e-4);
         let gap_threshold = med * 1.6;
 
         let mut start_line = cur_line;
@@ -603,10 +608,15 @@ fn cluster_lines(chars: &mut [CharCell]) -> Vec<LineSpan> {
         .collect();
     order.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Median height as the line-band tolerance.
+    // Median height as the line-band tolerance. We only need the
+    // value at index len/2 — `select_nth_unstable_by` partitions in
+    // O(n) instead of O(n log n) for a full sort.
     let mut heights: Vec<f32> = order.iter().map(|t| t.2).collect();
-    heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let med_h = heights[heights.len() / 2].max(1e-4);
+    let mid = heights.len() / 2;
+    let (_, &mut med_raw, _) = heights.select_nth_unstable_by(mid, |a, b| {
+        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let med_h = med_raw.max(1e-4);
     let tol = med_h * 0.55;
 
     // First pass: walk in Y order, group chars into lines.
