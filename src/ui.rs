@@ -600,6 +600,7 @@ fn drain_worker_results(app: &mut App<'_>) {
         match resp.image {
             Ok(img) => {
                 app.page_cache.insert(resp.req.page, img);
+                app.touch_page(resp.req.page);
                 // Force a recompose since a previously-blank page
                 // now has pixels.
                 app.last_compose_key = None;
