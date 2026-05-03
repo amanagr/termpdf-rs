@@ -299,6 +299,11 @@ pub struct App<'doc> {
     /// means "loaded, no outline" (vs `None` which would be "not
     /// yet loaded" — we avoid that state by loading in `App::new`).
     pub outline: Vec<OutlineEntry>,
+    /// Sorted-deduped page indices of `outline` entries with a
+    /// resolved page. Built once at construction; consulted on every
+    /// `]]`/`[[` press to avoid an allocation + sort + dedup on the
+    /// section-jump path.
+    pub outline_pages_sorted: Vec<usize>,
     /// `true` while the TOC overlay panel is open. Behaves like
     /// `show_help` — consumed first by `dispatch` so existing
     /// keybindings stay intact.
@@ -399,6 +404,16 @@ impl<'doc> App<'doc> {
             eprintln!("warning: could not load outline: {e:#}");
             Vec::new()
         });
+        let outline_pages_sorted: Vec<usize> = {
+            let mut v: Vec<usize> = outline
+                .iter()
+                .filter_map(|e| e.page)
+                .filter(|p| *p < page_count)
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
         let highlights = pdfhighlights::load_from_pdf(&document).unwrap_or_else(|e| {
             eprintln!("warning: could not read PDF annotations: {e:#}");
             HighlightStore::default()
@@ -482,6 +497,7 @@ impl<'doc> App<'doc> {
             link_hints: Vec::new(),
             hint_filter: String::new(),
             outline,
+            outline_pages_sorted,
             show_toc: false,
             toc_cursor: 0,
             toc_filter: String::new(),
@@ -885,17 +901,11 @@ impl<'doc> App<'doc> {
             self.status = "no outline in this document".into();
             return;
         }
-        let outline_pages: Vec<usize> = self
-            .outline
-            .iter()
-            .filter_map(|e| e.page)
-            .filter(|p| *p < self.page_count)
-            .collect();
-        if outline_pages.is_empty() {
+        if self.outline_pages_sorted.is_empty() {
             self.status = "outline has no resolved pages".into();
             return;
         }
-        match next_section_target(&outline_pages, self.current_page(), dir) {
+        match next_section_target(&self.outline_pages_sorted, self.current_page(), dir) {
             Some(p) => {
                 self.goto_page(p);
                 self.status = format!("→ page {}", p + 1);
@@ -2427,25 +2437,25 @@ pub fn find_references_page(outline: &[OutlineEntry]) -> Option<usize> {
     None
 }
 
-/// Pure helper: given a sorted-deduped vec of outline page indices,
-/// the user's current page, and a direction (+1 next, -1 prev),
-/// returns the page to jump to. `None` means "no neighbour in that
-/// direction". Extracted so it can be unit-tested without an App.
+/// Pure helper: given a sorted-deduped slice of outline page
+/// indices, the user's current page, and a direction (+1 next,
+/// -1 prev), returns the page to jump to. `None` means "no
+/// neighbour in that direction". Caller guarantees `outline_pages`
+/// is sorted ascending and deduped — `App::outline_pages_sorted`
+/// is built that way once at startup, so the section-jump path
+/// stays allocation-free.
 pub fn next_section_target(
     outline_pages: &[usize],
     current_page: usize,
     dir: i32,
 ) -> Option<usize> {
-    let mut sorted: Vec<usize> = outline_pages.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
     if dir > 0 {
-        sorted.into_iter().find(|p| *p > current_page)
+        outline_pages.iter().copied().find(|p| *p > current_page)
     } else {
         // For `[[`: from a page mid-section, land on the section's
         // first page. From the section's first page, land on the
         // previous section's first page.
-        sorted.into_iter().filter(|p| *p < current_page).next_back()
+        outline_pages.iter().copied().rev().find(|p| *p < current_page)
     }
 }
 
@@ -2940,13 +2950,6 @@ mod tests {
             outline_entry("Chapter 2", Some(20)),
         ];
         assert_eq!(find_references_page(&outline), None);
-    }
-
-    #[test]
-    fn next_section_handles_unsorted_dup_input() {
-        let outline = vec![20, 5, 12, 5, 0]; // unsorted, with dupes
-        assert_eq!(next_section_target(&outline, 7, 1), Some(12));
-        assert_eq!(next_section_target(&outline, 7, -1), Some(5));
     }
 
     #[test]
