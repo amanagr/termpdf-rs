@@ -2048,6 +2048,76 @@ impl<'doc> App<'doc> {
         .save(&self.path)
     }
 
+    /// Build a one-line PDF metadata summary for the status bar.
+    /// Pulls title / author from pdfium and adds page count + file size.
+    pub fn show_info(&mut self) {
+        use pdfium_render::prelude::PdfDocumentMetadataTagType;
+        let meta = self.document.metadata();
+        let title = meta
+            .get(PdfDocumentMetadataTagType::Title)
+            .map(|t| t.value().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                self.path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("(unknown)")
+                    .to_string()
+            });
+        let author = meta
+            .get(PdfDocumentMetadataTagType::Author)
+            .map(|t| t.value().to_string())
+            .filter(|s| !s.is_empty());
+        let bytes = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        self.status = match author {
+            Some(a) => format!(
+                "{} — {} · {} pages · {}",
+                title,
+                a,
+                self.page_count,
+                human_bytes(bytes),
+            ),
+            None => format!(
+                "{} · {} pages · {}",
+                title,
+                self.page_count,
+                human_bytes(bytes),
+            ),
+        };
+    }
+
+    /// Build a one-line render-pipeline diagnostic for the status bar.
+    /// Useful for chasing blur / sizing bugs ("am I rendering at the
+    /// resolution I think I am?") without bouncing to env vars or logs.
+    pub fn show_diag(&mut self) {
+        let (cw, ch) = self.cell_size_px;
+        let (vw, vh) = self.viewport_px;
+        let cells_w = if cw == 0 { 0 } else { vw / cw as u32 };
+        let cells_h = if ch == 0 { 0 } else { vh / ch as u32 };
+        let scale = std::env::var("TERMPDF_RENDER_SCALE")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(2.0);
+        let proto = match self.picker.protocol_type() {
+            ratatui_image::picker::ProtocolType::Kitty => "kitty",
+            ratatui_image::picker::ProtocolType::Sixel => "sixel",
+            ratatui_image::picker::ProtocolType::Iterm2 => "iterm2",
+            ratatui_image::picker::ProtocolType::Halfblocks => "halfblocks",
+        };
+        self.status = format!(
+            "{}/{} cell={}x{}px viewport={}x{}cell ({}x{}px) fit_w={}px zoom={:.2}× scale={:.1}× dark={}",
+            proto,
+            if self.is_tmux { "tmux" } else { "direct" },
+            cw, ch,
+            cells_w, cells_h,
+            vw, vh,
+            self.layout.fit_width_px,
+            self.zoom,
+            scale,
+            self.dark,
+        );
+    }
+
     /// Set mark `c` to the currently-leading page. Vim's marks are
     /// scoped per buffer; ours are per PDF and persisted via Session.
     pub fn set_mark(&mut self, c: char) {
@@ -2330,6 +2400,24 @@ pub fn next_section_target(
         // first page. From the section's first page, land on the
         // previous section's first page.
         sorted.into_iter().filter(|p| *p < current_page).next_back()
+    }
+}
+
+/// Compact byte-count formatter for `:info`. Picks the largest unit
+/// that keeps the number ≤ 1024 and prints to 1 decimal (omitted for
+/// bytes). 1234567 → "1.2 MB"; 999 → "999 B".
+fn human_bytes(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if n >= GB {
+        format!("{:.1} GB", n as f64 / GB as f64)
+    } else if n >= MB {
+        format!("{:.1} MB", n as f64 / MB as f64)
+    } else if n >= KB {
+        format!("{:.1} KB", n as f64 / KB as f64)
+    } else {
+        format!("{n} B")
     }
 }
 
@@ -2826,5 +2914,16 @@ mod tests {
         assert_eq!(filter, "x");
         assert!(action.is_none(), "no-match must not dispatch");
         assert!(exit, "no-match must exit hint mode");
+    }
+
+    #[test]
+    fn human_bytes_picks_largest_unit() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(999), "999 B");
+        assert_eq!(human_bytes(1024), "1.0 KB");
+        assert_eq!(human_bytes(1500), "1.5 KB");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(human_bytes(1024u64 * 1024 * 1024 * 3 + 1024 * 1024 * 512),
+                   "3.5 GB");
     }
 }

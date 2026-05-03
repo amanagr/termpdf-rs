@@ -1747,6 +1747,8 @@ pub fn help_overlay_lines() -> Vec<&'static str> {
         "                         Esc cancels",
         "  :<n>  /  :goto N       jump to page n",
         "  :export [path]         dump highlights as Markdown notes",
+        "  :info                  show PDF metadata (title, author, page count, size)",
+        "  :diag                  show terminal + render diagnostics (cell px, fit_w, scale)",
         "  :q                     quit",
         "  :set dark | :set nodark",
         "  ?                      toggle this overlay",

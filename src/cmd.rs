@@ -35,6 +35,12 @@ pub enum Command {
     /// `:export [path]`. `None` means "derive default path from the
     /// open PDF" (resolved at execute-time so the parser stays pure).
     Export(Option<PathBuf>),
+    /// Show PDF metadata (title, author, page count, file size).
+    Info,
+    /// Show rendering diagnostics (cell pixel size, viewport, zoom,
+    /// fit-width, render scale). Useful for debugging blur / sizing
+    /// issues on a new terminal.
+    Diag,
     /// `:goto` with no number, or with a non-numeric arg.
     GotoMissingArg,
     GotoBadArg(String),
@@ -88,6 +94,8 @@ pub fn parse(line: &str) -> Command {
         "toc" => Command::Toc,
         "help" => Command::Help,
         "refs" | "ref" | "bib" | "bibliography" | "references" => Command::Refs,
+        "info" | "metadata" => Command::Info,
+        "diag" | "diagnostics" => Command::Diag,
         "export" | "notes" => {
             // `:export some/path/with spaces.md` is rare but possible;
             // collect the rest of the line verbatim rather than split
@@ -118,6 +126,8 @@ pub fn execute(app: &mut App<'_>, line: &str) {
         Command::Toc => app.toggle_toc(),
         Command::Help => app.show_help = true,
         Command::Refs => app.jump_to_references(),
+        Command::Info => app.show_info(),
+        Command::Diag => app.show_diag(),
         Command::Export(maybe_target) => {
             let target = maybe_target.unwrap_or_else(|| {
                 let mut p = app.path.clone();
@@ -238,6 +248,14 @@ mod tests {
         assert_eq!(parse("bib"), Command::Refs);
         assert_eq!(parse("bibliography"), Command::Refs);
         assert_eq!(parse("references"), Command::Refs);
+    }
+
+    #[test]
+    fn info_and_diag_aliases() {
+        assert_eq!(parse("info"), Command::Info);
+        assert_eq!(parse("metadata"), Command::Info);
+        assert_eq!(parse("diag"), Command::Diag);
+        assert_eq!(parse("diagnostics"), Command::Diag);
     }
 
     /// Adversarial-input fuzz lite: bytes-as-strings shouldn't panic.
