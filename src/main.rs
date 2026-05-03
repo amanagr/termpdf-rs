@@ -450,7 +450,17 @@ fn warm_one_idle(app: &mut App<'_>) -> Result<()> {
         }
         let pi = cand as usize;
         if !app.page_cache.contains_key(&pi) && !app.failed_pages.contains(&pi) {
-            return ui::ensure_page_rendered(app, pi, fit_width_px, /*allow_failure=*/ true);
+            ui::ensure_page_rendered(app, pi, fit_width_px, /*allow_failure=*/ true)?;
+            // Bake overlay too (highlights+selection): tier-2 cache
+            // ready means the next sight skips the per-page bake too.
+            // Cheap relative to the pdfium render we just did (~1 ms
+            // vs ~20 ms).
+            let layout_key = crate::app::LayoutKey {
+                fit_width_px,
+                dark: app.dark,
+            };
+            ui::ensure_overlay(app, pi, layout_key);
+            return Ok(());
         }
     }
     Ok(())

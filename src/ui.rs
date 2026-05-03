@@ -1024,7 +1024,7 @@ fn page_overlay_key(app: &App<'_>, page_idx: usize, layout: LayoutKey) -> PageOv
 /// highlights / search hits; we clone the highlights_baked image
 /// and paint just the selection band on top. For a heavily
 /// highlighted page the saved-N×fill_rect_blend disappears.
-fn ensure_overlay(app: &mut App<'_>, page_idx: usize, layout: LayoutKey) {
+pub(crate) fn ensure_overlay(app: &mut App<'_>, page_idx: usize, layout: LayoutKey) {
     let overlay_key = page_overlay_key(app, page_idx, layout);
     if app
         .overlay_cache
