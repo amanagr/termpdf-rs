@@ -309,6 +309,11 @@ pub struct App<'doc> {
     /// session restored one). Consumed by the first `ensure_layout`
     /// call to compute the initial scroll offset, then cleared.
     pub pending_initial_page: Option<usize>,
+    /// Fraction `0..=1` into the pending initial page where the
+    /// previous session left the user. Applied alongside
+    /// `pending_initial_page` so reopens land mid-page exactly where
+    /// the user was reading, not at the page boundary above.
+    pub pending_initial_scroll_in_page: f32,
 
     /// Vim-style named marks `m{a..z}` → page index. Persisted via
     /// `Session` so a reopened document still has its marks.
@@ -371,6 +376,7 @@ impl ResumeMarker {
 pub const RESUME_MARKER_REARM: Duration = Duration::from_secs(10);
 
 impl<'doc> App<'doc> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         document: PdfDocument<'doc>,
         path: &Path,
@@ -378,6 +384,7 @@ impl<'doc> App<'doc> {
         dark: bool,
         zoom: f32,
         marks: std::collections::BTreeMap<char, usize>,
+        scroll_in_page: f32,
         picker: Picker,
     ) -> Result<Self> {
         let page_count = document.pages().len() as usize;
@@ -472,6 +479,7 @@ impl<'doc> App<'doc> {
             toc_filter: String::new(),
             toc_filter_editing: false,
             pending_initial_page: if page < page_count { Some(page) } else { None },
+            pending_initial_scroll_in_page: scroll_in_page.clamp(0.0, 1.0),
             marks,
             jumplist: Vec::new(),
             jump_idx: 0,
@@ -528,7 +536,14 @@ impl<'doc> App<'doc> {
             let new_page_h = self.layout.page_h(cur_page) as f32;
             self.scroll_y_px = new_page_y + (frac * new_page_h) as i64;
         } else if let Some(page_idx) = self.pending_initial_page.take() {
-            self.scroll_y_px = self.layout.page_y(page_idx);
+            // Apply both the saved page AND the saved within-page
+            // fraction so a reopen lands exactly where the user was
+            // reading, not at the page boundary above.
+            let page_y = self.layout.page_y(page_idx);
+            let page_h = self.layout.page_h(page_idx) as f32;
+            let frac = self.pending_initial_scroll_in_page;
+            self.pending_initial_scroll_in_page = 0.0;
+            self.scroll_y_px = page_y + (frac.clamp(0.0, 1.0) * page_h) as i64;
         }
 
         self.scroll_y_px = self.layout.clamp_scroll(self.scroll_y_px, viewport_h_px);
@@ -2014,11 +2029,21 @@ impl<'doc> App<'doc> {
     }
 
     pub fn persist_session(&self) -> Result<()> {
+        // Capture the user's exact within-page reading position as a
+        // fraction so a reopen lands at the same scroll, not just the
+        // top of the page they were on. Mirrors the across-zoom math
+        // in `ensure_layout`.
+        let cur_page = self.current_page();
+        let page_y = self.layout.page_y(cur_page);
+        let page_h = self.layout.page_h(cur_page).max(1) as f32;
+        let scroll_in_page =
+            ((self.scroll_y_px - page_y) as f32 / page_h).clamp(0.0, 1.0);
         Session {
-            page: self.current_page(),
+            page: cur_page,
             dark: self.dark,
             zoom: self.zoom,
             marks: self.marks.clone(),
+            scroll_in_page,
         }
         .save(&self.path)
     }

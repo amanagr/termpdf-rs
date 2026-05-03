@@ -28,6 +28,13 @@ pub struct Session {
     /// `'a` after a reopen lands where the user expected.
     #[serde(default)]
     pub marks: std::collections::BTreeMap<char, usize>,
+    /// Fraction `0.0..=1.0` of the way down the saved page at exit.
+    /// Stored as fraction (not absolute pixels) so the restored
+    /// position survives terminal resize / zoom drift between sessions.
+    /// 0.0 = at top of page; serde default keeps legacy sessions
+    /// landing at page top, matching pre-feature behaviour.
+    #[serde(default)]
+    pub scroll_in_page: f32,
 }
 
 fn default_zoom() -> f32 {
@@ -41,6 +48,7 @@ impl Default for Session {
             dark: false,
             zoom: 1.0,
             marks: std::collections::BTreeMap::new(),
+            scroll_in_page: 0.0,
         }
     }
 }
@@ -151,6 +159,7 @@ mod tests {
             dark: true,
             zoom: 2.5,
             marks,
+            scroll_in_page: 0.37,
         };
         s.save(&pdf).unwrap();
         let loaded = Session::load(&pdf);
@@ -159,6 +168,7 @@ mod tests {
         assert!((loaded.zoom - 2.5).abs() < 1e-6);
         assert_eq!(loaded.marks.get(&'a'), Some(&12));
         assert_eq!(loaded.marks.get(&'z'), Some(&99));
+        assert!((loaded.scroll_in_page - 0.37).abs() < 1e-6);
         // Cleanup
         let _ = std::fs::remove_file(Session::store_path(&pdf).unwrap());
         let _ = std::fs::remove_file(&pdf);
@@ -179,6 +189,7 @@ mod tests {
         assert!(!s.dark);
         assert!((s.zoom - 1.0).abs() < 1e-6);
         assert!(s.marks.is_empty());
+        assert_eq!(s.scroll_in_page, 0.0);
     }
 
     #[test]
@@ -206,6 +217,9 @@ mod tests {
         assert!(s.dark);
         assert!((s.zoom - 1.0).abs() < 1e-6);
         assert!(s.marks.is_empty());
+        // scroll_in_page is the newest field; legacy sessions get 0.0
+        // (top of page) so reopens from old saves don't surprise users.
+        assert_eq!(s.scroll_in_page, 0.0);
         let _ = std::fs::remove_file(&store);
         let _ = std::fs::remove_file(&pdf);
     }

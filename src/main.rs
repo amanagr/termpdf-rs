@@ -251,6 +251,10 @@ fn main() -> Result<()> {
     disk_cache::evict_to_budget_async();
     let picker = pick_protocol(args.protocol);
 
+    // If the user passed `--page` on the CLI, they meant "open at this
+    // page (top)" — discard the saved within-page scroll. Otherwise
+    // restore the exact pixel position they were at last session.
+    let start_scroll_in_page = if page_explicit { 0.0 } else { saved.scroll_in_page };
     let mut app = App::new(
         document,
         &args.path,
@@ -258,6 +262,7 @@ fn main() -> Result<()> {
         start_dark,
         saved.zoom,
         saved.marks.clone(),
+        start_scroll_in_page,
         picker,
     )?;
 
