@@ -100,11 +100,64 @@ pub fn cache_path_in_dir(
 
 /// Try to load a cached page bitmap. `None` on miss or any read /
 /// decode error — caller falls through to pdfium.
+///
+/// Threat model: a co-located process with the same UID could plant
+/// a file at the predictable cache path (the per-PDF dir name is a
+/// non-cryptographic hash of (path, mtime, size) which is trivially
+/// preimage-able). `image::open(path)` follows symlinks via
+/// `File::open`, so a planted symlink at the expected `<page>.png`
+/// could redirect the read to anywhere the user has read access,
+/// then feed those bytes to the `image` crate's PNG decoder — a
+/// reliable CVE source historically.
+///
+/// Defense: open the file ourselves with O_NOFOLLOW, read the bytes
+/// into memory, then hand them to `image::load_from_memory`. The
+/// terminal-read syscall and PNG decode never touch a path under
+/// the attacker's control.
 pub fn load(path: &Path) -> Option<DynamicImage> {
-    if !path.exists() {
-        return None;
+    let bytes = read_no_follow(path).ok()?;
+    image::load_from_memory(&bytes).ok()
+}
+
+/// Open and read a file with O_NOFOLLOW so a same-UID attacker can't
+/// redirect us by replacing the path with a symlink between cache
+/// path generation and read. On non-Unix this falls back to
+/// fs::read; the threat model is local-UID-attacker which is mostly
+/// a Unix concern.
+fn read_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        use std::io::Read as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        const O_NOFOLLOW: i32 = 0x20000; // libc::O_NOFOLLOW on Linux
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW)
+            .open(path)?;
+        // Cap size so a planted multi-GB file (or a regular file
+        // grown by an attacker after we created the cache slot)
+        // can't OOM the process during read. PDF page bitmaps PNG
+        // out at <2 MB even at high zoom; 16 MB is the comfortable
+        // ceiling.
+        const MAX_CACHED_PNG_BYTES: u64 = 16 * 1024 * 1024;
+        let len = file
+            .metadata()
+            .map(|m| m.len())
+            .unwrap_or(MAX_CACHED_PNG_BYTES);
+        if len > MAX_CACHED_PNG_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cache file too large",
+            ));
+        }
+        let mut buf = Vec::with_capacity(len as usize);
+        file.read_to_end(&mut buf)?;
+        Ok(buf)
     }
-    image::open(path).ok()
+    #[cfg(not(unix))]
+    {
+        std::fs::read(path)
+    }
 }
 
 /// Write a rendered page bitmap to the cache. Best-effort: returns
@@ -312,6 +365,51 @@ mod tests {
     fn load_missing_returns_none() {
         let path = std::env::temp_dir().join("nonexistent-disk-cache-file.png");
         assert!(load(&path).is_none());
+    }
+
+    /// O_NOFOLLOW must reject a symlink at the cache path. A
+    /// same-UID attacker who plants a symlink (the cache dir name
+    /// is non-cryptographically derived from the PDF, so this is
+    /// reachable) shouldn't be able to redirect us into reading a
+    /// file they chose. Without O_NOFOLLOW this test would succeed
+    /// in loading the planted target.
+    #[cfg(unix)]
+    #[test]
+    fn load_refuses_to_follow_symlink_at_cache_path() {
+        let dir = std::env::temp_dir()
+            .join(format!("disk_cache_symlink_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A real PNG that an attacker would want to redirect us to.
+        let target = dir.join("attacker_chosen.png");
+        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            8, 8, image::Rgba([1, 2, 3, 255]),
+        ));
+        store(&target, &img).unwrap();
+        // The "cache slot" the attacker squatted on with a symlink.
+        let cache_slot = dir.join("planted.png");
+        std::os::unix::fs::symlink(&target, &cache_slot).unwrap();
+        // O_NOFOLLOW path: this must refuse rather than read target.
+        assert!(
+            load(&cache_slot).is_none(),
+            "load through a symlink must return None — the planted PNG must not reach the decoder"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A planted multi-MB-class file at the cache slot must not
+    /// blow up the process. We bound the read to MAX_CACHED_PNG_BYTES
+    /// — the file gets rejected on size before it touches image::.
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_oversized_cache_file() {
+        let dir = std::env::temp_dir()
+            .join(format!("disk_cache_huge_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("huge.png");
+        // 32 MiB of zeros — well past the 16 MiB cap.
+        std::fs::write(&path, vec![0u8; 32 * 1024 * 1024]).unwrap();
+        assert!(load(&path).is_none(), "oversized cache file must not load");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
