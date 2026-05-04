@@ -961,7 +961,7 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     // unchanged, saving ~7-8 MB of allocation per `scroll_steady_30`.
     let combined_prefixes: Vec<Option<String>> = transmits
         .into_iter()
-        .zip(overlay_payloads.into_iter())
+        .zip(overlay_payloads)
         .map(|(t, ov)| match (t, ov) {
             (None, None) => None,
             (Some(t), None) => Some(t),
