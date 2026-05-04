@@ -255,30 +255,7 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
     // tmux+Ghostty: ratatui-image packs each row's kitty escape into
     // column 0 and our post-image cell writes never reached the wire.
 
-    // Perf HUD pinned to the bottom-right corner. Rendered *before*
-    // the status line so the status_line area can shrink to leave
-    // room — otherwise long status messages would overpaint the HUD
-    // glyphs at the right edge. Hidden entirely if SysInfo is
-    // disabled (TERMPDF_NO_PERF_HUD=1).
-    let status_inner = if let Some((hud, hud_w)) = perf_hud(app) {
-        let hud_w = hud_w.min(status_area.width);
-        let hud_area = Rect {
-            x: status_area.x + status_area.width.saturating_sub(hud_w),
-            y: status_area.y,
-            width: hud_w,
-            height: status_area.height,
-        };
-        f.render_widget(hud, hud_area);
-        Rect {
-            x: status_area.x,
-            y: status_area.y,
-            width: status_area.width.saturating_sub(hud_w),
-            height: status_area.height,
-        }
-    } else {
-        status_area
-    };
-    f.render_widget(status_line(app), status_inner);
+    f.render_widget(status_line(app), status_area);
 
     // Confine popups to the image area so their bottom border doesn't
     // overpaint the 1-row status line below it.
@@ -2215,32 +2192,6 @@ fn status_line(app: &App<'_>) -> Paragraph<'static> {
     }
 
     Paragraph::new(Line::from(spans))
-}
-
-/// Bottom-right perf HUD: CPU% averaged over the rolling 30-second
-/// window. Color-coded so a sustained spike draws the eye without
-/// parsing digits — green (cool) → yellow → red. Returns the rendered
-/// Paragraph plus the width in cells so the caller can right-align it.
-/// Zero-cost when sysinfo is disabled.
-///
-/// 30s window, not 1s: a 1-second window flickered with every
-/// keystroke; the user wants a stable read of SUSTAINED draw.
-fn perf_hud(app: &App<'_>) -> Option<(Paragraph<'static>, u16)> {
-    if app.sysinfo.disabled {
-        return None;
-    }
-    let s = app.sysinfo.cur;
-    let cpu_color = if s.cpu_pct >= 50.0 {
-        Color::Red
-    } else if s.cpu_pct >= 25.0 {
-        Color::Yellow
-    } else {
-        Color::Green
-    };
-    let cpu_text = format!("cpu {:>3.0}%·30s", s.cpu_pct);
-    let cpu_text_w = cpu_text.chars().count() as u16;
-    let span = Span::styled(cpu_text, Style::default().fg(cpu_color));
-    Some((Paragraph::new(Line::from(vec![span])), cpu_text_w))
 }
 
 fn draw_toc(f: &mut Frame, app: &mut App<'_>, area: Rect) {

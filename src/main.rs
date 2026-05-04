@@ -33,7 +33,6 @@ mod render_worker;
 mod search;
 mod search_index;
 mod session;
-mod sysinfo;
 mod textlayout;
 mod ui;
 
@@ -376,10 +375,6 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
             should_draw = false;
         }
         if should_draw {
-            // Refresh CPU/temp/RSS HUD before the draw reads them.
-            // maybe_sample is throttled internally to ~1 Hz so the
-            // per-frame call cost is one Instant::now + comparison.
-            app.sysinfo.maybe_sample();
             let _draw = profile::span(profile::Phase::Draw);
             term.draw(|f| ui::draw(f, app))?;
             drop(_draw);
