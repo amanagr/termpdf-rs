@@ -29,8 +29,10 @@
 #   scripts/monitor-scroll.sh firefox
 #   # then open the PDF in Firefox and hold Page Down for 25 s.
 #
-# Args: one or more process *names* (matched via pgrep -x). All
-# matching processes are sampled and their pcpu summed.
+# Args: one or more process *names* (matched via pgrep -x). Each
+# matching root pid + its direct children get utime/stime delta-
+# sampled per second; the deltas are summed across the tree, so a
+# multi-process browser (chrome/firefox) is fairly attributed.
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
@@ -41,8 +43,9 @@ if [[ $# -lt 1 ]]; then
 fi
 
 WINDOW=25       # seconds — long enough to dominate startup blips
-INTERVAL=1      # 1 Hz sampling, matches the in-app HUD cadence
+INTERVAL=1      # 1 Hz delta-sampling; each window is a "current CPU%"
 COUNTDOWN=3     # warning seconds before sampling starts
+CLK_TCK="$(getconf CLK_TCK)"  # jiffies/sec, for /proc/<pid>/stat math
 
 # Resolve names → pids (process roots; we'll add their children at
 # sample time so newly-spawned helpers / GPU children get counted).
@@ -66,25 +69,68 @@ for ((i=COUNTDOWN; i>0; i--)); do
 done
 echo "  sampling for ${WINDOW}s..."
 
-# Sample CPU% (sum across all matching roots + children) and peak RSS.
-sum_cpu_for() {
-    local total=0
+# Enumerate root pids + their direct children. Direct children only —
+# matches what `ps -o pcpu` would have summed, and is enough for the
+# browsers we care about (Chrome / Firefox flatten content + GPU
+# processes as direct children of the main process).
+all_pids() {
     for root in "${ROOT_PIDS[@]}"; do
         if ! kill -0 "$root" 2>/dev/null; then
             continue
         fi
-        local pids
-        pids="$(pgrep -P "$root" 2>/dev/null || true)"
-        pids="$root $pids"
-        for p in $pids; do
-            local pct
-            pct="$(ps -p "$p" -o pcpu= 2>/dev/null | tr -d ' ' || true)"
-            if [[ -n "$pct" && "$pct" != "0.0" ]]; then
-                total="$(awk -v a="$total" -v b="$pct" 'BEGIN{printf "%.1f", a+b}')"
-            fi
-        done
+        echo "$root"
+        pgrep -P "$root" 2>/dev/null || true
     done
-    echo "$total"
+}
+
+# Snapshot {pid, utime+stime} for the process tree. Lines look like
+# "<pid> <ticks>". Reading /proc/<pid>/stat is fast (kernel-resident);
+# we tolerate transient pids vanishing mid-snapshot.
+#
+# Field layout (man 5 proc): pid (comm) state ppid ... utime stime ...
+# comm can contain spaces and parens, so we anchor on ") " to skip past
+# it before splitting the rest by whitespace.
+snapshot_ticks() {
+    while IFS= read -r pid; do
+        [[ -z "$pid" ]] && continue
+        awk -v pid="$pid" '
+        {
+            i = match($0, /\) /)
+            if (i == 0) next
+            rest = substr($0, i + 2)
+            split(rest, a, " ")
+            # a[12] = utime (orig field 14), a[13] = stime (orig field 15).
+            printf "%s %d\n", pid, a[12] + a[13]
+        }' "/proc/$pid/stat" 2>/dev/null || true
+    done < <(all_pids)
+}
+
+# Sample CPU% over a fixed interval using /proc/<pid>/stat deltas.
+#
+# Why not `ps -o pcpu`: that field is the *lifetime* average since the
+# process started — for a Firefox that's been up for hours, a 25 s
+# scroll burst at 50 % CPU averages out to ~1 % over its lifetime, so
+# ps reports 1 % and you think the browser is idle. We want what `top`
+# shows: utime+stime delta over a short window, divided by wall time.
+#
+# Output: one float, "of one CPU" units (>100 means multi-core).
+cpu_window() {
+    local interval="$1"
+    local snap0 snap1
+    snap0="$(snapshot_ticks)"
+    sleep "$interval"
+    snap1="$(snapshot_ticks)"
+    awk -v interval="$interval" -v clk="$CLK_TCK" '
+    NR==FNR { t0[$1] = $2; next }
+    {
+        if ($1 in t0) {
+            d = $2 - t0[$1]
+            if (d > 0) sum += d
+        }
+    }
+    END {
+        printf "%.1f\n", (sum * 100.0) / (interval * clk)
+    }' <(echo "$snap0") <(echo "$snap1")
 }
 sum_rss_for() {
     local total=0
@@ -110,13 +156,14 @@ cpu_samples=()
 rss_peak=0
 end=$(( SECONDS + WINDOW ))
 while (( SECONDS < end )); do
-    cpu="$(sum_cpu_for)"
+    # cpu_window blocks for INTERVAL seconds (it's the delta window),
+    # so we don't add an outer sleep — that would double the wall time.
+    cpu="$(cpu_window "$INTERVAL")"
     rss="$(sum_rss_for)"
     cpu_samples+=("$cpu")
     if (( rss > rss_peak )); then
         rss_peak="$rss"
     fi
-    sleep "$INTERVAL"
 done
 
 # Stats: median + p95 + max so a held-key burst's tail is visible.
