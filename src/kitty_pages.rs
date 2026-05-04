@@ -1100,6 +1100,16 @@ pub fn place_page(
         }
         if let Some(cell) = buf.cell_mut((area.left(), cell_y)) {
             cell.set_symbol(symbol);
+            // CRITICAL: clear set_skip. clear_page_area marks every
+            // cell of the image area outside col 0 as skip=true, and
+            // a centered page's placement area starts at
+            // img_area.left + dst_left_cell > 0 — which lands on a
+            // skipped cell. set_symbol does NOT reset skip, so
+            // ratatui's diff (`if !current.skip ...`) filters out
+            // our col-0 placement and the kitty escape never
+            // reaches the terminal. Centered pages were rendering
+            // blank as a result.
+            cell.set_skip(false);
         }
         // Mark cells right of column 0 as skipped so ratatui's diff
         // doesn't overwrite our placeholders with empty cells.
@@ -2034,6 +2044,67 @@ mod tests {
         assert!(
             scratch.cached_row_head.contains("\x1b[38;2;0;0;99m"),
             "row head must rebuild with new image_id"
+        );
+    }
+
+    /// Regression: when ui::draw runs `clear_page_area` on the full
+    /// image area FIRST and then `place_page` on a centered page
+    /// (placement_area.left > image_area.left), the placement's col-0
+    /// cell sits inside the image-area range that clear_page_area
+    /// marked `set_skip(true)`. set_symbol() does not reset skip, so
+    /// without an explicit `set_skip(false)` in place_page ratatui's
+    /// diff filters the cell out and the kitty escape never reaches
+    /// the terminal — the page renders blank. This was the reported
+    /// "some pages stay blank after being rendered while scrolling"
+    /// symptom.
+    #[test]
+    fn place_page_after_clear_emits_centered_placement_to_terminal() {
+        // Image area is 10 wide; page bitmap is 6 wide → centered with
+        // a 2-cell left margin (dst_left_cell = 2).
+        let img_area = Rect { x: 0, y: 0, width: 10, height: 4 };
+        let mut buf = Buffer::empty(img_area);
+        let mut scratch = PlaceScratch::default();
+
+        clear_page_area(&mut buf, img_area, &mut scratch);
+
+        // Confirm the precondition: post-clear, col 2 (where the
+        // centered placement will land) is skip=true.
+        assert!(
+            buf.cell((2, 0)).unwrap().skip,
+            "precondition: clear_page_area must mark col 2 of img_area as skip=true",
+        );
+
+        let placement_area = Rect { x: 2, y: 0, width: 6, height: 4 };
+        place_page(
+            &mut buf,
+            placement_area,
+            /*page_idx*/ 0,
+            /*image_id*/ 7,
+            /*pixel_w*/ 60,
+            /*pixel_h*/ 80,
+            /*cell_w_px*/ 10,
+            /*cell_h_px*/ 20,
+            /*dst_top_cell*/ 0,
+            /*dst_height_cells*/ 4,
+            /*src_top_cell*/ 0,
+            /*src_left_cell*/ 0,
+            /*width_cells*/ 6,
+            /*prefix*/ None,
+            &mut scratch,
+        );
+
+        // The col-0 cell of the placement (= col 2 of img_area) must
+        // carry the kitty placement symbol AND have skip cleared, or
+        // ratatui's diff filters it out.
+        let cell = buf.cell((2, 0)).unwrap();
+        assert!(
+            cell.symbol().contains('\u{10EEEE}'),
+            "placement col-0 must carry the kitty placeholder char, got {:?}",
+            cell.symbol(),
+        );
+        assert!(
+            !cell.skip,
+            "placement col-0 must have skip=false so ratatui emits it; was skip=true → blank-page bug",
         );
     }
 }

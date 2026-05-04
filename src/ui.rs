@@ -509,6 +509,10 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
         /// active selection touching the page; `0` means no overlay
         /// should be drawn (and any prior overlay should be dropped).
         sel_sig: u64,
+        /// False when the rapid-burst defer chose to skip this page's
+        /// kitty placement. The blit still carries its original geometry
+        /// so we can paint a "loading…" indicator over the cleared area.
+        placement_active: bool,
     }
 
     let scroll_y = app.scroll_y_px;
@@ -595,6 +599,7 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
             src_left_cell,
             width_cells,
             sel_sig,
+            placement_active: true,
         });
     }
 
@@ -615,14 +620,17 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
             // (just need a re-encode because the user moved a
             // selection or edited a highlight) are cheap to transmit;
             // skipping them would make Visual-mode selection appear
-            // stuck during fast `l`/`h` motion. The blanket clear
-            // below blanks the cells where this page would have
-            // gone, so leaving height_cells=0 here just means
-            // place_page is skipped — the area is already clean.
+            // stuck during fast `l`/`h` motion.
+            //
+            // Mark `placement_active = false` rather than zeroing
+            // `height_cells`: the post-place pass needs the original
+            // geometry to draw a "loading…" indicator centered in the
+            // page's strip so the user knows the area is intentionally
+            // pending instead of a glitch.
             let is_cold = !app.page_cache.contains_key(&b.page_idx);
             if is_cold {
                 b.need_transmit = false;
-                b.height_cells = 0;
+                b.placement_active = false;
             }
         }
     }
@@ -697,9 +705,10 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     {
         let kp = app.kitty_pages.as_mut().unwrap();
         for b in blits.iter() {
-            if b.height_cells == 0 {
-                // Skipped (e.g. cold-defer); leave any prior overlay
-                // alone — the next non-skipped frame will refresh it.
+            if !b.placement_active || b.height_cells == 0 {
+                // Skipped (e.g. rapid-burst defer); leave any prior
+                // overlay alone — the next non-skipped frame will
+                // refresh it.
                 continue;
             }
             if b.sel_sig == 0 && kp.overlay_is_present(b.page_idx) {
@@ -725,7 +734,7 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
         let mut scratch = app.selection_overlay_scratch.take();
         let kp = app.kitty_pages.as_mut().unwrap();
         for (i, b) in blits.iter().enumerate() {
-            if b.height_cells == 0 || b.sel_sig == 0 {
+            if !b.placement_active || b.height_cells == 0 || b.sel_sig == 0 {
                 continue;
             }
             let Some(sel) = text_selection else { continue };
@@ -890,6 +899,9 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     let scratch = kp.place_scratch_mut();
     crate::kitty_pages::clear_page_area(buf, area, scratch);
     for (b, t) in blits.iter().zip(combined_prefixes.iter()) {
+        if !b.placement_active {
+            continue;
+        }
         let placement_area = Rect {
             x: img_area_left.saturating_add(b.dst_left_cell),
             y: img_area_top,
@@ -913,6 +925,36 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
             t.as_deref(),
             scratch,
         );
+    }
+
+    // Loading indicator pass. Visible pages that did NOT get a kitty
+    // placement on this frame fall into two buckets and BOTH leave
+    // an empty rectangle that confuses the user:
+    //   1. Rapid-burst defer: blit exists with placement_active=false.
+    //      We have its dst geometry from the original visible-page
+    //      loop and use it directly.
+    //   2. Bitmap missing: pdfium hasn't rendered this page yet, so
+    //      the visible-page loop bailed out at `pixel_dims = None`
+    //      (no blit entry at all). Recompute the strip from layout.
+    // Paint a centered "loading page N…" line into the cleared area
+    // so the user sees pending work, not a glitch.
+    {
+        use std::collections::HashSet;
+        let placed: HashSet<usize> = blits
+            .iter()
+            .filter(|b| b.placement_active)
+            .map(|b| b.page_idx)
+            .collect();
+        let scroll_y = app.scroll_y_px;
+        for &page_idx in &visible {
+            if placed.contains(&page_idx) {
+                continue;
+            }
+            paint_loading_indicator(
+                buf, area, app, page_idx, scroll_y,
+                cell_w, cell_h, area_height_cells,
+            );
+        }
     }
 
     // Now that the buffer has the placements, mark each page (and
@@ -948,6 +990,86 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
 
 /// Paint each unfiltered hint label over its link's centre cell.
 /// Black-on-yellow for visibility against arbitrary page content.
+/// Paint a centered "loading page N…" line into the cleared cells of
+/// a page strip. Called for visible pages that didn't get a kitty
+/// placement this frame — either because the rapid-burst defer skipped
+/// them or because pdfium hasn't rendered the bitmap yet.
+///
+/// Computes the page's on-screen y-row range from layout (no bitmap
+/// needed) and writes a one-row label at the strip's vertical center.
+fn paint_loading_indicator(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    app: &App<'_>,
+    page_idx: usize,
+    scroll_y: i64,
+    cell_w: u32,
+    cell_h: u32,
+    area_height_cells: u16,
+) {
+    use ratatui::style::{Color, Modifier, Style};
+
+    let page_doc_y = app.layout.page_y(page_idx);
+    let page_h_px = app.layout.page_h(page_idx);
+    if page_h_px == 0 {
+        return;
+    }
+    let cell_h_safe = cell_h.max(1) as i64;
+    // Strip top in cells, clamped to the visible area.
+    let strip_top_doc = (page_doc_y - scroll_y).max(0);
+    let strip_top_cell = (strip_top_doc / cell_h_safe).min(area_height_cells as i64) as u16;
+    // Strip bottom = strip_top + page height, clamped to the area.
+    let strip_bot_doc = ((page_doc_y + page_h_px as i64) - scroll_y).max(0);
+    let strip_bot_cell = ((strip_bot_doc + cell_h_safe - 1) / cell_h_safe)
+        .min(area_height_cells as i64) as u16;
+    let strip_height = strip_bot_cell.saturating_sub(strip_top_cell);
+    if strip_height == 0 {
+        return;
+    }
+    // Vertical center of the strip in absolute buffer coordinates.
+    let mid_row = area.top()
+        .saturating_add(strip_top_cell)
+        .saturating_add(strip_height / 2);
+    if mid_row >= area.bottom() {
+        return;
+    }
+
+    // Label text and horizontal centering. Use the layout's fit width
+    // so the label sits over where the page would render — same x-axis
+    // alignment the kitty placement uses.
+    let label = format!(" loading page {}… ", page_idx + 1);
+    let label_chars: Vec<char> = label.chars().collect();
+    let img_w_cells = (app.layout.fit_width_px / cell_w.max(1)) as u16;
+    let dst_left_cell = if img_w_cells < area.width {
+        (area.width - img_w_cells) / 2
+    } else {
+        0
+    };
+    let page_x_left = area.left().saturating_add(dst_left_cell);
+    let page_width = img_w_cells.min(area.width.saturating_sub(dst_left_cell));
+    if page_width == 0 || label_chars.len() as u16 > page_width {
+        return;
+    }
+    let pad = (page_width - label_chars.len() as u16) / 2;
+    let start_x = page_x_left.saturating_add(pad);
+
+    let style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM);
+    let mut utf8_buf = [0u8; 4];
+    for (i, ch) in label_chars.iter().enumerate() {
+        let x = start_x.saturating_add(i as u16);
+        if x >= area.right() {
+            break;
+        }
+        if let Some(cell) = buf.cell_mut((x, mid_row)) {
+            cell.set_symbol(ch.encode_utf8(&mut utf8_buf));
+            cell.set_style(style);
+            cell.set_skip(false);
+        }
+    }
+}
+
 fn draw_link_hints(
     buf: &mut ratatui::buffer::Buffer,
     app: &App<'_>,
