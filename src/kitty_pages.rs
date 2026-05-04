@@ -885,43 +885,6 @@ fn transmit(bitmap: &RgbaImage, id: u32, is_tmux: bool) -> String {
     )
 }
 
-/// Build a classical kitty placement APC for a previously-transmitted
-/// overlay image, positioned at the cursor with z=1 so it composites
-/// above the page placement underneath. Uses `U=0` (cursor-positioned,
-/// not unicode-placeholder); the caller must arrange for the cursor to
-/// be at the overlay's top-left when this APC is processed (in
-/// practice, by embedding the returned string in the same buffer cell
-/// as the page's first placeholder, with the surrounding `\x1b[s` /
-/// `\x1b[u` brackets).
-///
-/// Source-crop parameters (`X, Y, w, h`) crop the overlay bitmap to
-/// match the visible portion of the page when scrolled — otherwise
-/// kitty would render the full overlay with rows clipped at the
-/// viewport boundary, putting the selection band rows out of register
-/// with the page placement. `c` / `r` are the placement size in cells.
-pub fn build_overlay_place_apc(
-    overlay_id: u32,
-    width_cells: u16,
-    height_cells: u16,
-    src_left_px: u32,
-    src_top_px: u32,
-    src_w_px: u32,
-    src_h_px: u32,
-    is_tmux: bool,
-) -> String {
-    let (start, escape, end) = tmux_wrap(is_tmux);
-    let mut s = String::with_capacity(128);
-    s.push_str(start);
-    write!(
-        s,
-        "{escape}_Ga=p,U=0,i={overlay_id},p=1,c={width_cells},r={height_cells},\
-         X={src_left_px},Y={src_top_px},w={src_w_px},h={src_h_px},z=1,q=2;{escape}\\"
-    )
-    .unwrap();
-    s.push_str(end);
-    s
-}
-
 /// PNG-encode with `Fast` compression + `Up` filter. Benchmarked on a
 /// 1600×2300 synthetic page: NoFilter = 2.8× compression at 14 ms,
 /// Up filter = 50× compression at 1.9 ms. The Up predictor (each
@@ -2110,54 +2073,7 @@ mod tests {
         );
     }
 
-    /// `build_overlay_place_apc` must emit a classical placement APC
-    /// (`a=p,U=0`) at z=1 with the given source-crop and cell-size
-    /// parameters. The exact bytes ride into a buffer cell so the
-    /// shape matters.
-    #[test]
-    fn build_overlay_place_apc_format() {
-        let s = build_overlay_place_apc(
-            /*overlay_id*/ 42, /*width_cells*/ 30, /*height_cells*/ 12,
-            /*src_left_px*/ 0, /*src_top_px*/ 16, /*src_w_px*/ 240,
-            /*src_h_px*/ 192, /*is_tmux*/ false,
-        );
-        assert!(
-            s.starts_with("\x1b_G"),
-            "APC must start with \\x1b_G; got {s:?}"
-        );
-        assert!(s.contains("a=p"), "must place");
-        assert!(s.contains("U=0"), "classical (cursor-positioned) placement");
-        assert!(s.contains("i=42"), "must reference image id");
-        assert!(s.contains("z=1"), "must be above the page placement");
-        assert!(s.contains("c=30"), "cells width");
-        assert!(s.contains("r=12"), "cells height");
-        assert!(s.contains("X=0"), "source x");
-        assert!(s.contains("Y=16"), "source y");
-        assert!(s.contains("w=240"), "source w");
-        assert!(s.contains("h=192"), "source h");
-        assert!(
-            s.ends_with("\x1b\\"),
-            "APC must end with \\x1b\\\\; got {s:?}"
-        );
-    }
-
-    /// The same APC under tmux must be wrapped in the DCS passthrough
-    /// envelope (`\x1bPtmux;...\x1b\\`) with the inner ESCs doubled,
-    /// matching how page transmits are wrapped.
-    #[test]
-    fn build_overlay_place_apc_tmux_wraps() {
-        let s = build_overlay_place_apc(1, 10, 5, 0, 0, 80, 80, /*is_tmux*/ true);
-        assert!(
-            s.starts_with("\x1bPtmux;"),
-            "tmux APC must start with DCS wrap; got {s:?}"
-        );
-        assert!(
-            s.contains("\x1b\x1b_G"),
-            "inner ESCs must be doubled inside tmux passthrough"
-        );
-    }
-
-    /// queue_deletes must collapse contiguous-id runs into one
+/// queue_deletes must collapse contiguous-id runs into one
     /// `d=R` and leave singletons as `d=I`. The mixed case (one
     /// range + one isolated id) is the realistic situation when
     /// some evictions are forward-scroll consecutive and one or
