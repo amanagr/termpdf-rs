@@ -450,7 +450,10 @@ impl<'doc> App<'doc> {
         let page_count = document.pages().len() as usize;
         let page_metrics = pdf::page_metrics(&document)?;
         let outline = outline::load(&document).unwrap_or_else(|e| {
-            eprintln!("warning: could not load outline: {e:#}");
+            eprintln!(
+                "warning: could not load outline: {}",
+                crate::term_safe::safe_for_stderr(&format!("{e:#}"))
+            );
             Vec::new()
         });
         let outline_pages_sorted: Vec<usize> = {
@@ -464,7 +467,10 @@ impl<'doc> App<'doc> {
             v
         };
         let highlights = pdfhighlights::load_from_pdf(&document).unwrap_or_else(|e| {
-            eprintln!("warning: could not read PDF annotations: {e:#}");
+            eprintln!(
+                "warning: could not read PDF annotations: {}",
+                crate::term_safe::safe_for_stderr(&format!("{e:#}"))
+            );
             HighlightStore::default()
         });
         // Snapshot of pages that had our annotations on disk. On save

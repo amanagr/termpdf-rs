@@ -33,6 +33,7 @@ mod render_worker;
 mod search;
 mod search_index;
 mod session;
+mod term_safe;
 mod textlayout;
 mod ui;
 
@@ -189,7 +190,27 @@ fn tmux_passthrough_hint() {
         if let Some(parent) = m.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(&m, b"");
+        // Open with O_NOFOLLOW so a pre-planted symlink at the marker
+        // path can't redirect our zero-byte write to a sensitive
+        // file (e.g. ~/.bashrc) that the user has write access to.
+        // O_CREAT means "create if missing"; the lack of O_EXCL is
+        // deliberate — re-writing on every run is fine, the marker
+        // only needs to *exist*, not be unique.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            const O_NOFOLLOW: i32 = 0x20000;
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .custom_flags(O_NOFOLLOW)
+                .open(&m);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::write(&m, b"");
+        }
     }
 }
 
@@ -279,10 +300,16 @@ fn main() -> Result<()> {
     profile::report();
 
     if let Err(e) = app.persist_highlights() {
-        eprintln!("warning: failed to persist highlights: {e:?}");
+        eprintln!(
+            "warning: failed to persist highlights: {}",
+            term_safe::safe_for_stderr(&format!("{e:?}"))
+        );
     }
     if let Err(e) = app.persist_session() {
-        eprintln!("warning: failed to persist session: {e:?}");
+        eprintln!(
+            "warning: failed to persist session: {}",
+            term_safe::safe_for_stderr(&format!("{e:?}"))
+        );
     }
     res
 }
@@ -358,7 +385,7 @@ fn probe(
         "probe: wrote {}×{} PNG to {} (page {}, dark={})",
         img.width(),
         img.height(),
-        out.display(),
+        term_safe::safe_for_stderr(&out.display().to_string()),
         page + 1,
         dark
     );

@@ -316,7 +316,7 @@ a session file. By design.
 
 | Var                       | Default                            | Meaning                                  |
 | ------------------------- | ---------------------------------- | ---------------------------------------- |
-| `TERMPDF_PDFIUM`          | `vendor/libpdfium.so` next to bin  | Override path to libpdfium.so            |
+| `TERMPDF_PDFIUM`          | `vendor/libpdfium.so` next to bin  | Override path to libpdfium.so. Path must exist and the filename must start with `libpdfium.` / `pdfium.` and end in `.so`/`.dylib`/`.dll` — sanity checks against a hostile env pointing us at an arbitrary shared library to dlopen. |
 | `TERMPDF_PROTOCOL`        | `auto`                             | Force `kitty`/`sixel`/`iterm2`/`halfblocks` |
 | `TERMPDF_NO_TMUX_HINT`    | unset                              | Skip the one-time tmux hint              |
 | `TERMPDF_CACHE_MB`        | `256`                              | Soft cap on the in-memory page cache     |
