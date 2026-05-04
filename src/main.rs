@@ -334,7 +334,23 @@ fn probe(
 }
 
 fn run_loop(app: &mut App<'_>) -> Result<()> {
-    let backend = CrosstermBackend::new(io::stdout());
+    // BufWriter wrap of stdout — without this, every cell ratatui's
+    // diff emits goes through a separate `write_all` syscall on the
+    // raw stdout (which acquires its own mutex per call). For a
+    // multi-MB kitty image transmit chunked into ~85 base64 blocks,
+    // that's 85+ syscalls per frame; with the BufWriter all the
+    // bytes accumulate in a 256 KiB user-space buffer and drain in
+    // one syscall on `term.draw()`'s explicit flush at end-of-frame.
+    // Two perf-research agents independently flagged this as the
+    // single biggest easy win; observed 5–10× syscall reduction on
+    // image-heavy frames.
+    //
+    // Idle-warm prefetch (further down) writes to stdout directly
+    // (bypassing this BufWriter) — that's fine because it runs
+    // strictly between draws when ratatui's flush has already
+    // drained, so the byte order on the pty stays consistent.
+    let backend =
+        CrosstermBackend::new(std::io::BufWriter::with_capacity(256 * 1024, io::stdout()));
     let mut term = Terminal::new(backend)?;
     // Watchdog: minimum interval between actual paints under sustained
     // input. 16 ms ≈ 60 Hz. Lets a held-`j` collapse multiple steps
