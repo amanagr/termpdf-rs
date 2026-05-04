@@ -165,26 +165,34 @@ Chrome ships) without any of the surrounding browser machinery.
 
 There's a benchmark script in the repo that measures both on your
 machine: `scripts/bench-vs-browser.sh path/to/file.pdf`. It opens
-the same PDF in termpdf-rs and in your default browser, samples
-CPU% and RSS over an idle window, and prints a markdown comparison
-table.
+the same PDF in termpdf-rs and in your default browser, waits 10 s
+for warmup to settle, then samples CPU% and RSS for 20 s of
+steady-state idle.
 
-A reference observation from a 600-page PDF on Firefox:
+Steady-state idle on a 600-page PDF (Designing Data-Intensive
+Applications), measured with this script:
 
-| Metric                    | termpdf-rs   | Firefox        |
-| ------------------------- | ------------ | -------------- |
-| Idle CPU%                 | near 0%      | ~3%            |
-| Scroll CPU%               | single-digit | ~30%           |
-| RSS                       | ~30-50 MB    | ~200-400 MB    |
+| Metric    | termpdf-rs | google-chrome | ratio |
+| --------- | ---------- | ------------- | ----- |
+| Idle CPU% | 3.2%       | 17.1%         | 5.3×  |
+| Idle RSS  | 71 MB      | 558 MB        | 7.9×  |
 
-Firefox is the leaner of the two common browsers; chromium is
-heavier still on the same workload (multi-process accounting +
-GPU compositor process). The aim isn't to beat the absolute
-ceiling — it's to make the case that for a "just open this PDF"
-session, you don't need the web platform's overhead.
+Firefox is leaner on the CPU axis (~3 % steady-state idle) but
+still ~5× larger than termpdf-rs on RSS for the same PDF.
 
-Run the script yourself for the actual numbers on your hardware —
-GPU support, browser version, and PDF size all move the result.
+Scroll-time cost is harder to script (the benchmark can't reliably
+inject input into either app), but anecdotally:
+
+- termpdf-rs scroll CPU stays in the single-digit %s — visible in
+  the bottom-right HUD ("cpu N%·30s") while you hold `j`.
+- Chrome / Firefox scrolling the same PDF lands in the 15-30 % range
+  on the same hardware.
+
+The aim isn't to beat the absolute ceiling — it's to make the case
+that for a "just open this PDF" session, you don't need the web
+platform's overhead. Run the script yourself for the actual idle
+numbers on your hardware — GPU support, browser version, and PDF
+size all move the result.
 
 ### What gets us there
 

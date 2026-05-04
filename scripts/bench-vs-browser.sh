@@ -1,14 +1,24 @@
 #!/usr/bin/env bash
 # Compare termpdf-rs against a browser opening the same PDF. Measures
-# steady-state CPU% and RSS (max + steady) over an idle window and a
-# scroll window. Output is a small markdown table you can paste into
-# the README.
+# steady-state idle CPU% and RSS — i.e. what the resource cost is
+# while you're reading a page (not actively scrolling). Output is a
+# small markdown table you can paste into the README.
 #
 # Why this script exists: browsers showing a PDF carry the full
 # render pipeline (V8 + Blink + GPU compositor + IPC layers). The
 # claim termpdf-rs makes is that you can have native pixel-perfect
 # rendering at ~order-of-magnitude lower resource cost. This script
 # turns that claim into numbers from your machine.
+#
+# Why ONLY idle is measured: the script can't reliably inject scroll
+# input into either app — they're attached to a TTY (termpdf) or a
+# windowing system (browser). Past versions sampled a "scroll window"
+# that was really an extra idle window, which produced misleading
+# numbers (the second window was always lower because warmup had
+# completed). For a real scroll comparison, use the in-app HUD: hold
+# `j` in termpdf-rs and watch the bottom-right "cpu N%·30s"; switch
+# to the browser tab and hold Page Down while watching `top`/`htop`
+# for the browser process tree.
 #
 # Usage:
 #   scripts/bench-vs-browser.sh path/to/some.pdf [browser]
@@ -23,8 +33,8 @@
 #
 # Caveats:
 #   - chromium shows the PDF in a tab; the per-process CPU is summed
-#     across the multi-process tree (the renderer + GPU + main
-#     process all count).
+#     across the multi-process tree (renderer + GPU + main process
+#     all count).
 #   - firefox is single-process for this purpose, easier to attribute.
 #   - termpdf-rs is one process and reports its own CPU directly.
 #
@@ -70,8 +80,13 @@ trap 'rm -rf "$WORK"' EXIT
 
 # Sample interval (s) and total sample window (s).
 INTERVAL=1
-WINDOW_IDLE=20
-WINDOW_SCROLL=15
+WINDOW=20
+# Settle time before sampling. Long enough that pdfium init + first
+# paint + warm prefetch + Sharp upgrade re-transmits all complete on
+# a 600-page book. Without this, the median CPU% is dragged up by
+# warmup activity and looks worse than steady-state actually is.
+SETTLE_TERMPDF=10
+SETTLE_BROWSER=10
 
 # `ps` outputs in HHHHHpercent (1 decimal); we sum the process tree
 # so multi-process browsers (chrome) get fair attribution.
@@ -106,7 +121,7 @@ sum_rss_kb() {
     echo "$total"
 }
 
-# Sample CPU% and RSS_KB every $INTERVAL seconds for $WINDOW seconds,
+# Sample CPU% and RSS_KB every $INTERVAL seconds for $window seconds,
 # return median CPU% and peak RSS_KB.
 sample_loop() {
     local pid="$1" window="$2" label="$3"
@@ -140,25 +155,16 @@ sample_loop() {
 # ===========================================================================
 # Run termpdf-rs
 # ===========================================================================
-echo "=== termpdf-rs ($TERMPDF $PDF) ==="
+echo "=== termpdf-rs ==="
 TERMPDF_LOG="$WORK/termpdf.log"
 "$TERMPDF" "$PDF" --protocol kitty </dev/null >"$TERMPDF_LOG" 2>&1 &
 TERMPDF_PID=$!
-sleep 2  # let pdfium init + first paint
-echo "  idle window ($WINDOW_IDLE s)..."
-TERMPDF_IDLE="$(sample_loop "$TERMPDF_PID" "$WINDOW_IDLE" termpdf-idle)"
-TERMPDF_IDLE_CPU="${TERMPDF_IDLE% *}"
-TERMPDF_IDLE_RSS="${TERMPDF_IDLE#* }"
-
-# Inject keystrokes to simulate scroll. Without a TTY this is a no-op
-# from termpdf's side (it ignores stdin), so the "scroll" window is
-# really an extended idle for this binary — which is itself
-# diagnostic. For an interactive scroll measurement, run termpdf-rs
-# in your usual terminal and watch the in-app HUD.
-echo "  scroll window ($WINDOW_SCROLL s, simulated)..."
-TERMPDF_SCROLL="$(sample_loop "$TERMPDF_PID" "$WINDOW_SCROLL" termpdf-scroll)"
-TERMPDF_SCROLL_CPU="${TERMPDF_SCROLL% *}"
-TERMPDF_SCROLL_RSS="${TERMPDF_SCROLL#* }"
+echo "  warmup settle ($SETTLE_TERMPDF s)..."
+sleep "$SETTLE_TERMPDF"
+echo "  steady-state idle window ($WINDOW s)..."
+TERMPDF_IDLE="$(sample_loop "$TERMPDF_PID" "$WINDOW" termpdf)"
+TERMPDF_CPU="${TERMPDF_IDLE% *}"
+TERMPDF_RSS="${TERMPDF_IDLE#* }"
 
 kill "$TERMPDF_PID" 2>/dev/null || true
 wait "$TERMPDF_PID" 2>/dev/null || true
@@ -166,7 +172,7 @@ wait "$TERMPDF_PID" 2>/dev/null || true
 # ===========================================================================
 # Run browser
 # ===========================================================================
-echo "=== $BROWSER (file://$PDF) ==="
+echo "=== $BROWSER ==="
 PROFILE="$WORK/browser-profile"
 mkdir -p "$PROFILE"
 
@@ -192,17 +198,13 @@ case "$BROWSER" in
         ;;
 esac
 BROWSER_PID=$!
-sleep 5  # browsers take longer to settle than termpdf
+echo "  warmup settle ($SETTLE_BROWSER s)..."
+sleep "$SETTLE_BROWSER"
 
-echo "  idle window ($WINDOW_IDLE s)..."
-BROWSER_IDLE="$(sample_loop "$BROWSER_PID" "$WINDOW_IDLE" browser-idle)"
-BROWSER_IDLE_CPU="${BROWSER_IDLE% *}"
-BROWSER_IDLE_RSS="${BROWSER_IDLE#* }"
-
-echo "  scroll window ($WINDOW_SCROLL s, simulated)..."
-BROWSER_SCROLL="$(sample_loop "$BROWSER_PID" "$WINDOW_SCROLL" browser-scroll)"
-BROWSER_SCROLL_CPU="${BROWSER_SCROLL% *}"
-BROWSER_SCROLL_RSS="${BROWSER_SCROLL#* }"
+echo "  steady-state idle window ($WINDOW s)..."
+BROWSER_IDLE="$(sample_loop "$BROWSER_PID" "$WINDOW" "$BROWSER")"
+BROWSER_CPU="${BROWSER_IDLE% *}"
+BROWSER_RSS="${BROWSER_IDLE#* }"
 
 # Tear down browser process tree.
 pkill -P "$BROWSER_PID" 2>/dev/null || true
@@ -216,23 +218,23 @@ mb() { awk -v kb="$1" 'BEGIN{printf "%.0f MB", kb/1024}'; }
 ratio() { awk -v a="$1" -v b="$2" 'BEGIN{ if (b==0) printf "n/a"; else printf "%.1f×", b/a }'; }
 
 echo
-echo "## Resource comparison: termpdf-rs vs $BROWSER"
+echo "## Steady-state resource cost: termpdf-rs vs $BROWSER"
 echo
 echo "PDF: $(basename "$PDF")"
+echo "Sample window: $WINDOW s after a $SETTLE_TERMPDF s warmup settle."
 echo
-echo "| Metric                      | termpdf-rs      | $BROWSER      | ratio |"
-echo "| --------------------------- | --------------- | ------------- | ----- |"
-echo "| Idle CPU% (median, ${WINDOW_IDLE}s window)  | ${TERMPDF_IDLE_CPU}%        | ${BROWSER_IDLE_CPU}%      | $(ratio "$TERMPDF_IDLE_CPU" "$BROWSER_IDLE_CPU") |"
-echo "| Idle RSS (peak)             | $(mb "$TERMPDF_IDLE_RSS")       | $(mb "$BROWSER_IDLE_RSS")     | $(ratio "$TERMPDF_IDLE_RSS" "$BROWSER_IDLE_RSS") |"
-echo "| Scroll-window CPU% (median) | ${TERMPDF_SCROLL_CPU}%        | ${BROWSER_SCROLL_CPU}%      | $(ratio "$TERMPDF_SCROLL_CPU" "$BROWSER_SCROLL_CPU") |"
-echo "| Scroll-window RSS (peak)    | $(mb "$TERMPDF_SCROLL_RSS")       | $(mb "$BROWSER_SCROLL_RSS")     | $(ratio "$TERMPDF_SCROLL_RSS" "$BROWSER_SCROLL_RSS") |"
+echo "| Metric        | termpdf-rs   | $BROWSER     | ratio |"
+echo "| ------------- | ------------ | ------------ | ----- |"
+echo "| Idle CPU%     | ${TERMPDF_CPU}%       | ${BROWSER_CPU}%      | $(ratio "$TERMPDF_CPU" "$BROWSER_CPU") |"
+echo "| Idle RSS      | $(mb "$TERMPDF_RSS")     | $(mb "$BROWSER_RSS")    | $(ratio "$TERMPDF_RSS" "$BROWSER_RSS") |"
 echo
 echo "Notes:"
 echo "  - termpdf-rs is a single process; its numbers are direct."
 echo "  - $BROWSER's numbers sum the process tree (renderer + GPU"
 echo "    + main); a single-process browser like firefox is more"
-echo "    apples-to-apples but chromium reflects the full cost."
-echo "  - The 'scroll-window' here is a simulated idle since this"
-echo "    script can't reliably inject input through a browser."
-echo "    For the real scroll picture, hold j in termpdf-rs and watch"
-echo "    the in-app HUD; do the same in the browser using Page Down."
+echo "    apples-to-apples but chromium/chrome reflects the full cost."
+echo "  - This benchmark only measures IDLE. For scroll comparison,"
+echo "    open termpdf-rs in your usual terminal and hold j while"
+echo "    watching the bottom-right HUD ('cpu N%·30s'); separately"
+echo "    open the same PDF in the browser and hold Page Down while"
+echo "    watching top/htop for the browser process tree."
