@@ -59,14 +59,6 @@ anyhow = "1"
 # use of `data_local_dir()`.
 dirs = "6"
 base64 = "0.22"
-# zlib for kitty graphics `o=z` compressed RGB transmit. flate2 is
-# already in the tree transitively (via the image crate's PNG path);
-# adding it as a direct dep is essentially free in compile time.
-# Used in src/kitty_pages.rs::encode_rgb_zlib to replace the PNG
-# encode for opaque page bitmaps — same zlib core as PNG, but
-# without PNG's filtering pass, so encode is ~3× faster and Ghostty
-# decodes to RGB directly (no PNG parser, no alpha plane).
-flate2 = "1"
 
 [dev-dependencies]
 # PTY-driven integration tests. Spawns the built `termpdf` binary

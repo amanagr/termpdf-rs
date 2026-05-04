@@ -2096,7 +2096,6 @@ dependencies = [
  "clap",
  "crossterm",
  "dirs",
- "flate2",
  "image",
  "palette",
  "pdfium-render",
