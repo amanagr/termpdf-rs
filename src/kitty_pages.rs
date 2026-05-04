@@ -960,6 +960,29 @@ pub fn place_page(
     height_cells
 }
 
+/// Reset every cell in `area` so it no longer carries a kitty
+/// placeholder symbol or a `set_skip(true)` marker. Used when a frame
+/// decides NOT to call `place_page` for a page (rapid-scroll cold
+/// defer) so the prior frame's placeholder cells — which encode an
+/// `image_id` in their fg color — don't remain in the buffer.
+///
+/// Why this matters: leaving stale placeholder cells in place causes
+/// Ghostty to log `warning(renderer_image): missing image for virtual
+/// placement` once per cell per render-frame whenever the referenced
+/// image_id has been freed by a prior `a=d` delete. At a few hundred
+/// stale cells × 60 Hz render that's 10–20k warnings/second going to
+/// journald — enough to crash Ghostty after ~10 s of held-`j`
+/// scrolling (observed 2026-05-04, 660k warnings in 7 days).
+pub fn clear_page_area(buf: &mut ratatui::buffer::Buffer, area: ratatui::layout::Rect) {
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.reset();
+            }
+        }
+    }
+}
+
 fn tmux_wrap(is_tmux: bool) -> (&'static str, &'static str, &'static str) {
     if is_tmux {
         ("\x1bPtmux;", "\x1b\x1b", "\x1b\\")
@@ -1482,5 +1505,72 @@ mod tests {
         let deletes = r.take_pending_deletes().expect("evictions queue deletes");
         // 4 evicted pages × 2 deletes each (page id + overlay id) = 8.
         assert_eq!(deletes.matches("_Ga=d,d=I,i=").count(), 8);
+    }
+
+    /// Regression: a placeholder cell from the prior frame that ends
+    /// up referencing a freed image_id (because no blit covers the
+    /// area this frame) makes Ghostty log
+    /// `warning(renderer_image): missing image for virtual placement`
+    /// every render-frame; sustained ~10s of held-`j` scrolling once
+    /// generated 660k such warnings and crashed Ghostty (incident
+    /// 2026-05-04). `clear_page_area` is the post-fix guarantee that
+    /// no kitty placeholder symbol or skip flag survives an unpainted
+    /// rect — the placement loop calls it once over the whole image
+    /// area before any place_page write.
+    #[test]
+    fn clear_page_area_resets_placeholder_cells_and_skip_flags() {
+        let area = Rect { x: 0, y: 0, width: 6, height: 3 };
+        let mut buf = Buffer::empty(area);
+        let mut scratch = PlaceScratch::default();
+        // Paint a placement so cell (0,0) carries the kitty placeholder
+        // escape + image_id-encoding fg color, and cells (1..6, *) get
+        // set_skip(true) so ratatui's diff would otherwise leave them
+        // as-is for stale image references.
+        place_page(
+            &mut buf,
+            area,
+            /*page_idx*/ 0,
+            /*image_id*/ 42,
+            /*pixel_w*/ 60,    // 6 cols at cell_w=10
+            /*pixel_h*/ 60,    // 3 rows at cell_h=20
+            /*cell_w_px*/ 10,
+            /*cell_h_px*/ 20,
+            /*dst_top_cell*/ 0,
+            /*dst_height_cells*/ 3,
+            /*src_top_cell*/ 0,
+            /*src_left_cell*/ 0,
+            /*width_cells*/ 6,
+            /*prefix*/ None,
+            &mut scratch,
+        );
+        // Sanity: pre-clear, the placeholder symbol is non-trivial and
+        // some cells are marked skip.
+        assert!(buf.cell((0, 0)).unwrap().symbol().contains('\u{10EEEE}'));
+        let any_skipped_pre = (0..area.height).any(|y| {
+            (1..area.width).any(|x| buf.cell((x, y)).map(|c| c.skip).unwrap_or(false))
+        });
+        assert!(any_skipped_pre, "place_page should mark non-leftmost cells as skip");
+
+        clear_page_area(&mut buf, area);
+
+        // Every cell in the rect must be back to default: empty symbol,
+        // no skip flag, no fg color carrying an image_id.
+        for y in 0..area.height {
+            for x in 0..area.width {
+                let cell = buf.cell((x, y)).unwrap();
+                assert_eq!(
+                    cell.symbol(),
+                    " ",
+                    "cell ({x},{y}) symbol must be reset; got {:?}",
+                    cell.symbol()
+                );
+                assert!(!cell.skip, "cell ({x},{y}) must have skip cleared");
+                assert_eq!(
+                    cell.fg,
+                    ratatui::style::Color::Reset,
+                    "cell ({x},{y}) fg must be Reset (no stale image_id)"
+                );
+            }
+        }
     }
 }

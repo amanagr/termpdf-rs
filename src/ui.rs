@@ -615,16 +615,12 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
             // (just need a re-encode because the user moved a
             // selection or edited a highlight) are cheap to transmit;
             // skipping them would make Visual-mode selection appear
-            // stuck during fast `l`/`h` motion.
+            // stuck during fast `l`/`h` motion. The blanket clear
+            // below blanks the cells where this page would have
+            // gone, so leaving height_cells=0 here just means
+            // place_page is skipped — the area is already clean.
             let is_cold = !app.page_cache.contains_key(&b.page_idx);
             if is_cold {
-                // Skip placement too — the terminal has no image
-                // cached under this ID yet, so emitting a placeholder
-                // would just render garbled fg-color cells. Setting
-                // height_cells=0 makes the placement loop below skip
-                // this entry. The catch-up redraw scheduled by the
-                // event loop after input goes idle will pick the
-                // page up at full transmit + placement.
                 b.need_transmit = false;
                 b.height_cells = 0;
             }
@@ -874,6 +870,23 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     let buf = f.buffer_mut();
     let img_area_left = area.left();
     let img_area_top = area.top();
+
+    // Blank the entire image area before any placement. Without this,
+    // cells from the prior frame that still hold a kitty placeholder
+    // (encoding an `image_id` in the fg color) survive into this
+    // frame whenever no blit covers them — happens any time a visible
+    // page has no cached bitmap (cold defer, budget defer, rapid
+    // defer, or a page whose layout slot widened between frames).
+    // Ghostty re-renders those stale cells, can't find the freed
+    // image_id, and logs `warning(renderer_image): missing image for
+    // virtual placement` once per cell per render-frame. At 10–20k
+    // warnings/sec journald floods and the Ghostty client crashes
+    // (660k entries observed in 7 days, 2026-05-04). Cell::reset() is
+    // ~50 ns so even a 200×50 area costs <1 ms; cells immediately
+    // overwritten by place_page below never reach the wire because
+    // ratatui's diff compares the buffer's *final* state to the prior
+    // frame's, not the intermediate writes.
+    crate::kitty_pages::clear_page_area(buf, area);
 
     let kp = app.kitty_pages.as_mut().unwrap();
     let scratch = kp.place_scratch_mut();
