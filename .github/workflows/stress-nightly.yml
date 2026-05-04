@@ -1,0 +1,62 @@
+name: Stress (nightly)
+
+# Long-session soak. Runs `tests/stress_long_session.rs` for 30
+# minutes against a 200-page synthetic doc and asserts bounded RSS
+# growth + bounded transmit rate. Catches the slow leaks and
+# runaway-redraw bugs that 30 s of unit-test scrolling won't surface.
+#
+# Cron triggers nightly at 04:00 UTC (~10 PM/midnight in the
+# Americas, ~early morning in Europe — off-peak runner availability).
+# Manual `workflow_dispatch` for on-demand runs after suspicious
+# refactors.
+
+on:
+  schedule:
+    # Daily at 04:00 UTC. cron syntax: m h dom mon dow.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    inputs:
+      duration_sec:
+        description: "Stress duration in seconds (default 1800 = 30 min)"
+        required: false
+        default: "1800"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  soak:
+    name: 30-min scroll soak
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rust toolchain
+        run: rustup default stable
+      - name: Cache vendor
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: vendor-pdfium-${{ hashFiles('setup.sh') }}
+      - name: setup.sh (fetch pdfium if missing)
+        run: ./setup.sh
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: Build (release)
+        run: cargo build --release --tests
+      - name: Soak
+        env:
+          TERMPDF_STRESS_RUN: "1"
+          # workflow_dispatch input falls back to the cron default of
+          # 1800 (30 min) when the field is left blank.
+          TERMPDF_STRESS_DURATION_SEC: ${{ inputs.duration_sec || '1800' }}
+        # The test prints a single-line summary on success. Use
+        # --nocapture so the line lands in the workflow log.
+        run: cargo test --release --test stress_long_session -- --nocapture
+        timeout-minutes: 45

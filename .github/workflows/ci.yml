@@ -1,0 +1,130 @@
+name: CI
+
+# Ship-readiness gate. Runs on every push to main + every PR. Three
+# tiers, in order of cost:
+#   1. fmt/clippy/build  — fast, fails the run early on lint/build
+#                          breakage so the slower jobs don't waste
+#                          a runner.
+#   2. unit + integration tests — the 264 unit tests, render_kitty
+#                          smoke, render_pty pty-driven smoke, and
+#                          the registry property tests at the
+#                          default case count.
+#   3. perf regression   — runs the perf_harness scenarios against
+#                          the tracked baseline. Gated to push-to-main
+#                          and PRs touching perf-sensitive paths so
+#                          PR cycles stay under 2 minutes.
+#
+# All tiers share a vendor cache: pdfium-binaries is ~7.5 MB
+# downloaded once per cache-key bump (= setup.sh hash change), so the
+# fetch lands in the first run and is reused for everything else.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Quiet the per-build clutter; cargo's default progress bar adds
+  # nothing readable in CI logs.
+  CARGO_NET_RETRY: 3
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  fmt-and-clippy:
+    name: fmt + clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rust toolchain
+        run: |
+          rustup default stable
+          rustup component add rustfmt clippy
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      # Build clippy needs pdfium for the lints to typecheck the
+      # render path. Cache + setup.sh.
+      - name: Cache vendor
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: vendor-pdfium-${{ hashFiles('setup.sh') }}
+      - name: setup.sh (fetch pdfium if missing)
+        run: ./setup.sh
+      - name: cargo clippy
+        # All targets so dev-deps (proptest, portable-pty) are
+        # linted too. -D warnings already in RUSTFLAGS makes any
+        # warning a hard fail.
+        run: cargo clippy --all-targets
+
+  test:
+    name: unit + integration
+    runs-on: ubuntu-24.04
+    needs: fmt-and-clippy
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rust toolchain
+        run: rustup default stable
+      - name: Cache vendor
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: vendor-pdfium-${{ hashFiles('setup.sh') }}
+      - name: setup.sh (fetch pdfium if missing)
+        run: ./setup.sh
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: Build (release)
+        run: cargo build --release --tests
+      - name: Unit tests (264 incl. registry proptests)
+        run: cargo test --release --bin termpdf
+      - name: render_kitty integration
+        run: cargo test --release --test render_kitty
+      - name: render_pty integration
+        # Pty-driven test needs a real terminal; ubuntu runners
+        # have one via /dev/pts. Halfblocks protocol used in the
+        # test sidesteps the kitty stdio cap probe.
+        run: cargo test --release --test render_pty
+      - name: Property tests at 4× cases (catch shrinking weak spots)
+        env:
+          PROPTEST_CASES: "256"
+        run: cargo test --release --bin termpdf registry_proptests
+
+  perf:
+    name: perf regression
+    runs-on: ubuntu-24.04
+    needs: test
+    # Skip perf on draft PRs — they're typically WIP and the
+    # +90 s on every push isn't worth it.
+    if: github.event_name == 'push' || !github.event.pull_request.draft
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rust toolchain
+        run: rustup default stable
+      - name: Cache vendor
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: vendor-pdfium-${{ hashFiles('setup.sh') }}
+      - name: setup.sh (fetch pdfium if missing)
+        run: ./setup.sh
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: perf_harness vs tracked baseline
+        # Verbose stdout makes the fail mode explorable from the
+        # workflow log without re-running.
+        env:
+          TERMPDF_PERF_VERBOSE: "1"
+        run: cargo test --release --test perf_harness
