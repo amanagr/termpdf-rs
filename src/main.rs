@@ -392,7 +392,27 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
         }
         if should_draw {
             let _draw = profile::span(profile::Phase::Draw);
+            // Wrap the frame in DECSET 2026 (Synchronized Output): the
+            // terminal buffers everything between BSU and ESU and then
+            // commits it as one atomic frame. Without this, on
+            // image-heavy frames the user could briefly see a torn
+            // mid-draw state — half the kitty placements landed,
+            // ratatui's diff still mid-flush, the rest of the buffer
+            // still showing the previous frame. Supported by Ghostty,
+            // Kitty, Wezterm, recent xterm; unsupported terminals
+            // silently ignore the unknown private mode.
+            //
+            // We write through `term.backend_mut()` (which impls
+            // `Write` on the underlying BufWriter) so BSU sits in the
+            // same user-space buffer as ratatui's diff bytes — one
+            // syscall on the flush at end-of-draw — and ESU lands
+            // immediately after via an explicit flush. Either way the
+            // terminal-side state machine groups them into one update.
+            use std::io::Write as _;
+            let _ = write!(term.backend_mut(), "\x1b[?2026h");
             term.draw(|f| ui::draw(f, app))?;
+            let _ = write!(term.backend_mut(), "\x1b[?2026l");
+            let _ = term.backend_mut().flush();
             drop(_draw);
             last_draw = std::time::Instant::now();
             dirty = false;
