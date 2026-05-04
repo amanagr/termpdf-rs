@@ -25,7 +25,7 @@ your laptop doesn't heat up while reading
 │                                                                  │
 │                                                                  │
 └──────────────────────────────────────────────────────────────────┘
-   12/300  zoom 100%  DARK              [j]  found 7 matches    cpu 2%·30s
+   12/300  zoom 100%  DARK              [j]  found 7 matches
 ```
 
 ## Why this exists
@@ -50,9 +50,8 @@ client side.
 - **Power-efficient by design.** Idle term.draw is gated on a `dirty`
   flag — when the user does nothing, the binary writes nothing to the
   pty. Held-key bursts defer cold renders entirely; a single settle
-  redraw catches up when input goes idle. The in-app HUD shows the
-  rolling 30-second CPU% so a regression is visible in the same
-  window you're reading in.
+  redraw catches up when input goes idle. Hold `j` and CPU stays in
+  single digits where a browser sits at 60+ %.
 - **Indexed full-text search.** First search builds a back-index in
   the background; subsequent searches are
   [Sioyek-fast](https://ahrm.github.io/jekyll/update/2022/09/11/pdf-viewer-text-search-benchmark.html):
@@ -170,23 +169,31 @@ for warmup to settle, then samples CPU% and RSS for 20 s of
 steady-state idle.
 
 Steady-state idle on a 600-page PDF (Designing Data-Intensive
-Applications), measured with this script:
+Applications), measured with `bench-vs-browser.sh`:
 
 | Metric    | termpdf-rs | google-chrome | ratio |
 | --------- | ---------- | ------------- | ----- |
 | Idle CPU% | 3.2%       | 17.1%         | 5.3×  |
 | Idle RSS  | 71 MB      | 558 MB        | 7.9×  |
 
-Firefox is leaner on the CPU axis (~3 % steady-state idle) but
-still ~5× larger than termpdf-rs on RSS for the same PDF.
+For interactive scroll, use `monitor-scroll.sh` and scroll manually
+in each app — it delta-samples `/proc/<pid>/stat` once per second so
+the value reflects current CPU usage (the same thing `top` reports),
+not the lifetime average that `ps -o pcpu` gives. On the same DDIA
+book, sustained held-`j` / Page Down for ~25 s:
 
-Scroll-time cost is harder to script (the benchmark can't reliably
-inject input into either app), but anecdotally:
+| Metric                    | termpdf-rs + Ghostty | Firefox     |
+| ------------------------- | -------------------- | ----------- |
+| Scroll CPU% (median, 25s) | 7.5%                 | 66.0%       |
+| Scroll CPU% (max)         | 8.0%                 | 74.0%       |
 
-- termpdf-rs scroll CPU stays in the single-digit %s — visible in
-  the bottom-right HUD ("cpu N%·30s") while you hold `j`.
-- Chrome / Firefox scrolling the same PDF lands in the 15-30 % range
-  on the same hardware.
+Almost 9× lower CPU during active scroll, on the same machine and
+the same PDF. The 7.5 % we measure is the *combined* termpdf-rs +
+Ghostty cost — termpdf is roughly 1-2 % on its own; the bulk is
+Ghostty PNG-decoding the page bitmaps and uploading textures. Set
+`TERMPDF_TRANSMIT_RAW=1` to ship raw RGBA instead of PNG (skips
+Ghostty's decode at the cost of larger pty bytes) and see whether
+your terminal prefers less compute or less bandwidth.
 
 The aim isn't to beat the absolute ceiling — it's to make the case
 that for a "just open this PDF" session, you don't need the web
@@ -234,10 +241,6 @@ Concrete moves that get us to single-digit CPU during reading:
   bounded to 512 MB; re-opens skip pdfium entirely.
 - **Persistent search index** at the same hash key; reopens skip the
   ~3.5 s text-extract cost.
-
-The bottom-right HUD shows the rolling 30-second process-CPU%, so a
-sustained spike is visible in the same window you're reading in. Set
-`TERMPDF_NO_PERF_HUD=1` to hide it.
 
 ## Reading PDFs lives nicely with…
 
@@ -294,13 +297,13 @@ back to per-page pdfium for the unindexed pages. Status line shows
 the percent. Once 100%, the index persists; subsequent opens are
 instant.
 
-**"My terminal is using a lot of CPU."** First, check the in-app HUD
-— if termpdf's own CPU% is also high, the regression is on our side
-and we'd love a bug report. If termpdf is reading low but the
-terminal's CPU is high during scroll, the cost is downstream PNG
-decode + GPU upload. Try `TERMPDF_TRANSMIT_RAW=1` to ship raw RGBA
-instead of PNG (skips decode in the terminal at the cost of larger
-pty bytes).
+**"My terminal is using a lot of CPU."** Run
+`scripts/monitor-scroll.sh termpdf <your-terminal>` while scrolling.
+If termpdf's own CPU is high, the regression is on our side and we'd
+love a bug report. If termpdf is low but the terminal is high during
+scroll, the cost is downstream PNG decode + GPU upload — try
+`TERMPDF_TRANSMIT_RAW=1` to ship raw RGBA instead of PNG (skips
+decode in the terminal at the cost of larger pty bytes).
 
 ## Configuration
 
@@ -314,7 +317,6 @@ a session file. By design.
 | `TERMPDF_NO_TMUX_HINT`    | unset                              | Skip the one-time tmux hint              |
 | `TERMPDF_CACHE_MB`        | `256`                              | Soft cap on the in-memory page cache     |
 | `TERMPDF_PROFILE`         | unset                              | Print phase timings to stderr at exit    |
-| `TERMPDF_NO_PERF_HUD`     | unset                              | Hide the bottom-right CPU% HUD           |
 | `TERMPDF_FAST_LCD`        | unset                              | Re-enable LCD subpixel text on the Fast tier (sharper scroll, more CPU) |
 | `TERMPDF_TRANSMIT_RAW`    | unset                              | Ship raw RGBA instead of PNG (skip terminal-side PNG decode at the cost of larger pty bytes) |
 
