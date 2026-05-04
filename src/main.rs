@@ -273,6 +273,7 @@ fn main() -> Result<()> {
     app.render_worker = render_worker::RenderWorker::spawn(lib.clone(), args.path.clone());
 
     setup_terminal()?;
+    install_decset_panic_hook();
     let res = run_loop(&mut app);
     teardown_terminal()?;
     profile::report();
@@ -293,9 +294,40 @@ fn setup_terminal() -> Result<()> {
 }
 
 fn teardown_terminal() -> Result<()> {
-    execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
+    // Belt-and-braces ESU: if a frame ended in a state where the
+    // run-loop's per-frame ESU didn't run (e.g. an early return path
+    // was added later that bypassed it), make sure we're not leaving
+    // the user's terminal in DECSET 2026 sync mode.
+    use std::io::Write as _;
+    let mut out = io::stdout();
+    let _ = write!(out, "\x1b[?2026l");
+    let _ = out.flush();
+    execute!(out, DisableMouseCapture, LeaveAlternateScreen)?;
     disable_raw_mode()?;
     Ok(())
+}
+
+/// Wrap the default panic hook so a panic during `term.draw` or any
+/// other tight render path doesn't leave the user's terminal stuck
+/// in DECSET 2026 sync mode (output buffered, screen frozen). Writes
+/// ESU directly to stdout — bypasses any BufWriter that might still
+/// hold the BSU we paired it with, since by panic time the unwinder
+/// hasn't run our normal cleanup. Also clears alt-screen + raw mode
+/// so the user's shell prompt is reachable.
+fn install_decset_panic_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write as _;
+        let mut out = io::stdout();
+        let _ = write!(out, "\x1b[?2026l");
+        let _ = out.flush();
+        // Best-effort tty restore; if we can't (e.g. stdout already
+        // closed) the default hook still runs and the user can fix
+        // the terminal with `reset`.
+        let _ = execute!(out, DisableMouseCapture, LeaveAlternateScreen);
+        let _ = disable_raw_mode();
+        prev(info);
+    }));
 }
 
 /// Headless render path used by `--probe`. Builds a fake Picker with an
@@ -392,7 +424,31 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
         }
         if should_draw {
             let _draw = profile::span(profile::Phase::Draw);
-            term.draw(|f| ui::draw(f, app))?;
+            // Wrap the frame in DECSET 2026 (Synchronized Output): the
+            // terminal buffers everything between BSU (\x1b[?2026h) and
+            // ESU (\x1b[?2026l) and commits it as one atomic frame.
+            // Supported by Ghostty, Kitty, Wezterm, recent xterm;
+            // unsupported terminals silently ignore the unknown
+            // private mode.
+            //
+            // CRITICAL: we MUST write ESU on every exit path. If BSU
+            // hits the terminal but ESU does not (term.draw error,
+            // panic mid-frame, write failure), the terminal stays
+            // stuck in synchronized-output mode — output buffered,
+            // never committed, screen frozen even after the user
+            // stops scrolling. So we capture the draw result, ALWAYS
+            // emit ESU + flush, then propagate the error after.
+            // Panics inside ui::draw are caught by the panic hook
+            // installed in main(), which writes ESU directly to
+            // stdout before the default handler runs.
+            use std::io::Write as _;
+            let _ = write!(term.backend_mut(), "\x1b[?2026h");
+            // Discard CompletedFrame's borrow on term immediately —
+            // we need term back to write ESU. Result -> Result<(),_>.
+            let draw_res = term.draw(|f| ui::draw(f, app)).map(|_| ());
+            let _ = write!(term.backend_mut(), "\x1b[?2026l");
+            let _ = term.backend_mut().flush();
+            draw_res?;
             drop(_draw);
             last_draw = std::time::Instant::now();
             dirty = false;
