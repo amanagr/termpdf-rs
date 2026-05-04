@@ -13,6 +13,8 @@ text stays sharp, figures stay readable, no halfblocks-ASCII guesswork.
 link-follow · highlights stored *in* the PDF · idle redraws gated so
 your laptop doesn't heat up while reading
 
+<a href="https://amanagr.github.io/termpdf-rs/">Website</a> · <a href="https://github.com/amanagr/termpdf-rs">GitHub</a>
+
 </div>
 
 ---
@@ -82,6 +84,8 @@ git clone https://github.com/amanagr/termpdf-rs && cd termpdf-rs
 cargo build --release
 ./target/release/termpdf paper.pdf
 ```
+
+> Full docs, screenshots, and the power-efficiency writeup: https://amanagr.github.io/termpdf-rs/
 
 A shell alias lands you in a productive state immediately:
 

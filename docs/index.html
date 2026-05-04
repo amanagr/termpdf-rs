@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>termpdf-rs — power-efficient terminal PDF reader</title>
+<meta name="description" content="Pixel-perfect PDF pages in your terminal via the kitty graphics protocol. Vim keys, indexed search, highlights stored in the PDF. Single-digit CPU during sustained scroll on a 600-page book.">
+<link rel="canonical" href="https://amanagr.github.io/termpdf-rs/">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://amanagr.github.io/termpdf-rs/">
+<meta property="og:title" content="termpdf-rs — a PDF reader that lives in your terminal">
+<meta property="og:description" content="vim keys, kitty-native pixel-perfect pages, indexed search, single-digit CPU on a held-j. Linux + Rust.">
+<meta property="og:image" content="https://amanagr.github.io/termpdf-rs/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="termpdf-rs — a PDF reader that lives in your terminal">
+<meta name="twitter:description" content="vim keys, kitty-native pixel-perfect pages, indexed search, single-digit CPU on a held-j. Linux + Rust.">
+<meta name="twitter:image" content="https://amanagr.github.io/termpdf-rs/og.png">
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "termpdf-rs",
+  "operatingSystem": "Linux",
+  "applicationCategory": "DeveloperApplication",
+  "description": "Power-efficient terminal PDF reader in Rust. Pixel-perfect pages via the Kitty graphics protocol, vim keybindings, indexed full-text search, color-aware dark mode, and highlights stored inside the PDF.",
+  "url": "https://amanagr.github.io/termpdf-rs/",
+  "downloadUrl": "https://github.com/amanagr/termpdf-rs",
+  "license": "https://opensource.org/license/bsd-3-clause",
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+  "author": { "@type": "Person", "name": "Aman Agrawal" }
+}
+</script>
+</head>
+<body>
+
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="nav">
+  <div class="nav-inner">
+    <a class="brand" href="/termpdf-rs/">termpdf-rs<span class="dot">.</span></a>
+    <button class="nav-toggle" aria-label="menu" aria-expanded="false" aria-controls="nav-links">menu</button>
+    <nav class="nav-links" id="nav-links" aria-label="primary">
+      <a href="#features">Features</a>
+      <a href="#power">Power</a>
+      <a href="#install">Install</a>
+      <a href="#keys">Keys</a>
+      <a href="#faq">FAQ</a>
+      <a href="https://github.com/amanagr/termpdf-rs" rel="noopener">GitHub →</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+<section class="hero" aria-label="hero">
+  <h1>Read PDFs in your terminal without your fan kicking on.</h1>
+  <p class="sub">Pixel-perfect pages via the kitty graphics protocol, vim keys, indexed search, highlights stored <em>in</em> the PDF. Single-digit CPU during sustained scroll on a 600-page book.</p>
+
+  <div class="install-line" id="install-line">
+    <span class="prompt">$</span><span id="install-cmd">git clone https://github.com/amanagr/termpdf-rs &amp;&amp; cd termpdf-rs &amp;&amp; ./setup.sh &amp;&amp; cargo build --release</span>
+    <button class="copy-btn" data-copy-target="install-cmd" aria-label="Copy install command">Copy</button>
+  </div>
+
+  <div class="cta-row">
+    <a class="btn btn-primary" href="#install">Install</a>
+    <a class="btn btn-ghost" href="https://github.com/amanagr/termpdf-rs" rel="noopener">Source on GitHub</a>
+  </div>
+
+  <div class="terminal" aria-label="terminal preview">
+    <div class="terminal-bar">
+      <span class="terminal-dot r"></span>
+      <span class="terminal-dot y"></span>
+      <span class="terminal-dot g"></span>
+      <span class="terminal-title">~/papers — termpdf paper.pdf</span>
+    </div>
+<pre class="terminal-body" aria-hidden="true"><span class="frame">┌──────────────────────────────────────────────────────────────────┐
+│                                                                  │
+│       <span class="pageblock">[a real, pixel-perfect PDF page rendered as an image]</span>      │
+│                                                                  │
+│                                                                  │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘</span>
+   <span class="status">12/300  zoom 100%  DARK</span>              <span class="hl">[j]  found 7 matches</span></pre>
+  </div>
+</section>
+
+<section id="why" aria-labelledby="why-h">
+  <h2 id="why-h">Why this exists</h2>
+  <p>Most terminal PDF "readers" either draw halfblocks and pretend that's reading, or use real graphics protocols but burn CPU as if you were watching video — a held-<kbd>j</kbd> on a 600-page book pegs a core, the laptop discharges while plugged in, the fan kicks on.</p>
+  <p>termpdf-rs is the inverse: real pixel-perfect images via the kitty graphics protocol, but the scroll and idle paths are budgeted ruthlessly. Idle with a PDF open emits effectively no bytes on the pty. A sustained scroll burst on a 600-page book lands in single-digit CPU.</p>
+</section>
+
+<section id="features" aria-labelledby="features-h">
+  <h2 id="features-h">What you get on day one</h2>
+  <div class="features">
+    <div class="feature"><h3><span class="icon">▮</span>Pixel-perfect pages</h3><p>Real PNG-quality renders via the kitty graphics protocol — Kitty, Ghostty, WezTerm. No halfblock guesswork.</p></div>
+    <div class="feature"><h3><span class="icon">vi</span>Vim keys, vim text-objects</h3><p><kbd>j</kbd>/<kbd>k</kbd>/<kbd>gg</kbd>/<kbd>G</kbd>; <kbd>viw</kbd>/<kbd>vis</kbd>/<kbd>vip</kbd> on PDF text; marks <kbd>m{a-z}</kbd>/<kbd>'{a-z}</kbd>; <kbd>Ctrl-o</kbd>/<kbd>Ctrl-i</kbd> jumplist.</p></div>
+    <div class="feature"><h3><span class="icon">⌕</span>Indexed search</h3><p>First search builds a back-index in the background and persists it. Subsequent opens hit instantly.</p></div>
+    <div class="feature"><h3><span class="icon">▰</span>Highlights live in the PDF</h3><p>Native PDF annotations — they travel with the file and render in Adobe, Preview, Sioyek, zathura.</p></div>
+    <div class="feature"><h3><span class="icon">◐</span>Color-aware dark mode</h3><p>Luminance-only HSL inversion via <code>palette</code>. Red text stays red, blue charts stay blue.</p></div>
+    <div class="feature"><h3><span class="icon">→f</span>Vimium-style link-follow</h3><p><kbd>f</kbd> overlays 1-2 char hints on every clickable link. Type the hint to jump or open.</p></div>
+  </div>
+</section>
+
+<section id="power" aria-labelledby="power-h">
+  <h2 id="power-h">Power efficiency, measured</h2>
+  <p>PDF reading is a low-frequency activity — pages turn at human speed, not video speed — so a reader that pegs CPU on scroll is wasting battery on nothing. Idle redraws are gated on a dirty flag: when you do nothing, the binary writes nothing to the pty. Held-key bursts defer cold pdfium renders entirely; a single settle redraw catches up when input goes idle.</p>
+
+  <div class="table-wrap">
+    <table>
+      <caption>Idle on Designing Data-Intensive Applications (623 pages)</caption>
+      <thead><tr><th>Metric</th><th class="num">termpdf-rs</th><th class="num">Chrome</th><th class="num">Ratio</th></tr></thead>
+      <tbody>
+        <tr><td>Idle CPU%</td><td class="num win">3.2%</td><td class="num lose">17.1%</td><td class="num ratio">5.3×</td></tr>
+        <tr><td>Idle RSS</td><td class="num win">71 MB</td><td class="num lose">558 MB</td><td class="num ratio">7.9×</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <caption>Sustained held-<kbd>j</kbd> for ~25 s on the same book</caption>
+      <thead><tr><th>Metric</th><th class="num">termpdf-rs + Ghostty</th><th class="num">Firefox</th><th class="num">Ratio</th></tr></thead>
+      <tbody>
+        <tr><td>Scroll CPU% (median)</td><td class="num win">7.5%</td><td class="num lose">66.0%</td><td class="num ratio">8.8×</td></tr>
+        <tr><td>Scroll CPU% (max)</td><td class="num win">8.0%</td><td class="num lose">74.0%</td><td class="num ratio">9.3×</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p class="caption">Numbers come from <a href="https://github.com/amanagr/termpdf-rs/blob/main/scripts/bench-vs-browser.sh">scripts/bench-vs-browser.sh</a> and <code>monitor-scroll.sh</code> in the repo. Run them on your machine — you'll get something close, modulo your CPU and terminal.</p>
+</section>
+
+<section id="install" aria-labelledby="install-h">
+  <h2 id="install-h">Install</h2>
+  <p>Linux x86_64, terminal that speaks the kitty graphics protocol (Kitty, Ghostty, WezTerm). No pre-built binaries yet — clone, vendor pdfium, build.</p>
+
+  <div class="tabs" role="tablist" aria-label="install methods">
+    <button class="tab-btn" role="tab" aria-selected="true" aria-controls="tab-source" id="tab-source-btn">From source</button>
+    <button class="tab-btn" role="tab" aria-selected="false" aria-controls="tab-cargo" id="tab-cargo-btn">Cargo</button>
+    <button class="tab-btn" role="tab" aria-selected="false" aria-controls="tab-tmux" id="tab-tmux-btn">tmux note</button>
+  </div>
+
+  <div class="tab-panel active" role="tabpanel" id="tab-source" aria-labelledby="tab-source-btn">
+    <p><code>setup.sh</code> downloads the pinned <code>libpdfium.so</code> (~7.5 MB) into the repo. Then a stock release build.</p>
+<pre><code>git clone https://github.com/amanagr/termpdf-rs
+cd termpdf-rs
+./setup.sh
+cargo build --release
+./target/release/termpdf paper.pdf
+
+# alias for daily use
+alias pdf='~/termpdf-rs/target/release/termpdf'</code></pre>
+  </div>
+
+  <div class="tab-panel" role="tabpanel" id="tab-cargo" aria-labelledby="tab-cargo-btn" hidden>
+    <p>Not on crates.io yet — pdfium is a runtime native dependency that needs vendoring. Use the source path above. A crates.io release lands once the libpdfium loader can locate a system-installed library across distros.</p>
+  </div>
+
+  <div class="tab-panel" role="tabpanel" id="tab-tmux" aria-labelledby="tab-tmux-btn" hidden>
+    <p>Inside tmux, enable graphics passthrough once:</p>
+<pre><code>tmux set -g allow-passthrough on</code></pre>
+    <p>The binary prints a one-time hint if it detects tmux without passthrough enabled.</p>
+  </div>
+</section>
+
+<section id="keys" aria-labelledby="keys-h">
+  <h2 id="keys-h">Five keys to get started</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Key</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><kbd>j</kbd> / <kbd>k</kbd></td><td>Next / prev page</td></tr>
+        <tr><td><kbd>Space</kbd></td><td>Scroll one screen down (less-style)</td></tr>
+        <tr><td><kbd>o</kbd></td><td>Open the table-of-contents panel — <kbd>/</kbd> to fuzzy-filter</td></tr>
+        <tr><td><kbd>v</kbd></td><td>Visual mode → <kbd>viw</kbd>/<kbd>vis</kbd>/<kbd>vip</kbd> → <kbd>y</kbd> to highlight</td></tr>
+        <tr><td><kbd>f</kbd></td><td>Link-follow — type the hint over any clickable link</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="caption">Press <kbd>?</kbd> in the binary for the full overlay. The full keymap also lives at <a href="keys/">/keys/</a>.</p>
+
+  <details>
+    <summary>Full keymap</summary>
+
+    <h3 style="font-size:14px;margin:16px 0 4px;color:var(--fg);">Navigate</h3>
+    <div class="table-wrap"><table>
+      <tbody>
+        <tr><td><kbd>j</kbd> / <kbd>k</kbd></td><td>next / prev page</td></tr>
+        <tr><td><kbd>Space</kbd> / <kbd>b</kbd></td><td>one screen down / up (less-style)</td></tr>
+        <tr><td><kbd>Ctrl-d</kbd> / <kbd>Ctrl-u</kbd></td><td>half-screen down / up</td></tr>
+        <tr><td><kbd>gg</kbd> / <kbd>G</kbd></td><td>first / last page</td></tr>
+        <tr><td><kbd>:</kbd>n / <kbd>N G</kbd></td><td>jump to page N</td></tr>
+        <tr><td><kbd>]]</kbd> / <kbd>[[</kbd></td><td>next / prev outline section</td></tr>
+        <tr><td><kbd>m{a-z}</kbd> / <kbd>'{a-z}</kbd></td><td>set / jump to mark (persisted per PDF)</td></tr>
+        <tr><td><kbd>Ctrl-o</kbd> / <kbd>Ctrl-i</kbd></td><td>jumplist back / forward</td></tr>
+        <tr><td><kbd>+</kbd> / <kbd>-</kbd> / <kbd>0</kbd></td><td>zoom in / out / reset</td></tr>
+        <tr><td><kbd>d</kbd></td><td>toggle color-aware dark mode</td></tr>
+        <tr><td><kbd>f</kbd></td><td>link-follow hint mode</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3 style="font-size:14px;margin:16px 0 4px;color:var(--fg);">Highlight &amp; quote (Visual — <kbd>v</kbd>)</h3>
+    <div class="table-wrap"><table>
+      <tbody>
+        <tr><td><kbd>h</kbd> <kbd>j</kbd> <kbd>k</kbd> <kbd>l</kbd> · <kbd>w</kbd> <kbd>b</kbd> <kbd>e</kbd> · <kbd>0</kbd> <kbd>^</kbd> <kbd>$</kbd></td><td>move the caret like in vim</td></tr>
+        <tr><td><kbd>iw</kbd> / <kbd>is</kbd> / <kbd>ip</kbd></td><td>select inner word / sentence / paragraph</td></tr>
+        <tr><td><kbd>V</kbd> / <kbd>Ctrl-v</kbd></td><td>linewise / blockwise selection</td></tr>
+        <tr><td><kbd>c</kbd></td><td>cycle highlight color</td></tr>
+        <tr><td><kbd>y</kbd></td><td>save highlight + copy plain text</td></tr>
+        <tr><td><kbd>Y</kbd></td><td>copy plain text only (no highlight)</td></tr>
+        <tr><td><kbd>gy</kbd></td><td>copy as Markdown blockquote with citation</td></tr>
+        <tr><td>click + drag</td><td>highlight with the mouse</td></tr>
+        <tr><td><kbd>x</kbd> (Normal)</td><td>delete last highlight on current page</td></tr>
+      </tbody>
+    </table></div>
+
+    <h3 style="font-size:14px;margin:16px 0 4px;color:var(--fg);">Search, TOC, export</h3>
+    <div class="table-wrap"><table>
+      <tbody>
+        <tr><td><kbd>/&lt;query&gt;</kbd> then <kbd>n</kbd> / <kbd>N</kbd></td><td>search · next / prev match (indexed)</td></tr>
+        <tr><td><kbd>:nohl</kbd></td><td>clear search results</td></tr>
+        <tr><td><kbd>o</kbd></td><td>open TOC panel — <kbd>/</kbd> to filter, Enter jumps</td></tr>
+        <tr><td><kbd>:export [path]</kbd></td><td>dump highlights as a Markdown notes file</td></tr>
+      </tbody>
+    </table></div>
+  </details>
+</section>
+
+<section id="faq" aria-labelledby="faq-h">
+  <h2 id="faq-h">FAQ</h2>
+
+  <details>
+    <summary>Does this work over SSH?</summary>
+    <p>Yes, if your local terminal speaks the kitty graphics protocol and the remote shell forwards bytes cleanly. Latency-bound on slow links because each page is a PNG-sized payload; on a LAN it's fine.</p>
+  </details>
+
+  <details>
+    <summary>What about Wayland / X11?</summary>
+    <p>Doesn't care. termpdf-rs renders into your terminal, not into the display server. If your terminal runs, this runs.</p>
+  </details>
+
+  <details>
+    <summary>Does it support encrypted / password-protected PDFs?</summary>
+    <p>Not yet. Decrypt first with <code>qpdf --decrypt locked.pdf unlocked.pdf</code> and open the result. Tracked as a known limitation.</p>
+  </details>
+
+  <details>
+    <summary>Can I use this in tmux?</summary>
+    <p>Yes. Run <code>tmux set -g allow-passthrough on</code> once so tmux forwards the kitty graphics escapes. The binary prints a one-time hint if it detects tmux without passthrough enabled.</p>
+  </details>
+
+  <details>
+    <summary>What if my terminal isn't Kitty / Ghostty / WezTerm?</summary>
+    <p>Pass <code>--protocol sixel</code> for xterm / foot / Konsole — slower, lower fidelity, but readable. Anything else falls back to halfblocks, which is unreadable; treat that as confirmation the binary loads, then switch terminals.</p>
+  </details>
+
+  <details>
+    <summary>macOS or Windows?</summary>
+    <p>Not at launch. The hot path is Linux x86_64 and a vendored <code>libpdfium.so</code>. Porting needs the equivalent <code>libpdfium.dylib</code> / <code>pdfium.dll</code> wired through <code>setup.sh</code> and the runtime loader; help welcome on the issue tracker.</p>
+  </details>
+</section>
+
+</main>
+
+<footer>
+  <div class="footer-grid">
+    <div class="footer-col">
+      <h4>Project</h4>
+      <ul>
+        <li><a href="https://github.com/amanagr/termpdf-rs" rel="noopener">GitHub</a></li>
+        <li><a href="https://github.com/amanagr/termpdf-rs/issues" rel="noopener">Issues</a></li>
+        <li><a href="https://github.com/amanagr/termpdf-rs/releases" rel="noopener">Releases</a></li>
+      </ul>
+    </div>
+    <div class="footer-col">
+      <h4>Docs</h4>
+      <ul>
+        <li><a href="https://github.com/amanagr/termpdf-rs#readme" rel="noopener">README</a></li>
+        <li><a href="keys/">Keys cheatsheet</a></li>
+        <li><a href="https://github.com/amanagr/termpdf-rs/blob/main/LICENSE" rel="noopener">License (BSD-3)</a></li>
+      </ul>
+    </div>
+    <div class="footer-col">
+      <h4>Built with</h4>
+      <ul>
+        <li><a href="https://www.rust-lang.org/" rel="noopener">Rust</a> + <a href="https://ratatui.rs/" rel="noopener">ratatui</a></li>
+        <li><a href="https://github.com/paulocoutinhox/pdfium-lib" rel="noopener">pdfium</a> (BSD-3)</li>
+        <li><a href="https://sw.kovidgoyal.net/kitty/graphics-protocol/" rel="noopener">kitty graphics protocol</a></li>
+      </ul>
+    </div>
+  </div>
+  <div class="footer-meta">
+    <span>termpdf-rs · BSD-3-Clause · 2026</span>
+    <a class="up" href="#main">↑ top</a>
+  </div>
+</footer>
+
+<script>
+  // copy install command
+  document.querySelectorAll('.copy-btn').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var target = document.getElementById(btn.getAttribute('data-copy-target'));
+      if (!target) return;
+      var text = target.textContent.trim();
+      navigator.clipboard.writeText(text).then(function () {
+        var orig = btn.textContent;
+        btn.textContent = 'Copied';
+        btn.classList.add('copied');
+        setTimeout(function () { btn.textContent = orig; btn.classList.remove('copied'); }, 1400);
+      }).catch(function () {
+        btn.textContent = 'Copy failed';
+      });
+    });
+  });
+
+  // tabs
+  var tabBtns = document.querySelectorAll('.tab-btn');
+  tabBtns.forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var panelId = btn.getAttribute('aria-controls');
+      tabBtns.forEach(function (b) { b.setAttribute('aria-selected', 'false'); });
+      btn.setAttribute('aria-selected', 'true');
+      document.querySelectorAll('.tab-panel').forEach(function (p) {
+        p.classList.remove('active');
+        p.setAttribute('hidden', '');
+      });
+      var panel = document.getElementById(panelId);
+      if (panel) {
+        panel.classList.add('active');
+        panel.removeAttribute('hidden');
+      }
+    });
+  });
+
+  // mobile nav toggle
+  var toggle = document.querySelector('.nav-toggle');
+  var navLinks = document.getElementById('nav-links');
+  if (toggle && navLinks) {
+    toggle.addEventListener('click', function () {
+      var open = navLinks.classList.toggle('open');
+      toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
+    navLinks.querySelectorAll('a').forEach(function (a) {
+      a.addEventListener('click', function () {
+        navLinks.classList.remove('open');
+        toggle.setAttribute('aria-expanded', 'false');
+      });
+    });
+  }
+</script>
+
+</body>
+</html>

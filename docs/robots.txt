@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://amanagr.github.io/termpdf-rs/sitemap.xml

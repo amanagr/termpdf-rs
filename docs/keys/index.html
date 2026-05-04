@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Keys cheatsheet — termpdf-rs</title>
+<meta name="description" content="Full keymap for termpdf-rs. Printable, single-page, no JavaScript needed.">
+<link rel="canonical" href="https://amanagr.github.io/termpdf-rs/keys/">
+<link rel="icon" href="/termpdf-rs/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/termpdf-rs/style.css">
+<style>
+  @media print {
+    .nav, footer, .skip-link { display: none; }
+    body { background: #fff; color: #000; }
+    table, th, td { border-color: #999; }
+  }
+</style>
+</head>
+<body>
+
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="nav">
+  <div class="nav-inner">
+    <a class="brand" href="/termpdf-rs/">termpdf-rs<span class="dot">.</span></a>
+    <nav class="nav-links" aria-label="primary">
+      <a href="/termpdf-rs/#install">Install</a>
+      <a href="/termpdf-rs/#faq">FAQ</a>
+      <a href="https://github.com/amanagr/termpdf-rs" rel="noopener">GitHub →</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+<section>
+  <h2 style="font-size:32px;margin-bottom:8px;">Keys cheatsheet</h2>
+  <p class="muted">Press <kbd>?</kbd> in the running binary for the same overlay. <code>Ctrl-P</code> in your browser to print.</p>
+</section>
+
+<section>
+  <h2>Navigate</h2>
+  <div class="table-wrap"><table>
+    <tbody>
+      <tr><td><kbd>j</kbd> / <kbd>k</kbd></td><td>next / prev page</td></tr>
+      <tr><td><kbd>Space</kbd> / <kbd>b</kbd></td><td>one screen down / up (less-style)</td></tr>
+      <tr><td><kbd>Ctrl-d</kbd> / <kbd>Ctrl-u</kbd></td><td>half-screen down / up</td></tr>
+      <tr><td><kbd>gg</kbd> / <kbd>G</kbd></td><td>first / last page</td></tr>
+      <tr><td><kbd>:</kbd>n / <kbd>N G</kbd></td><td>jump to page N</td></tr>
+      <tr><td><kbd>]]</kbd> / <kbd>[[</kbd></td><td>next / prev outline section</td></tr>
+      <tr><td><kbd>m{a-z}</kbd> / <kbd>'{a-z}</kbd></td><td>set / jump to mark (per-PDF)</td></tr>
+      <tr><td><kbd>Ctrl-o</kbd> / <kbd>Ctrl-i</kbd></td><td>jumplist back / forward</td></tr>
+      <tr><td><kbd>+</kbd> / <kbd>-</kbd> / <kbd>0</kbd></td><td>zoom in / out / reset</td></tr>
+      <tr><td><kbd>d</kbd></td><td>toggle color-aware dark mode</td></tr>
+      <tr><td><kbd>f</kbd></td><td>link-follow hint mode</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2>Highlight &amp; quote (Visual — <kbd>v</kbd>)</h2>
+  <div class="table-wrap"><table>
+    <tbody>
+      <tr><td><kbd>h</kbd> <kbd>j</kbd> <kbd>k</kbd> <kbd>l</kbd> · <kbd>w</kbd> <kbd>b</kbd> <kbd>e</kbd> · <kbd>0</kbd> <kbd>^</kbd> <kbd>$</kbd></td><td>move the caret like in vim</td></tr>
+      <tr><td><kbd>iw</kbd> / <kbd>is</kbd> / <kbd>ip</kbd></td><td>inner word / sentence / paragraph</td></tr>
+      <tr><td><kbd>V</kbd> / <kbd>Ctrl-v</kbd></td><td>linewise / blockwise selection</td></tr>
+      <tr><td><kbd>c</kbd></td><td>cycle highlight color</td></tr>
+      <tr><td><kbd>y</kbd></td><td>save highlight + copy plain text</td></tr>
+      <tr><td><kbd>Y</kbd></td><td>copy plain text only (no highlight)</td></tr>
+      <tr><td><kbd>gy</kbd></td><td>copy as Markdown blockquote with citation</td></tr>
+      <tr><td>click + drag</td><td>highlight with the mouse</td></tr>
+      <tr><td><kbd>x</kbd> (Normal)</td><td>delete last highlight on current page</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <h2>Search, TOC, export</h2>
+  <div class="table-wrap"><table>
+    <tbody>
+      <tr><td><kbd>/&lt;query&gt;</kbd> then <kbd>n</kbd> / <kbd>N</kbd></td><td>search · next / prev match (indexed)</td></tr>
+      <tr><td><kbd>:nohl</kbd></td><td>clear search results</td></tr>
+      <tr><td><kbd>o</kbd></td><td>open TOC panel — <kbd>/</kbd> to filter, Enter jumps</td></tr>
+      <tr><td><kbd>:export [path]</kbd></td><td>dump highlights as a Markdown notes file</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+</main>
+
+<footer>
+  <div class="footer-meta">
+    <span>termpdf-rs · BSD-3-Clause · 2026</span>
+    <a class="up" href="/termpdf-rs/">↑ home</a>
+  </div>
+</footer>
+
+</body>
+</html>
