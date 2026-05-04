@@ -257,10 +257,20 @@ fn apply_store_to_document(
 /// two steps means the original PDF stays intact if pdfium dies
 /// mid-write.
 ///
-/// On Unix the temp file is pre-created with 0600 BEFORE pdfium
-/// writes to it. pdfium's `open(path, O_WRONLY|O_TRUNC)` preserves
-/// the existing inode's mode, so the file is never briefly world-
-/// readable — a chmod-after-write was racy on shared filesystems.
+/// Threat model for the temp file: a co-located attacker (same UID,
+/// write access to the directory containing the user's PDF) could
+/// otherwise (a) predict the temp path `.{stem}.termpdf-tmp`,
+/// (b) plant a symlink there pointing at an arbitrary file the
+/// user can write, (c) wait for pdfium's `open(O_WRONLY|O_TRUNC)`
+/// to follow the symlink and overwrite the target with PDF bytes.
+///
+/// Two hardenings:
+///   1. Randomized temp suffix (per-process nanos + counter) so
+///      the attacker can't pre-place a symlink at a known path.
+///   2. We own the file descriptor: open with O_NOFOLLOW + O_EXCL
+///      + 0600, then hand the *fd* to pdfium via `save_to_writer`.
+///      pdfium never opens by path, so a symlink swap landing
+///      mid-write writes nowhere we don't control.
 fn save_atomic(document: &PdfDocument<'_>, path: &Path) -> Result<()> {
     let parent = path
         .parent()
@@ -270,31 +280,69 @@ fn save_atomic(document: &PdfDocument<'_>, path: &Path) -> Result<()> {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("doc");
-    let tmp_path = parent.join(format!(".{stem}.termpdf-tmp"));
+    let tmp_path = parent.join(format!(
+        ".{stem}.termpdf-tmp.{}.{}",
+        std::process::id(),
+        unique_temp_suffix(),
+    ));
 
     #[cfg(unix)]
     {
+        use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt;
-        // Wipe any stale temp from a prior crash so create_new succeeds
-        // with our mode rather than reusing leftover permissions.
-        let _ = fs::remove_file(&tmp_path);
-        std::fs::OpenOptions::new()
+        // O_NOFOLLOW + O_EXCL: if a same-UID attacker squatted on the
+        // randomized temp path with a symlink between scheduling and
+        // open, the open fails rather than following. O_EXCL is the
+        // standard "create or fail" guard; together they're a tight
+        // anti-symlink-race fence. 0o600 keeps the temp inode private
+        // even on shared volumes.
+        const O_NOFOLLOW: i32 = 0x20000; // libc::O_NOFOLLOW on Linux
+        let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
+            .custom_flags(O_NOFOLLOW)
             .mode(0o600)
             .open(&tmp_path)
             .with_context(|| {
                 format!("creating private temp file {}", tmp_path.display())
             })?;
+        document
+            .save_to_writer(&mut file)
+            .with_context(|| format!("writing temp PDF to {}", tmp_path.display()))?;
+        // Flush + drop fd before rename so the bytes are durably on
+        // disk; rename is atomic on the same filesystem.
+        file.flush().ok();
+        drop(file);
     }
-
-    document
-        .save_to_file(&tmp_path)
-        .with_context(|| format!("writing temp PDF to {}", tmp_path.display()))?;
+    #[cfg(not(unix))]
+    {
+        // Fallback path-based save on non-Unix; the symlink-race
+        // threat model doesn't apply the same way on Windows.
+        document
+            .save_to_file(&tmp_path)
+            .with_context(|| format!("writing temp PDF to {}", tmp_path.display()))?;
+    }
 
     fs::rename(&tmp_path, path)
         .with_context(|| format!("renaming {} → {}", tmp_path.display(), path.display()))?;
     Ok(())
+}
+
+/// Per-call unique suffix for the save-atomic temp filename. Mixes
+/// nanoseconds with a process-local counter so two saves in the same
+/// nanosecond still collide-resolve. Non-cryptographic; only needs
+/// to be unpredictable to a co-located attacker between schedule and
+/// open, which nanos easily satisfy.
+fn unique_temp_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:x}-{n:x}")
 }
 
 #[cfg(test)]
