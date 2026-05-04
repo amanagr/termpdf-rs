@@ -319,8 +319,18 @@ pub fn load(path: &std::path::Path, expected_total: usize) -> Option<DocIndex> {
     let indexed_count = u64::from_le_bytes(bytes[16..24].try_into().ok()?) as usize;
     let text_len = u64::from_le_bytes(bytes[24..32].try_into().ok()?) as usize;
     let header_end = 32usize;
-    let starts_end = header_end + total_pages * 8;
-    if bytes.len() < starts_end + text_len {
+    // Wrap-safe: a malformed index file with a giant `text_len` could
+    // make `starts_end + text_len` overflow on usize, sneak past the
+    // `bytes.len() <` guard, and then panic in the slice on line 332.
+    // Threat model: same-UID attacker plants a file under our cache
+    // dir (only DoS — they can already do worse). Use `checked_add`
+    // and bound text_len by the file size for early rejection.
+    let starts_end = header_end.checked_add(total_pages.checked_mul(8)?)?;
+    if text_len > bytes.len() {
+        return None;
+    }
+    let needed = starts_end.checked_add(text_len)?;
+    if bytes.len() < needed {
         return None;
     }
     let mut page_starts = Vec::with_capacity(total_pages);
@@ -542,6 +552,28 @@ mod tests {
         bytes.truncate(20);
         std::fs::write(&path, &bytes).unwrap();
         assert!(load(&path, idx.total_pages).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Hostile cache file with a giant `text_len` field used to wrap
+    /// `starts_end + text_len` past usize::MAX, sneak past the
+    /// `bytes.len() <` guard, and panic in the slice. checked_add
+    /// rejects cleanly.
+    #[test]
+    fn load_with_overflowing_text_len_returns_none_not_panic() {
+        let dir = std::env::temp_dir().join(format!("idx_overflow_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("idx.bin");
+        // Hand-build a header with text_len = u64::MAX (rolls over usize add).
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(INDEX_MAGIC);
+        bytes.extend_from_slice(&3u64.to_le_bytes()); // total_pages = 3
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // indexed_count
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes()); // text_len
+        // page_starts table (3 × 8 bytes). Doesn't matter what's here.
+        bytes.extend_from_slice(&[0u8; 24]);
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(load(&path, 3).is_none(), "load must reject, not panic");
         std::fs::remove_dir_all(&dir).ok();
     }
 
