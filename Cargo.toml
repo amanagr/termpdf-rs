@@ -74,3 +74,10 @@ portable-pty = "0.9"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+# eza/yazi/fd pattern: drop unwind tables and panic=unwind machinery.
+# Saves 5-10% binary size and a tiny startup cost. We don't use
+# `catch_unwind` anywhere in src/ — the only consumer is std's panic
+# hook which still fires (we install our own to clear DECSET 2026
+# before exit). dev-dependency PTY tests run in a separate process so
+# they're unaffected.
+panic = "abort"
