@@ -189,6 +189,13 @@ pub struct PlaceScratch {
     /// ones.
     cached_row_clear: String,
     cached_row_clear_dims: (u16, u16),
+    /// `\x1b[s\x1b[38;2;R;G;Bm\u{10EEEE}` — the per-page constant
+    /// prefix every row of `place_page` writes. Depends only on
+    /// `image_id`, which is stable for the page's lifetime in the
+    /// registry. Cached so the per-row inner loop is push_str + push
+    /// instead of a 5-arg format!().
+    cached_row_head: String,
+    cached_row_head_id: Option<u32>,
     /// Per-row symbol working buffer. Always cleared at the start of
     /// each row; reuse across calls keeps the underlying allocation
     /// from being freed/realloced every page.
@@ -1035,7 +1042,35 @@ pub fn place_page(
         scratch.cached_restore_dims = area_dims;
     }
 
-    let symbol = &mut scratch.symbol;
+    // Per-call constants extracted from the per-row write!. The SGR
+    // foreground escape encodes the image ID and is identical for
+    // every row of this page; the src-left and id-extra diacritics
+    // are also fixed per call (only img_row's diacritic varies row-
+    // to-row). Pre-formatting them once and push_str-ing per row
+    // drops ~150 format!() calls per frame on a 3-page-visible scroll.
+    if scratch.cached_row_head_id != Some(image_id) {
+        scratch.cached_row_head.clear();
+        write!(
+            scratch.cached_row_head,
+            "\x1b[s\x1b[38;2;{id_r};{id_g};{id_b}m\u{10EEEE}",
+        )
+        .unwrap();
+        scratch.cached_row_head_id = Some(image_id);
+    }
+    let src_left_d = diacritic(src_left_cell);
+    let id_extra_d = id_extra_diacritic;
+
+    // Split-borrow scratch: take mut on `symbol` and immut on the
+    // three cached strings. They're disjoint fields so the borrow
+    // checker accepts this; doing it via a method that returns &str
+    // would conflict with &mut self.symbol later.
+    let PlaceScratch {
+        row_diacritics,
+        restore_cursor,
+        cached_row_head,
+        symbol,
+        ..
+    } = scratch;
     if symbol.capacity() < 2048 {
         symbol.reserve(2048 - symbol.capacity());
     }
@@ -1052,16 +1087,12 @@ pub fn place_page(
         // this row inherit the fg color and increment the col by 1
         // — so we only set the explicit `src_left_cell` diacritic on
         // the first placement cell; the rest auto-increment.
-        write!(
-            symbol,
-            "\x1b[s\x1b[38;2;{id_r};{id_g};{id_b}m\u{10EEEE}{}{}{}",
-            diacritic(img_row),
-            diacritic(src_left_cell),
-            id_extra_diacritic,
-        )
-        .unwrap();
-        symbol.push_str(&scratch.row_diacritics);
-        symbol.push_str(&scratch.restore_cursor);
+        symbol.push_str(cached_row_head);
+        symbol.push(diacritic(img_row));
+        symbol.push(src_left_d);
+        symbol.push(id_extra_d);
+        symbol.push_str(row_diacritics);
+        symbol.push_str(restore_cursor);
 
         let cell_y = area.top().saturating_add(dst_top_cell.saturating_add(dy));
         if cell_y >= area.bottom() {
@@ -1949,6 +1980,60 @@ mod tests {
         assert_ne!(
             scratch.cached_row_clear, cached_first,
             "cache must rebuild on dim change"
+        );
+    }
+
+    /// `place_page`'s per-row inner loop pre-computes the SGR escape
+    /// (`\x1b[s\x1b[38;2;R;G;Bm\u{10EEEE}`) once per page since image
+    /// IDs are stable per page. Re-placing the same page must not
+    /// rebuild the head string; switching to a different page must.
+    #[test]
+    fn place_page_caches_row_head_per_image_id() {
+        let area = Rect { x: 0, y: 0, width: 8, height: 4 };
+        let mut buf = Buffer::empty(area);
+        let mut scratch = PlaceScratch::default();
+
+        // First call with image_id=42 should populate the cache.
+        place_page(
+            &mut buf, area,
+            /*page_idx*/ 0, /*image_id*/ 42,
+            /*pixel_w*/ 80, /*pixel_h*/ 80,
+            /*cell_w_px*/ 10, /*cell_h_px*/ 20,
+            0, 4, 0, 0, 8, None, &mut scratch,
+        );
+        assert_eq!(scratch.cached_row_head_id, Some(42));
+        let head_first = scratch.cached_row_head.clone();
+        let ptr_first = scratch.cached_row_head.as_ptr() as usize;
+        // Must encode the SGR with id 42 → bytes 0,0,42 → "0;0;42".
+        assert!(
+            head_first.contains("\x1b[38;2;0;0;42m"),
+            "row head must encode image_id=42 in SGR fg, got {head_first:?}"
+        );
+
+        // Second call with same id must reuse the same allocation.
+        place_page(
+            &mut buf, area,
+            0, 42,
+            80, 80, 10, 20,
+            0, 4, 0, 0, 8, None, &mut scratch,
+        );
+        assert_eq!(scratch.cached_row_head, head_first, "head changed");
+        assert_eq!(
+            scratch.cached_row_head.as_ptr() as usize, ptr_first,
+            "row head was reallocated for the same image_id"
+        );
+
+        // Different id must rebuild the head with the new SGR.
+        place_page(
+            &mut buf, area,
+            0, /*image_id*/ 99,
+            80, 80, 10, 20,
+            0, 4, 0, 0, 8, None, &mut scratch,
+        );
+        assert_eq!(scratch.cached_row_head_id, Some(99));
+        assert!(
+            scratch.cached_row_head.contains("\x1b[38;2;0;0;99m"),
+            "row head must rebuild with new image_id"
         );
     }
 }
