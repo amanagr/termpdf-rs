@@ -969,24 +969,80 @@ pub fn place_page(
     height_cells
 }
 
-/// Reset every cell in `area` so it no longer carries a kitty
-/// placeholder symbol or a `set_skip(true)` marker. Used when a frame
-/// decides NOT to call `place_page` for a page (rapid-scroll cold
-/// defer) so the prior frame's placeholder cells — which encode an
-/// `image_id` in their fg color — don't remain in the buffer.
+/// Clear every cell in `area` so it no longer carries a stale kitty
+/// placeholder pointing at a freed image_id. Called once over the
+/// whole image area at the top of the placement section; place_page
+/// then overwrites for visible pages. Cells the placement loop
+/// doesn't reach end up cleared.
 ///
-/// Why this matters: leaving stale placeholder cells in place causes
-/// Ghostty to log `warning(renderer_image): missing image for virtual
-/// placement` once per cell per render-frame whenever the referenced
-/// image_id has been freed by a prior `a=d` delete. At a few hundred
-/// stale cells × 60 Hz render that's 10–20k warnings/second going to
-/// journald — enough to crash Ghostty after ~10 s of held-`j`
-/// scrolling (observed 2026-05-04, 660k warnings in 7 days).
+/// Why this is non-trivial: `place_page` writes the row's full kitty
+/// escape into *column 0's* symbol and `set_skip(true)` on cols
+/// 1..N — Ghostty's grid then holds placeholder cells at every
+/// column, but ratatui's buffer only tracks column 0. A naive
+/// `cell.reset()` over the area resets cols 1..N to (symbol=" ",
+/// skip=false), which equals their prior frame state (symbol=" "
+/// from a prior reset, skip=true) for ratatui's diff purposes —
+/// nothing emitted, Ghostty's grid still holds the placeholders.
+/// When the referenced image_id later gets freed (our LRU
+/// `a=d,d=I,i=ID` delete OR Ghostty's internal eviction), Ghostty
+/// walks the cells, can't find the image, and logs
+/// `warning(renderer_image): missing image for virtual placement`
+/// per cell per render-frame. Per kitty-protocol issue #6477
+/// (kovidgoyal): "these are text so delete them as you would any
+/// other text" — i.e. the only way to clear a unicode-placeholder
+/// cell is to overwrite its grid bytes.
+///
+/// So column 0 gets a short escape — `\x1b[s` + `width` spaces +
+/// `\x1b[u\x1b[width-1C\x1b[height-1B` — that paints spaces over
+/// columns 0..N-1 in Ghostty's grid and parks the cursor at the
+/// area's bottom-right (matching place_page's cursor convention so
+/// ratatui's between-cell CUPs land correctly). The escape differs
+/// byte-for-byte from any place_page escape (no fg-color set, no
+/// placeholder + diacritics) so ratatui's diff fires on every
+/// placement→clear transition. Cols 1..N stay `set_skip(true)`
+/// so ratatui doesn't try to emit them independently and clobber
+/// the column-0 escape.
+///
+/// Steady-state (frame N == frame N+1, both cleared OR both placed):
+/// column 0 symbol unchanged → diff sees no change → zero wire bytes.
+/// Bandwidth cost shows up only on the transition frame.
+///
+/// At ~50 ns per Cell::reset() this still costs <1 ms even on a
+/// 200×50 image area; cells immediately overwritten by place_page
+/// later in the frame never reach the wire because ratatui's diff
+/// compares the buffer's *final* state to the prior frame's, not
+/// intermediate writes.
 pub fn clear_page_area(buf: &mut ratatui::buffer::Buffer, area: ratatui::layout::Rect) {
+    use std::fmt::Write;
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let mut row_clear = String::with_capacity((area.width as usize) + 24);
+    row_clear.push_str("\x1b[s");
+    for _ in 0..area.width {
+        row_clear.push(' ');
+    }
+    write!(
+        row_clear,
+        "\x1b[u\x1b[{}C\x1b[{}B",
+        area.width.saturating_sub(1),
+        area.height.saturating_sub(1)
+    )
+    .unwrap();
+
     for y in area.top()..area.bottom() {
-        for x in area.left()..area.right() {
+        if let Some(cell) = buf.cell_mut((area.left(), y)) {
+            cell.reset();
+            cell.set_symbol(&row_clear);
+        }
+        for cx in 1..area.width {
+            let x = area.left().saturating_add(cx);
+            if x >= area.right() {
+                break;
+            }
             if let Some(cell) = buf.cell_mut((x, y)) {
                 cell.reset();
+                cell.set_skip(true);
             }
         }
     }
@@ -1516,32 +1572,32 @@ mod tests {
         assert_eq!(deletes.matches("_Ga=d,d=I,i=").count(), 8);
     }
 
-    /// Regression: a placeholder cell from the prior frame that ends
-    /// up referencing a freed image_id (because no blit covers the
-    /// area this frame) makes Ghostty log
+    /// Regression: a placeholder cell from the prior frame that
+    /// references a freed image_id makes Ghostty log
     /// `warning(renderer_image): missing image for virtual placement`
-    /// every render-frame; sustained ~10s of held-`j` scrolling once
+    /// every render-frame; sustained held-`j` scrolling once
     /// generated 660k such warnings and crashed Ghostty (incident
-    /// 2026-05-04). `clear_page_area` is the post-fix guarantee that
-    /// no kitty placeholder symbol or skip flag survives an unpainted
-    /// rect — the placement loop calls it once over the whole image
-    /// area before any place_page write.
+    /// 2026-05-04). `clear_page_area` overwrites column 0 with a
+    /// short row-clear escape (spaces wrapped in save/restore) that
+    /// (a) differs from any place_page escape so ratatui's diff
+    /// fires on placement→clear transitions, and (b) actively paints
+    /// spaces over Ghostty's grid cells, dropping the placeholder
+    /// characters that hold the dead image_id reference.
     #[test]
-    fn clear_page_area_resets_placeholder_cells_and_skip_flags() {
+    fn clear_page_area_overwrites_placement_with_row_clear_escape() {
         let area = Rect { x: 0, y: 0, width: 6, height: 3 };
         let mut buf = Buffer::empty(area);
         let mut scratch = PlaceScratch::default();
         // Paint a placement so cell (0,0) carries the kitty placeholder
         // escape + image_id-encoding fg color, and cells (1..6, *) get
-        // set_skip(true) so ratatui's diff would otherwise leave them
-        // as-is for stale image references.
+        // set_skip(true).
         place_page(
             &mut buf,
             area,
             /*page_idx*/ 0,
             /*image_id*/ 42,
-            /*pixel_w*/ 60,    // 6 cols at cell_w=10
-            /*pixel_h*/ 60,    // 3 rows at cell_h=20
+            /*pixel_w*/ 60,
+            /*pixel_h*/ 60,
             /*cell_w_px*/ 10,
             /*cell_h_px*/ 20,
             /*dst_top_cell*/ 0,
@@ -1552,33 +1608,69 @@ mod tests {
             /*prefix*/ None,
             &mut scratch,
         );
-        // Sanity: pre-clear, the placeholder symbol is non-trivial and
-        // some cells are marked skip.
-        assert!(buf.cell((0, 0)).unwrap().symbol().contains('\u{10EEEE}'));
-        let any_skipped_pre = (0..area.height).any(|y| {
-            (1..area.width).any(|x| buf.cell((x, y)).map(|c| c.skip).unwrap_or(false))
-        });
-        assert!(any_skipped_pre, "place_page should mark non-leftmost cells as skip");
+        // Sanity: pre-clear, the placeholder symbol carries U+10EEEE.
+        let placement_sym = buf.cell((0, 0)).unwrap().symbol().to_string();
+        assert!(placement_sym.contains('\u{10EEEE}'));
 
         clear_page_area(&mut buf, area);
 
-        // Every cell in the rect must be back to default: empty symbol,
-        // no skip flag, no fg color carrying an image_id.
+        // Column 0: now holds the row-clear escape — non-empty, must
+        // NOT carry the placeholder char, must contain spaces.
         for y in 0..area.height {
-            for x in 0..area.width {
+            let sym = buf.cell((0, y)).unwrap().symbol();
+            assert!(
+                !sym.contains('\u{10EEEE}'),
+                "col 0 row {y} must drop the kitty placeholder; got {sym:?}"
+            );
+            assert!(
+                sym.contains(' '),
+                "col 0 row {y} must contain spaces (the row clear); got {sym:?}"
+            );
+            assert!(
+                sym.starts_with("\x1b[s"),
+                "col 0 row {y} must start with cursor-save (so its width matches what place_page expects); got {sym:?}"
+            );
+            assert_ne!(
+                sym, placement_sym,
+                "clear escape must differ from place escape (else ratatui's diff won't fire on transition)"
+            );
+        }
+        // Columns 1..N: stay set_skip(true) so ratatui doesn't try to
+        // emit them and overwrite the col-0 escape's effect.
+        for y in 0..area.height {
+            for x in 1..area.width {
                 let cell = buf.cell((x, y)).unwrap();
-                assert_eq!(
-                    cell.symbol(),
-                    " ",
-                    "cell ({x},{y}) symbol must be reset; got {:?}",
-                    cell.symbol()
+                assert!(
+                    cell.skip,
+                    "cell ({x},{y}) must keep skip=true after clear (col 0's escape paints these)"
                 );
-                assert!(!cell.skip, "cell ({x},{y}) must have skip cleared");
                 assert_eq!(
                     cell.fg,
                     ratatui::style::Color::Reset,
-                    "cell ({x},{y}) fg must be Reset (no stale image_id)"
+                    "cell ({x},{y}) fg must be Reset (no stale image_id encoding)"
                 );
+            }
+        }
+    }
+
+    /// Steady state: clearing the same area twice in a row produces
+    /// byte-identical buffer state, so ratatui's diff emits nothing
+    /// the second time. Without this, every frame would re-emit the
+    /// row-clear escape over the entire image area — wasted bandwidth.
+    #[test]
+    fn clear_page_area_is_idempotent_for_diff_purposes() {
+        let area = Rect { x: 0, y: 0, width: 8, height: 4 };
+        let mut buf_a = Buffer::empty(area);
+        let mut buf_b = Buffer::empty(area);
+        clear_page_area(&mut buf_a, area);
+        clear_page_area(&mut buf_b, area);
+        for y in 0..area.height {
+            for x in 0..area.width {
+                let a = buf_a.cell((x, y)).unwrap();
+                let b = buf_b.cell((x, y)).unwrap();
+                assert_eq!(a.symbol(), b.symbol(), "({x},{y}) symbol mismatch");
+                assert_eq!(a.skip, b.skip, "({x},{y}) skip mismatch");
+                assert_eq!(a.fg, b.fg, "({x},{y}) fg mismatch");
             }
         }
     }
