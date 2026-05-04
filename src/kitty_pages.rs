@@ -47,12 +47,18 @@ use ratatui::layout::Rect;
 use crate::app::LayoutKey;
 
 /// Cap on cached pages. Each entry holds metadata + an optional
-/// encoded payload (~250 KB PNG). 64 entries ≈ 16 MB in our process;
-/// the terminal-side decoded RGBA is much larger (~5 MB/page) but
-/// each eviction emits an `a=d,d=I,i=ID` delete so the terminal can
-/// free its copy too. Without this cap, opening a 700-page PDF
-/// would leak ~3.5 GB of decoded image into the terminal.
-const MAX_CACHED_PAGES: usize = 64;
+/// encoded payload (~250 KB PNG). The terminal-side decoded RGBA is
+/// much larger (~10 MB/page at our render resolution) and Ghostty
+/// internally evicts when its image store fills up. When that happens
+/// any of our placement cells still pointing at the freed image_id
+/// triggers `warning(renderer_image): missing image for virtual
+/// placement` per cell per render-frame — observed 132 warnings vs
+/// 112 Ghostty internal evictions in 10 minutes at cap=64 (one stale
+/// reference per eviction, cleared on the next placement frame).
+/// Cap=24 keeps the working set under ~250 MB on the terminal side
+/// so Ghostty's image store never has to evict on its own; we still
+/// hold ~5× the typical viewport for scroll-back without re-render.
+const MAX_CACHED_PAGES: usize = 24;
 
 /// Image-cache entry per page index.
 #[derive(Debug, Clone)]
