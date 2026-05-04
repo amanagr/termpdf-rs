@@ -2968,6 +2968,79 @@ mod tests {
         assert!(!r);
     }
 
+    // ---- scroll-keypress throttle ---------------------------------
+    //
+    // Pure version of `App::note_scroll_attempt` for unit testing.
+    // Returns the new (last_applied_at, allow) given the current
+    // state and a candidate keypress time. Mirrors the real method's
+    // behaviour: an attempt is allowed if the previous applied scroll
+    // is at least SCROLL_THROTTLE_MS old (or there's no previous one).
+    // Disallowed attempts must NOT advance last_applied_at —
+    // otherwise a stream of held-key events at <THROTTLE rate would
+    // each push the timer forward and starve the throttle indefinitely.
+    fn step_throttle(
+        prev_applied_at: Option<std::time::Instant>,
+        now: std::time::Instant,
+    ) -> (Option<std::time::Instant>, bool) {
+        let allow = prev_applied_at
+            .is_none_or(|t| (now - t).as_millis() >= super::SCROLL_THROTTLE_MS);
+        let new_at = if allow { Some(now) } else { prev_applied_at };
+        (new_at, allow)
+    }
+
+    #[test]
+    fn throttle_first_attempt_always_allowed() {
+        let now = std::time::Instant::now();
+        let (state, allow) = step_throttle(None, now);
+        assert!(allow, "first scroll after a long pause must always go through");
+        assert_eq!(state, Some(now), "allowed attempt records the time");
+    }
+
+    #[test]
+    fn throttle_second_attempt_within_window_dropped() {
+        let t0 = std::time::Instant::now();
+        let (state, _) = step_throttle(None, t0);
+        // 30 Hz autorepeat = ~33 ms; well inside the 150 ms throttle.
+        let t1 = t0 + std::time::Duration::from_millis(33);
+        let (state2, allow) = step_throttle(state, t1);
+        assert!(!allow, "second attempt within SCROLL_THROTTLE_MS must drop");
+        assert_eq!(
+            state2, state,
+            "dropped attempt must NOT advance last_applied_at — otherwise a held key starves the throttle"
+        );
+    }
+
+    #[test]
+    fn throttle_attempt_after_window_allowed() {
+        let t0 = std::time::Instant::now();
+        let (state, _) = step_throttle(None, t0);
+        let t1 = t0 + std::time::Duration::from_millis(super::SCROLL_THROTTLE_MS as u64);
+        let (state2, allow) = step_throttle(state, t1);
+        assert!(allow, "attempt at exactly SCROLL_THROTTLE_MS must be allowed");
+        assert_eq!(state2, Some(t1), "allowed attempt records the new time");
+    }
+
+    #[test]
+    fn throttle_held_key_30hz_caps_at_67hz() {
+        // Simulate Linux keyboard autorepeat: 30 Hz = one event every 33 ms.
+        // Over 1 second (30 events) we expect at most ceil(1000 / 150) = 7
+        // accepted scrolls — i.e. ~6.7 Hz, the throttle's design rate.
+        let t0 = std::time::Instant::now();
+        let mut state: Option<std::time::Instant> = None;
+        let mut accepted = 0u32;
+        for i in 0..30 {
+            let (new_state, allow) = step_throttle(state, t0 + std::time::Duration::from_millis(i * 33));
+            state = new_state;
+            if allow {
+                accepted += 1;
+            }
+        }
+        assert!(
+            (6..=7).contains(&accepted),
+            "30 Hz held-key over 1s should pass {{6,7}} scrolls; got {accepted}"
+        );
+    }
+
     // ---- link-hint state machine ----------------------------------
     //
     // Tests the pure transition logic without spinning up an App or
