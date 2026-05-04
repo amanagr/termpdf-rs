@@ -886,10 +886,9 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     // overwritten by place_page below never reach the wire because
     // ratatui's diff compares the buffer's *final* state to the prior
     // frame's, not the intermediate writes.
-    crate::kitty_pages::clear_page_area(buf, area);
-
     let kp = app.kitty_pages.as_mut().unwrap();
     let scratch = kp.place_scratch_mut();
+    crate::kitty_pages::clear_page_area(buf, area, scratch);
     for (b, t) in blits.iter().zip(combined_prefixes.iter()) {
         let placement_area = Rect {
             x: img_area_left.saturating_add(b.dst_left_cell),

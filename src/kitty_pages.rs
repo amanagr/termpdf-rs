@@ -179,6 +179,23 @@ pub struct PlaceScratch {
     /// area's dims, which change only on terminal resize.
     restore_cursor: String,
     cached_restore_dims: (u16, u16),
+    /// `\x1b[s␠␠…␠\x1b[u\x1b[(W-1)C\x1b[(H-1)B`. The row-clear escape
+    /// `clear_page_area` writes to column 0 of every row of the image
+    /// area (drops Ghostty's stale virtual-placement placeholders).
+    /// Depends only on `(area.width, area.height)`, which only change
+    /// on terminal resize — but `clear_page_area` runs on every
+    /// frame, so without caching we paid a fresh `String` alloc + a
+    /// per-cell `push(' ')` loop on every redraw, including pure-idle
+    /// ones.
+    cached_row_clear: String,
+    cached_row_clear_dims: (u16, u16),
+    /// `\x1b[s\x1b[38;2;R;G;Bm\u{10EEEE}` — the per-page constant
+    /// prefix every row of `place_page` writes. Depends only on
+    /// `image_id`, which is stable for the page's lifetime in the
+    /// registry. Cached so the per-row inner loop is push_str + push
+    /// instead of a 5-arg format!().
+    cached_row_head: String,
+    cached_row_head_id: Option<u32>,
     /// Per-row symbol working buffer. Always cleared at the start of
     /// each row; reuse across calls keeps the underlying allocation
     /// from being freed/realloced every page.
@@ -1025,7 +1042,35 @@ pub fn place_page(
         scratch.cached_restore_dims = area_dims;
     }
 
-    let symbol = &mut scratch.symbol;
+    // Per-call constants extracted from the per-row write!. The SGR
+    // foreground escape encodes the image ID and is identical for
+    // every row of this page; the src-left and id-extra diacritics
+    // are also fixed per call (only img_row's diacritic varies row-
+    // to-row). Pre-formatting them once and push_str-ing per row
+    // drops ~150 format!() calls per frame on a 3-page-visible scroll.
+    if scratch.cached_row_head_id != Some(image_id) {
+        scratch.cached_row_head.clear();
+        write!(
+            scratch.cached_row_head,
+            "\x1b[s\x1b[38;2;{id_r};{id_g};{id_b}m\u{10EEEE}",
+        )
+        .unwrap();
+        scratch.cached_row_head_id = Some(image_id);
+    }
+    let src_left_d = diacritic(src_left_cell);
+    let id_extra_d = id_extra_diacritic;
+
+    // Split-borrow scratch: take mut on `symbol` and immut on the
+    // three cached strings. They're disjoint fields so the borrow
+    // checker accepts this; doing it via a method that returns &str
+    // would conflict with &mut self.symbol later.
+    let PlaceScratch {
+        row_diacritics,
+        restore_cursor,
+        cached_row_head,
+        symbol,
+        ..
+    } = scratch;
     if symbol.capacity() < 2048 {
         symbol.reserve(2048 - symbol.capacity());
     }
@@ -1042,16 +1087,12 @@ pub fn place_page(
         // this row inherit the fg color and increment the col by 1
         // — so we only set the explicit `src_left_cell` diacritic on
         // the first placement cell; the rest auto-increment.
-        write!(
-            symbol,
-            "\x1b[s\x1b[38;2;{id_r};{id_g};{id_b}m\u{10EEEE}{}{}{}",
-            diacritic(img_row),
-            diacritic(src_left_cell),
-            id_extra_diacritic,
-        )
-        .unwrap();
-        symbol.push_str(&scratch.row_diacritics);
-        symbol.push_str(&scratch.restore_cursor);
+        symbol.push_str(cached_row_head);
+        symbol.push(diacritic(img_row));
+        symbol.push(src_left_d);
+        symbol.push(id_extra_d);
+        symbol.push_str(row_diacritics);
+        symbol.push_str(restore_cursor);
 
         let cell_y = area.top().saturating_add(dst_top_cell.saturating_add(dy));
         if cell_y >= area.bottom() {
@@ -1118,28 +1159,42 @@ pub fn place_page(
 /// later in the frame never reach the wire because ratatui's diff
 /// compares the buffer's *final* state to the prior frame's, not
 /// intermediate writes.
-pub fn clear_page_area(buf: &mut ratatui::buffer::Buffer, area: ratatui::layout::Rect) {
+pub fn clear_page_area(
+    buf: &mut ratatui::buffer::Buffer,
+    area: ratatui::layout::Rect,
+    scratch: &mut PlaceScratch,
+) {
     use std::fmt::Write;
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let mut row_clear = String::with_capacity((area.width as usize) + 24);
-    row_clear.push_str("\x1b[s");
-    for _ in 0..area.width {
-        row_clear.push(' ');
+    let dims = (area.width, area.height);
+    if scratch.cached_row_clear_dims != dims || scratch.cached_row_clear.is_empty() {
+        scratch.cached_row_clear.clear();
+        let needed = (area.width as usize) + 24;
+        if scratch.cached_row_clear.capacity() < needed {
+            scratch
+                .cached_row_clear
+                .reserve(needed - scratch.cached_row_clear.capacity());
+        }
+        scratch.cached_row_clear.push_str("\x1b[s");
+        for _ in 0..area.width {
+            scratch.cached_row_clear.push(' ');
+        }
+        write!(
+            scratch.cached_row_clear,
+            "\x1b[u\x1b[{}C\x1b[{}B",
+            area.width.saturating_sub(1),
+            area.height.saturating_sub(1)
+        )
+        .unwrap();
+        scratch.cached_row_clear_dims = dims;
     }
-    write!(
-        row_clear,
-        "\x1b[u\x1b[{}C\x1b[{}B",
-        area.width.saturating_sub(1),
-        area.height.saturating_sub(1)
-    )
-    .unwrap();
 
     for y in area.top()..area.bottom() {
         if let Some(cell) = buf.cell_mut((area.left(), y)) {
             cell.reset();
-            cell.set_symbol(&row_clear);
+            cell.set_symbol(&scratch.cached_row_clear);
         }
         for cx in 1..area.width {
             let x = area.left().saturating_add(cx);
@@ -1775,7 +1830,7 @@ mod tests {
         let placement_sym = buf.cell((0, 0)).unwrap().symbol().to_string();
         assert!(placement_sym.contains('\u{10EEEE}'));
 
-        clear_page_area(&mut buf, area);
+        clear_page_area(&mut buf, area, &mut scratch);
 
         // Column 0: now holds the row-clear escape — non-empty, must
         // NOT carry the placeholder char, must contain spaces.
@@ -1871,8 +1926,10 @@ mod tests {
         let area = Rect { x: 0, y: 0, width: 8, height: 4 };
         let mut buf_a = Buffer::empty(area);
         let mut buf_b = Buffer::empty(area);
-        clear_page_area(&mut buf_a, area);
-        clear_page_area(&mut buf_b, area);
+        let mut scratch_a = PlaceScratch::default();
+        let mut scratch_b = PlaceScratch::default();
+        clear_page_area(&mut buf_a, area, &mut scratch_a);
+        clear_page_area(&mut buf_b, area, &mut scratch_b);
         for y in 0..area.height {
             for x in 0..area.width {
                 let a = buf_a.cell((x, y)).unwrap();
@@ -1882,5 +1939,101 @@ mod tests {
                 assert_eq!(a.fg, b.fg, "({x},{y}) fg mismatch");
             }
         }
+    }
+
+    /// `clear_page_area` runs every frame including pure-idle redraws.
+    /// The row-clear escape only depends on `(area.width, area.height)`
+    /// so it must be cached on `PlaceScratch` and rebuilt only when
+    /// dims change. Without the cache we paid a fresh `String` alloc
+    /// + a per-cell `push(' ')` loop on every redraw.
+    #[test]
+    fn clear_page_area_caches_escape_until_dims_change() {
+        let area = Rect { x: 0, y: 0, width: 12, height: 5 };
+        let mut buf = Buffer::empty(area);
+        let mut scratch = PlaceScratch::default();
+        clear_page_area(&mut buf, area, &mut scratch);
+        // Snapshot the cached bytes + capacity so we can detect a
+        // re-build (which would re-allocate or rewrite the string).
+        let cached_first = scratch.cached_row_clear.clone();
+        let cap_first = scratch.cached_row_clear.capacity();
+        let ptr_first = scratch.cached_row_clear.as_ptr() as usize;
+        assert!(!cached_first.is_empty());
+        assert_eq!(scratch.cached_row_clear_dims, (area.width, area.height));
+
+        // Same area on a fresh buffer — must reuse the cached string.
+        let mut buf2 = Buffer::empty(area);
+        clear_page_area(&mut buf2, area, &mut scratch);
+        assert_eq!(scratch.cached_row_clear, cached_first, "string content changed");
+        assert_eq!(scratch.cached_row_clear.capacity(), cap_first, "string was reallocated");
+        assert_eq!(
+            scratch.cached_row_clear.as_ptr() as usize,
+            ptr_first,
+            "backing pointer moved → realloc happened"
+        );
+
+        // Resize — the cache MUST rebuild (different W/H means the
+        // restore-cursor offsets in the escape are different).
+        let resized = Rect { x: 0, y: 0, width: 20, height: 8 };
+        let mut buf3 = Buffer::empty(resized);
+        clear_page_area(&mut buf3, resized, &mut scratch);
+        assert_eq!(scratch.cached_row_clear_dims, (resized.width, resized.height));
+        assert_ne!(
+            scratch.cached_row_clear, cached_first,
+            "cache must rebuild on dim change"
+        );
+    }
+
+    /// `place_page`'s per-row inner loop pre-computes the SGR escape
+    /// (`\x1b[s\x1b[38;2;R;G;Bm\u{10EEEE}`) once per page since image
+    /// IDs are stable per page. Re-placing the same page must not
+    /// rebuild the head string; switching to a different page must.
+    #[test]
+    fn place_page_caches_row_head_per_image_id() {
+        let area = Rect { x: 0, y: 0, width: 8, height: 4 };
+        let mut buf = Buffer::empty(area);
+        let mut scratch = PlaceScratch::default();
+
+        // First call with image_id=42 should populate the cache.
+        place_page(
+            &mut buf, area,
+            /*page_idx*/ 0, /*image_id*/ 42,
+            /*pixel_w*/ 80, /*pixel_h*/ 80,
+            /*cell_w_px*/ 10, /*cell_h_px*/ 20,
+            0, 4, 0, 0, 8, None, &mut scratch,
+        );
+        assert_eq!(scratch.cached_row_head_id, Some(42));
+        let head_first = scratch.cached_row_head.clone();
+        let ptr_first = scratch.cached_row_head.as_ptr() as usize;
+        // Must encode the SGR with id 42 → bytes 0,0,42 → "0;0;42".
+        assert!(
+            head_first.contains("\x1b[38;2;0;0;42m"),
+            "row head must encode image_id=42 in SGR fg, got {head_first:?}"
+        );
+
+        // Second call with same id must reuse the same allocation.
+        place_page(
+            &mut buf, area,
+            0, 42,
+            80, 80, 10, 20,
+            0, 4, 0, 0, 8, None, &mut scratch,
+        );
+        assert_eq!(scratch.cached_row_head, head_first, "head changed");
+        assert_eq!(
+            scratch.cached_row_head.as_ptr() as usize, ptr_first,
+            "row head was reallocated for the same image_id"
+        );
+
+        // Different id must rebuild the head with the new SGR.
+        place_page(
+            &mut buf, area,
+            0, /*image_id*/ 99,
+            80, 80, 10, 20,
+            0, 4, 0, 0, 8, None, &mut scratch,
+        );
+        assert_eq!(scratch.cached_row_head_id, Some(99));
+        assert!(
+            scratch.cached_row_head.contains("\x1b[38;2;0;0;99m"),
+            "row head must rebuild with new image_id"
+        );
     }
 }
