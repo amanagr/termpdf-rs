@@ -149,6 +149,31 @@ pub struct KittyPageRegistry {
     /// next transmit (or a synthetic one) so the terminal frees its
     /// decoded RGBA copy of the evicted image.
     pending_deletes: String,
+    /// Scratch buffers reused across `place_page` calls. Memoizes the
+    /// per-row diacritic string (varies by viewport `cols` only) and
+    /// the restore-cursor escape (varies by `area.width`/`area.height`
+    /// only). Without this each visible page-row paid two small allocs
+    /// per draw — ~210 allocs per frame in a 3-page-visible scroll.
+    place_scratch: PlaceScratch,
+}
+
+/// Cached per-frame buffers used by `place_page`. Fields are owned by
+/// the registry and rebuilt only when their key inputs change.
+#[derive(Default)]
+pub struct PlaceScratch {
+    /// `width_cells - 1` repetitions of `U+10EEEE`. Cached because
+    /// rebuilding it per row was the second-largest steady-scroll
+    /// allocation source.
+    row_diacritics: String,
+    cached_cols: u16,
+    /// `\x1b[u\x1b[(W-1)C\x1b[(H-1)B`. Depends on the placement
+    /// area's dims, which change only on terminal resize.
+    restore_cursor: String,
+    cached_restore_dims: (u16, u16),
+    /// Per-row symbol working buffer. Always cleared at the start of
+    /// each row; reuse across calls keeps the underlying allocation
+    /// from being freed/realloced every page.
+    pub symbol: String,
 }
 
 /// Distance between a page's image_id and its overlay's image_id. Big
@@ -165,7 +190,16 @@ impl KittyPageRegistry {
             overlays: HashMap::new(),
             lru: VecDeque::new(),
             pending_deletes: String::new(),
+            place_scratch: PlaceScratch::default(),
         }
+    }
+
+    /// Mutable handle to the place-scratch. Hot path: passed into
+    /// `place_page` so it can reuse cached row-diacritic + restore-
+    /// cursor strings across calls. Public so the renderer can wire
+    /// it into the placement loop.
+    pub fn place_scratch_mut(&mut self) -> &mut PlaceScratch {
+        &mut self.place_scratch
     }
 
     /// Drop all cached entries. Caller is responsible for sending
@@ -824,6 +858,7 @@ pub fn place_page(
     src_left_cell: u16,
     width_cells: u16,
     prefix: Option<&str>,
+    scratch: &mut PlaceScratch,
 ) -> u16 {
     let _ = page_idx; // reserved for future per-page debug; placement is purely id-driven
 
@@ -848,7 +883,6 @@ pub fn place_page(
     // Encode image ID in foreground color (24-bit). The high byte goes
     // into a third diacritic on each placeholder.
     let [id_extra, id_r, id_g, id_b] = image_id.to_be_bytes();
-    let id_color = format!("\x1b[38;2;{id_r};{id_g};{id_b}m");
     let id_extra_diacritic = diacritic(u16::from(id_extra));
 
     // Reused string for each row's symbol. ratatui-image opts to write
@@ -856,15 +890,30 @@ pub fn place_page(
     // we follow the same pattern for the same reason — ratatui's diff
     // would otherwise overwrite our placeholders with default cells.
     let cols = (width_cells as u32).min(MAX_COLS) as u16;
-    let row_diacritics: String =
-        std::iter::repeat_n('\u{10EEEE}', cols.saturating_sub(1) as usize).collect();
-    let restore_cursor = format!(
-        "\x1b[u\x1b[{}C\x1b[{}B",
-        area.width.saturating_sub(1),
-        area.height.saturating_sub(1)
-    );
+    if scratch.cached_cols != cols {
+        scratch.row_diacritics.clear();
+        scratch
+            .row_diacritics
+            .extend(std::iter::repeat_n('\u{10EEEE}', cols.saturating_sub(1) as usize));
+        scratch.cached_cols = cols;
+    }
+    let area_dims = (area.width, area.height);
+    if scratch.cached_restore_dims != area_dims {
+        scratch.restore_cursor.clear();
+        write!(
+            scratch.restore_cursor,
+            "\x1b[u\x1b[{}C\x1b[{}B",
+            area.width.saturating_sub(1),
+            area.height.saturating_sub(1)
+        )
+        .unwrap();
+        scratch.cached_restore_dims = area_dims;
+    }
 
-    let mut symbol = String::with_capacity(2048);
+    let symbol = &mut scratch.symbol;
+    if symbol.capacity() < 2048 {
+        symbol.reserve(2048 - symbol.capacity());
+    }
     let mut prefix_ref = prefix;
 
     for dy in 0..height_cells {
@@ -880,21 +929,21 @@ pub fn place_page(
         // the first placement cell; the rest auto-increment.
         write!(
             symbol,
-            "\x1b[s{id_color}\u{10EEEE}{}{}{}",
+            "\x1b[s\x1b[38;2;{id_r};{id_g};{id_b}m\u{10EEEE}{}{}{}",
             diacritic(img_row),
             diacritic(src_left_cell),
             id_extra_diacritic,
         )
         .unwrap();
-        symbol.push_str(&row_diacritics);
-        symbol.push_str(&restore_cursor);
+        symbol.push_str(&scratch.row_diacritics);
+        symbol.push_str(&scratch.restore_cursor);
 
         let cell_y = area.top().saturating_add(dst_top_cell.saturating_add(dy));
         if cell_y >= area.bottom() {
             break;
         }
         if let Some(cell) = buf.cell_mut((area.left(), cell_y)) {
-            cell.set_symbol(&symbol);
+            cell.set_symbol(symbol);
         }
         // Mark cells right of column 0 as skipped so ratatui's diff
         // doesn't overwrite our placeholders with empty cells.
@@ -1210,6 +1259,7 @@ mod tests {
     fn place_page_honors_src_left_cell() {
         let mut buf = Buffer::empty(Rect { x: 0, y: 0, width: 10, height: 4 });
         let area = Rect { x: 0, y: 0, width: 10, height: 4 };
+        let mut scratch = PlaceScratch::default();
         let written = place_page(
             &mut buf,
             area,
@@ -1225,6 +1275,7 @@ mod tests {
             /*src_left_cell*/ 5,
             /*width_cells*/ 10,
             /*prefix*/ None,
+            &mut scratch,
         );
         assert!(written > 0);
         let symbol = buf.cell((0, 0)).unwrap().symbol().to_string();
@@ -1247,6 +1298,7 @@ mod tests {
     fn place_page_clamps_width_at_image_right_edge() {
         let mut buf = Buffer::empty(Rect { x: 0, y: 0, width: 10, height: 4 });
         let area = Rect { x: 0, y: 0, width: 10, height: 4 };
+        let mut scratch = PlaceScratch::default();
         // 12-col-wide image; src_left_cell=8 leaves only 4 valid cols.
         let written = place_page(
             &mut buf,
@@ -1258,6 +1310,7 @@ mod tests {
             10, 20,
             0, 4, 0, /*src_left_cell*/ 8, /*requested width*/ 10,
             None,
+            &mut scratch,
         );
         assert!(written > 0);
         // Cells 0..4 should hold placeholders; cells 4..10 should be

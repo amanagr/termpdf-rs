@@ -831,6 +831,10 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
         let text_selection = app.text_selection;
         let selection_color_idx = app.selection_color_idx;
         let selection_placement = app.selection_placement;
+        // Take the scratch out of the App so the kp/text_cache borrows
+        // below can coexist with us mutating it. We always put it back
+        // at the end of this scope.
+        let mut scratch = app.selection_overlay_scratch.take();
         let kp = app.kitty_pages.as_mut().unwrap();
         for (i, b) in blits.iter().enumerate() {
             if b.height_cells == 0 || b.sel_sig == 0 {
@@ -850,8 +854,17 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
 
             let mut payload = String::new();
             if need_overlay_transmit {
-                let img = build_selection_overlay_image(
-                    (b.pixel_w, b.pixel_h),
+                // Reuse the scratch RGBA when its dims match the page;
+                // otherwise reallocate (zoom or layout change). The
+                // fill function clears every pixel before painting so
+                // there's no risk of stale-paint bleed-through.
+                let img = match scratch.take() {
+                    Some(img) if img.dimensions() == (b.pixel_w, b.pixel_h) => img,
+                    _ => RgbaImage::new(b.pixel_w, b.pixel_h),
+                };
+                let mut img = img;
+                fill_selection_overlay_image(
+                    &mut img,
                     b.page_idx,
                     sel,
                     pt,
@@ -866,6 +879,7 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
                     b.sel_sig,
                 ));
                 overlay_marks[i] = Some((b.revision, b.sel_sig, b.pixel_w, b.pixel_h));
+                scratch = Some(img);
             }
 
             // Classical placement APC. Cursor is at the page's first
@@ -893,6 +907,10 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
 
             overlay_payloads[i] = Some(payload);
         }
+        // Return the scratch to the App for next frame. If no overlays
+        // were built this frame, scratch is whatever take() returned
+        // (Some on subsequent frames, None on first frame).
+        app.selection_overlay_scratch = scratch;
     }
 
     // Drain any pending kitty `a=d,d=I,i=ID` deletes from prior
@@ -901,29 +919,32 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     // write keeps the deletes inside the `term.draw` window and avoids
     // a second pty round-trip.
     let kp = app.kitty_pages.as_mut().unwrap();
-    if let Some(deletes) = kp.take_pending_deletes() {
+    if let Some(mut deletes) = kp.take_pending_deletes() {
         // Prefer riding deletes on a slot that already has bytes
         // (page transmit OR overlay payload); only reject onto the
-        // pending queue if NEITHER exists this frame.
+        // pending queue if NEITHER exists this frame. Move-merge the
+        // existing slot string into our `deletes` buffer to avoid an
+        // extra clone per merge.
         let attached = if let Some(i) = transmits.iter().position(|t| t.is_some()) {
-            let mut combined = deletes.clone();
-            combined.push_str(transmits[i].as_ref().unwrap());
-            transmits[i] = Some(combined);
+            let existing = transmits[i].take().unwrap();
+            deletes.reserve(existing.len());
+            deletes.push_str(&existing);
+            transmits[i] = Some(deletes);
             true
         } else if let Some(i) = overlay_payloads.iter().position(|p| p.is_some()) {
-            let mut combined = deletes.clone();
-            combined.push_str(overlay_payloads[i].as_ref().unwrap());
-            overlay_payloads[i] = Some(combined);
+            let existing = overlay_payloads[i].take().unwrap();
+            deletes.reserve(existing.len());
+            deletes.push_str(&existing);
+            overlay_payloads[i] = Some(deletes);
             true
         } else {
-            false
-        };
-        if !attached {
             // No transmits or overlay APCs this frame — stash the
             // deletes for next. Cheap to write back; eviction is rare
             // relative to draws.
             kp.put_back_pending_deletes(deletes);
-        }
+            false
+        };
+        let _ = attached;
     }
 
     // Concatenate page transmit + overlay payload into the per-blit
@@ -933,18 +954,22 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     //   3. \x1b[s + overlay classical place + \x1b[u places the
     //      overlay at the cursor (= page first cell), keeping cursor
     //      bracketed for the page's placement loop that follows.
+    // Move-merge transmits + overlays into a single per-blit prefix
+    // by consuming both Vecs. The (Some(t), None) branch — the steady
+    // scroll case — used to clone the full ~270 KB transmit string for
+    // nothing; `into_iter()` lets us hand the existing String along
+    // unchanged, saving ~7-8 MB of allocation per `scroll_steady_30`.
     let combined_prefixes: Vec<Option<String>> = transmits
-        .iter()
-        .zip(overlay_payloads.iter())
+        .into_iter()
+        .zip(overlay_payloads.into_iter())
         .map(|(t, ov)| match (t, ov) {
             (None, None) => None,
-            (Some(t), None) => Some(t.clone()),
-            (None, Some(o)) => Some(o.clone()),
-            (Some(t), Some(o)) => {
-                let mut s = String::with_capacity(t.len() + o.len());
-                s.push_str(t);
-                s.push_str(o);
-                Some(s)
+            (Some(t), None) => Some(t),
+            (None, Some(o)) => Some(o),
+            (Some(mut t), Some(o)) => {
+                t.reserve(o.len());
+                t.push_str(&o);
+                Some(t)
             }
         })
         .collect();
@@ -958,6 +983,8 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     let img_area_left = area.left();
     let img_area_top = area.top();
 
+    let kp = app.kitty_pages.as_mut().unwrap();
+    let scratch = kp.place_scratch_mut();
     for (b, t) in blits.iter().zip(combined_prefixes.iter()) {
         let placement_area = Rect {
             x: img_area_left.saturating_add(b.dst_left_cell),
@@ -980,6 +1007,7 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
             b.src_left_cell,
             b.width_cells,
             t.as_deref(),
+            scratch,
         );
     }
 
@@ -2112,30 +2140,35 @@ pub fn bake_selection_into_page(
 // `ensure_overlay`) so it travels through the same kitty re-upload
 // path that already works for saved highlights.
 
-/// Produce a transparent same-dim-as-page RGBA image with selection
-/// rects painted at translucent alpha. This is the "overlay" half of
-/// the layered-placement scheme: kitty composites it above the page
-/// placement at z=1 so a moving selection re-transmits ONLY this image
-/// (mostly transparent → ~5-15 KB PNG) instead of the full page bitmap
-/// (~170 KB PNG).
+/// Fill a transparent RGBA image with selection rects painted at
+/// translucent alpha. This is the "overlay" half of the layered-
+/// placement scheme: kitty composites it above the page placement at
+/// z=1 so a moving selection re-transmits ONLY this image (mostly
+/// transparent → ~5-15 KB PNG) instead of the full page bitmap (~170
+/// KB PNG).
 ///
-/// `dims` is (width, height) in pixels; matches the page bitmap so the
+/// `img` must be the same dims as the underlying page bitmap so the
 /// kitty placement-c/r and source-X/Y/w/h math is identical for both
-/// images. Most pixels stay (0,0,0,0); only selection-band rows take
-/// the highlight color at the same alpha (0.45 → 115 / 255) used by
-/// `bake_selection_into_page`.
-pub(crate) fn build_selection_overlay_image(
-    dims: (u32, u32),
+/// images. The function clears `img` to fully-transparent first so
+/// callers can reuse a scratch buffer across frames without leaking
+/// pixels from the previous selection.
+pub(crate) fn fill_selection_overlay_image(
+    img: &mut RgbaImage,
     page_idx: usize,
     sel: crate::textlayout::TextSelection,
     pt: &crate::textlayout::PageText,
     color_idx: usize,
     placement_mode: bool,
-) -> RgbaImage {
-    let mut img = RgbaImage::new(dims.0, dims.1);
+) {
+    // Zero everything first. selection_drag_30 keystrokes shrink the
+    // selection band by one char each; without the clear, residual
+    // pixels from the prior frame would stay painted and the overlay
+    // would visibly accumulate.
+    let buf: &mut [u8] = img.as_mut();
+    buf.fill(0);
     let (lo, hi) = sel.ordered();
     if !(lo.page..=hi.page).contains(&page_idx) {
-        return img;
+        return;
     }
     if !placement_mode {
         let mut start = if page_idx == lo.page { lo.idx } else { 0 };
@@ -2161,7 +2194,7 @@ pub(crate) fn build_selection_overlay_image(
         let rgba = [color.rgb.0, color.rgb.1, color.rgb.2, alpha];
         for r01 in pt.range_to_rects(start, end) {
             let rect = norm_to_pixels(r01, img.width(), img.height());
-            fill_rect_rgba(&mut img, rect, rgba);
+            fill_rect_rgba(img, rect, rgba);
         }
     }
     if page_idx == sel.head.page {
@@ -2176,15 +2209,14 @@ pub(crate) fn build_selection_overlay_image(
             // 1px black border at full alpha.
             let (cx, cy, cw, ch) = caret_rect;
             // Top, bottom, left, right border bands — full alpha black.
-            fill_rect_rgba(&mut img, (cx, cy, cw, 1), [40, 40, 40, 255]);
-            fill_rect_rgba(&mut img, (cx, cy + ch.saturating_sub(1), cw, 1), [40, 40, 40, 255]);
-            fill_rect_rgba(&mut img, (cx, cy, 1, ch), [40, 40, 40, 255]);
-            fill_rect_rgba(&mut img, (cx + cw.saturating_sub(1), cy, 1, ch), [40, 40, 40, 255]);
+            fill_rect_rgba(img, (cx, cy, cw, 1), [40, 40, 40, 255]);
+            fill_rect_rgba(img, (cx, cy + ch.saturating_sub(1), cw, 1), [40, 40, 40, 255]);
+            fill_rect_rgba(img, (cx, cy, 1, ch), [40, 40, 40, 255]);
+            fill_rect_rgba(img, (cx + cw.saturating_sub(1), cy, 1, ch), [40, 40, 40, 255]);
             // Interior fill: 0.55 white-blend → α=140 white.
-            fill_rect_rgba(&mut img, (cx, cy, cw, ch), [255, 255, 255, 140]);
+            fill_rect_rgba(img, (cx, cy, cw, ch), [255, 255, 255, 140]);
         }
     }
-    img
 }
 
 /// Percent through the document, based on doc-pixel scroll position.
@@ -2874,7 +2906,7 @@ mod tests {
         }
     }
 
-    /// `build_selection_overlay_image` must paint selection-band
+    /// `fill_selection_overlay_image` must paint selection-band
     /// pixels with the right color AND alpha=115 (matching the bake
     /// path's 0.45 blend), and leave non-selection pixels fully
     /// transparent. Compositing on the kitty side then reproduces the
@@ -2889,8 +2921,9 @@ mod tests {
             mode: SelMode::Charwise,
         };
 
-        let img = build_selection_overlay_image(
-            (200, 200),
+        let mut img = RgbaImage::new(200, 200);
+        fill_selection_overlay_image(
+            &mut img,
             0,
             sel,
             &pt,
@@ -2928,9 +2961,17 @@ mod tests {
             head: Caret { page: 5, idx: 2 },
             mode: SelMode::Charwise,
         };
-        let img = build_selection_overlay_image((40, 40), 0, sel, &pt, 0, false);
+        let mut img = RgbaImage::new(40, 40);
+        // Pre-fill with garbage so we verify the function clears it.
+        for px in img.as_mut().chunks_exact_mut(4) {
+            px.copy_from_slice(&[10, 20, 30, 40]);
+        }
+        fill_selection_overlay_image(&mut img, 0, sel, &pt, 0, false);
         for (_, _, p) in img.enumerate_pixels() {
-            assert_eq!(p.0, [0, 0, 0, 0], "off-selection page must be fully transparent");
+            assert_eq!(
+                p.0, [0, 0, 0, 0],
+                "off-selection page must be fully transparent — fill must clear stale pixels"
+            );
         }
     }
 
@@ -2943,8 +2984,9 @@ mod tests {
         let pt = synthetic_page_text();
         let caret = Caret { page: 0, idx: 2 };
         let sel = TextSelection { anchor: caret, head: caret, mode: SelMode::Charwise };
-        let img = build_selection_overlay_image(
-            (200, 200),
+        let mut img = RgbaImage::new(200, 200);
+        fill_selection_overlay_image(
+            &mut img,
             0,
             sel,
             &pt,
