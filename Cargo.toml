@@ -32,15 +32,21 @@ ratatui = "0.30"
 # Skip chafa-dyn (the default) — chafa is the halfblocks fallback
 # renderer for terminals without kitty/sixel, and it pulls in
 # libchafa-devel as a system dep. Ghostty speaks kitty natively, so
-# we don't need chafa.
-ratatui-image = { version = "10", default-features = false, features = ["crossterm", "image-defaults"] }
+# we don't need chafa. Also skip image-defaults (which would re-enable
+# image's full codec stack) — see the `image` line below.
+ratatui-image = { version = "10", default-features = false, features = ["crossterm"] }
 crossterm = "0.29"
 
-# Color-aware dark mode. We invert *luminance* in HSL space so red
-# text stays red, blue charts stay blue, only white/grayscale gets
-# flipped. Naive per-channel inversion turns a red diagram into a
-# cyan diagram — that's the bug almost every PDF dark-mode tool ships.
-image = "0.25"
+# Color-aware dark mode + on-the-wire PNG encode + cached page
+# decode. We only ever encode/decode PNG (page bitmap → kitty
+# transmit; cached page bitmap on disk). image's default features
+# pull in the entire codec stack including rav1e/ravif (AV1) and a
+# wasm toolchain — ~50 transitive crates of build.rs / unsafe C-like
+# code that we never call into. default-features = false + just
+# "png" trims that supply-chain surface. Also drops the
+# unmaintained `paste 1.0.15` (RUSTSEC-2024-0436) which arrives
+# transitively through ravif → rav1e.
+image = { version = "0.25", default-features = false, features = ["png"] }
 palette = { version = "0.7", default-features = false, features = ["std"] }
 
 # CLI parsing + JSON for highlight persistence.
