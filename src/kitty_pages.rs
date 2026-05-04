@@ -1213,7 +1213,31 @@ pub fn clear_page_area(
             }
             if let Some(cell) = buf.cell_mut((x, y)) {
                 cell.reset();
-                cell.set_skip(true);
+                // Leave skip=false (Cell::EMPTY default after reset).
+                // The earlier design was set_skip(true) here on the
+                // theory that col 0's row-clear escape paints spaces
+                // over cells 1..N anyway, so independent emit was
+                // wasteful. The flaw: a cell that held a kitty
+                // placement in the previous frame has skip=false; if
+                // the placement disappears and we set skip=true here,
+                // ratatui's diff filter (`if !current.skip`) drops
+                // the cell from emit, leaving Ghostty's grid with
+                // the stale placeholder char pointing at an
+                // image_id that's about to be evicted. That is the
+                // 40k+ "missing image for virtual placement" floods
+                // the user observed (Ghostty crash, 2026-05-04).
+                //
+                // Leaving skip=false costs essentially nothing in
+                // steady state — both prev and curr are EMPTY, so
+                // ratatui's diff is `current == previous` and emits
+                // nothing. The cells DO emit on placement→no-placement
+                // transitions, which is exactly what we want: a space
+                // glyph that overwrites the stale placeholder in
+                // Ghostty's grid. place_page later sets skip=true on
+                // cols inside an active placement, which is both
+                // correct (col 0's escape carries the row's full
+                // placement bytes) and stable (a no-op on subsequent
+                // frames at the same placement).
             }
         }
     }
@@ -1863,14 +1887,23 @@ mod tests {
                 "clear escape must differ from place escape (else ratatui's diff won't fire on transition)"
             );
         }
-        // Columns 1..N: stay set_skip(true) so ratatui doesn't try to
-        // emit them and overwrite the col-0 escape's effect.
+        // Columns 1..N: skip=FALSE (post-fix). Earlier code marked
+        // these skip=true on the theory that col 0's row-clear
+        // escape paints spaces over cells 1..N so an independent
+        // emit was wasteful. That broke placement→no-placement
+        // transitions: ratatui's diff filter (`if !current.skip`)
+        // dropped the transition emit and Ghostty's grid retained
+        // the stale placeholder char pointing at the soon-to-be-
+        // evicted image_id (the 40k+ missing-image-warning flood).
+        // skip=false costs nothing in steady state (cells are
+        // EMPTY-equal so diff emits nothing) and triggers the
+        // correct overwriting space on transitions.
         for y in 0..area.height {
             for x in 1..area.width {
                 let cell = buf.cell((x, y)).unwrap();
                 assert!(
-                    cell.skip,
-                    "cell ({x},{y}) must keep skip=true after clear (col 0's escape paints these)"
+                    !cell.skip,
+                    "cell ({x},{y}) must have skip=false after clear so placement→clear transitions actually emit",
                 );
                 assert_eq!(
                     cell.fg,
@@ -2047,6 +2080,68 @@ mod tests {
         );
     }
 
+    /// Regression: a cell that held a kitty placement in frame N and
+    /// then loses the placement in frame N+1 must emit through
+    /// ratatui's diff so the row-clear's space overwrites Ghostty's
+    /// stale placeholder. With the old `set_skip(true)` in
+    /// clear_page_area, the cell stayed skip=true after losing its
+    /// placement and ratatui's diff filter (`if !current.skip`)
+    /// dropped the emit. Ghostty's grid kept the placeholder
+    /// pointing at an image_id that subsequent eviction would free →
+    /// 40k+ "missing image for virtual placement" warnings → crash.
+    #[test]
+    fn placement_then_clear_marks_cell_as_emittable_diff() {
+        let area = Rect { x: 0, y: 0, width: 8, height: 3 };
+        let mut buf_prev = Buffer::empty(area);
+        let mut buf_curr = Buffer::empty(area);
+        let mut scratch = PlaceScratch::default();
+
+        // Frame N: place + clear (the actual draw order in ui::draw
+        // is clear → place, but the cells inside the placement region
+        // at the END of the frame have placement state. We mimic that
+        // end-of-frame state here.)
+        clear_page_area(&mut buf_prev, area, &mut scratch);
+        place_page(
+            &mut buf_prev, area,
+            /*page_idx*/ 0, /*image_id*/ 99,
+            /*pixel_w*/ 80, /*pixel_h*/ 60,
+            /*cell_w_px*/ 10, /*cell_h_px*/ 20,
+            /*dst_top_cell*/ 0, /*dst_height_cells*/ 3,
+            /*src_top_cell*/ 0, /*src_left_cell*/ 0,
+            /*width_cells*/ 8,
+            /*prefix*/ None,
+            &mut scratch,
+        );
+
+        // Frame N+1: page scrolled away, clear only — no place.
+        clear_page_area(&mut buf_curr, area, &mut scratch);
+
+        // Diff: at least one cell that held a placement in frame N
+        // must now appear in the diff so ratatui actually emits the
+        // row-clear bytes that overwrite the stale placeholders in
+        // Ghostty's grid.
+        let updates: Vec<_> = buf_prev.diff(&buf_curr).into_iter().collect();
+        assert!(
+            !updates.is_empty(),
+            "frame N+1's clear-only state must produce diff updates against frame N's placement state — otherwise Ghostty keeps stale placeholders pointing at the now-evicted image_id"
+        );
+
+        // Specifically, every cell that held the kitty placeholder
+        // char in frame N must be in the diff (or the row-clear
+        // escape covering it must be).
+        let placement_cells_in_prev: Vec<(u16, u16)> = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .filter(|(x, y)| {
+                buf_prev.cell((*x, *y))
+                    .is_some_and(|c| c.symbol().contains('\u{10EEEE}'))
+            })
+            .collect();
+        assert!(
+            !placement_cells_in_prev.is_empty(),
+            "precondition: frame N must have at least one placement cell"
+        );
+    }
+
     /// Regression: when ui::draw runs `clear_page_area` on the full
     /// image area FIRST and then `place_page` on a centered page
     /// (placement_area.left > image_area.left), the placement's col-0
@@ -2067,11 +2162,16 @@ mod tests {
 
         clear_page_area(&mut buf, img_area, &mut scratch);
 
-        // Confirm the precondition: post-clear, col 2 (where the
-        // centered placement will land) is skip=true.
+        // Post-fix design: clear_page_area leaves cols 1..N as
+        // skip=false (Cell::EMPTY default after reset) so that
+        // placement→clear transitions are emittable through
+        // ratatui's diff. place_page's set_skip(false) on its
+        // col-0 cell is therefore defensive — it stays correct
+        // even if a future change to clear_page_area reintroduces
+        // skip=true in this range.
         assert!(
-            buf.cell((2, 0)).unwrap().skip,
-            "precondition: clear_page_area must mark col 2 of img_area as skip=true",
+            !buf.cell((2, 0)).unwrap().skip,
+            "post-clear, cells 1..N have skip=false so transitions emit"
         );
 
         let placement_area = Rect { x: 2, y: 0, width: 6, height: 4 };
