@@ -97,8 +97,14 @@ struct CachedPayload {
     revision: u64,
     pixel_w: u32,
     pixel_h: u32,
-    /// Kitty format code: 100 = PNG, 32 = raw RGBA.
+    /// Kitty format code: 100 = PNG, 32 = raw RGBA, 24 = raw RGB.
     format_code: u8,
+    /// Kitty compression code: 0 = no compression header, b'z' = `o=z`
+    /// (zlib-deflated). PNG (f=100) always rides as 0 because PNG's
+    /// container already wraps a zlib stream. RGB (f=24) we always
+    /// zlib-compress on the way out so Ghostty stores the deflated
+    /// bytes (smaller against image-storage-limit).
+    compression: u8,
     bytes: Vec<u8>,
 }
 
@@ -131,6 +137,11 @@ struct OverlayCachedPayload {
     layout: LayoutKey,
     revision: u64,
     sel_sig: u64,
+    /// Same kitty compression code as `CachedPayload::compression`.
+    /// Selection-band overlays keep PNG/RGBA (real alpha < 255) and
+    /// stay at 0; the field exists only because the same
+    /// `build_transmit_string` is used for both.
+    compression: u8,
     pixel_w: u32,
     pixel_h: u32,
     format_code: u8,
@@ -532,13 +543,14 @@ impl KittyPageRegistry {
                 None => true,
             };
             if needs_encode {
-                let (format_code, bytes) = encode_payload_opaque(bitmap);
+                let (format_code, compression, bytes) = encode_payload_opaque(bitmap);
                 entry.cached_payload = Some(CachedPayload {
                     layout,
                     revision,
                     pixel_w,
                     pixel_h,
                     format_code,
+                    compression,
                     bytes,
                 });
             }
@@ -546,7 +558,15 @@ impl KittyPageRegistry {
                 .cached_payload
                 .as_ref()
                 .expect("cached_payload populated on the line above");
-            build_transmit_string(&c.bytes, c.format_code, id, pixel_w, pixel_h, is_tmux)
+            build_transmit_string(
+                &c.bytes,
+                c.format_code,
+                c.compression,
+                id,
+                pixel_w,
+                pixel_h,
+                is_tmux,
+            )
         };
         self.touch(page_idx);
         result
@@ -589,13 +609,14 @@ impl KittyPageRegistry {
                 return;
             }
         }
-        let (format_code, bytes) = encode_payload_opaque(bitmap);
+        let (format_code, compression, bytes) = encode_payload_opaque(bitmap);
         entry.cached_payload = Some(CachedPayload {
             layout,
             revision,
             pixel_w,
             pixel_h,
             format_code,
+            compression,
             bytes,
         });
         self.touch(page_idx);
@@ -684,11 +705,12 @@ impl KittyPageRegistry {
             None => true,
         };
         if needs_encode {
-            let (format_code, bytes) = encode_payload(bitmap);
+            let (format_code, compression, bytes) = encode_payload(bitmap);
             entry.cached_payload = Some(OverlayCachedPayload {
                 layout,
                 revision,
                 sel_sig,
+                compression,
                 pixel_w,
                 pixel_h,
                 format_code,
@@ -701,7 +723,15 @@ impl KittyPageRegistry {
             .expect("overlay payload populated above");
         // Use the same transmit-string builder as pages — kitty doesn't
         // distinguish image kinds, only IDs.
-        build_transmit_string(&c.bytes, c.format_code, id, pixel_w, pixel_h, is_tmux)
+        build_transmit_string(
+            &c.bytes,
+            c.format_code,
+            c.compression,
+            id,
+            pixel_w,
+            pixel_h,
+            is_tmux,
+        )
     }
 
     /// Update overlay registry state to record that the just-built
@@ -765,38 +795,74 @@ impl KittyPageRegistry {
 /// Set `TERMPDF_TRANSMIT_RAW=1` to force the old raw-RGBA path —
 /// useful for A/B testing or if a terminal turns out not to like
 /// PNG transmits in practice.
-fn encode_payload(bitmap: &RgbaImage) -> (u8, Vec<u8>) {
+fn encode_payload(bitmap: &RgbaImage) -> (u8, u8, Vec<u8>) {
     if force_raw_env() {
-        return (32, bitmap.as_raw().to_vec());
+        return (32, 0, bitmap.as_raw().to_vec());
     }
     match encode_png_fast(bitmap) {
-        Ok(png) => (100, png),
-        Err(_) => (32, bitmap.as_raw().to_vec()),
+        Ok(png) => (100, 0, png),
+        Err(_) => (32, 0, bitmap.as_raw().to_vec()),
     }
 }
 
-/// PAGE encode path — strips alpha and ships RGB. Page bitmaps come
-/// out of pdfium opaque (alpha=255 everywhere) and stay opaque after
-/// dark-mode inversion + highlight baking (we composite onto an
-/// opaque bg). Sending RGB cuts:
-///   1. Wire bytes by 25% (PNG's deflate already compresses constant
-///      alpha well, but we still ship the alpha plane through it).
-///   2. **Ghostty's image-store size by 25%** — Ghostty keeps the
-///      decoded buffer; for our 10 MB/page raw RGBA at typical zoom,
-///      RGB drops it to ~7.5 MB. With cap=7 pages that's ~52 MB on
-///      Ghostty's side instead of ~70 MB, well under the internal
-///      capacity that was triggering "missing image" warnings.
+/// PAGE encode path — strips alpha and ships RGB through `o=z` zlib.
+/// Page bitmaps come out of pdfium opaque (alpha=255 everywhere) and
+/// stay opaque after dark-mode inversion + highlight baking (we
+/// composite onto an opaque bg). The new pipeline is:
+///   raw RGBA → strip alpha (RGB) → flate2 zlib deflate → kitty `f=24,o=z`
 ///
-/// Overlay images (selection band) keep RGBA via `encode_payload`;
+/// Why this is faster than PNG (the prior path):
+///   - PNG's `Up` filter is the bulk of its CPU. Skipping it cuts
+///     encode time ~3× (benchmarked: ~14 ms for `Fast`+`Up` PNG vs
+///     ~5 ms for raw zlib on the same bitmap).
+///   - Wire size is comparable for PDF-page content: PNG's filter
+///     buys ~10–30 % vs raw deflate, but raw RGB starts smaller (no
+///     PNG container, no chunk framing, no alpha plane).
+///   - Inside Ghostty, kitty `f=24,o=z` decodes straight to RGB
+///     bytes against `image-storage-limit` (per agent-3 research of
+///     graphics_storage.zig); PNG took the long way through the
+///     wuffs decoder. Net effect: same or smaller per-image footprint
+///     and faster terminal-side decode.
+///
+/// `TERMPDF_TRANSMIT_RAW=1` still forces uncompressed `f=24` (raw RGB)
+/// for A/B testing the compression alone. Setting `TERMPDF_TRANSMIT_PNG=1`
+/// reverts to the old PNG path for terminals that mishandle `o=z`.
+///
+/// Overlay images (selection band) keep PNG/RGBA via `encode_payload`;
 /// they have real alpha < 255 by design.
-fn encode_payload_opaque(bitmap: &RgbaImage) -> (u8, Vec<u8>) {
+fn encode_payload_opaque(bitmap: &RgbaImage) -> (u8, u8, Vec<u8>) {
     if force_raw_env() {
-        return (24, strip_alpha(bitmap));
+        return (24, 0, strip_alpha(bitmap));
     }
-    match encode_png_fast_rgb(bitmap) {
-        Ok(png) => (100, png),
-        Err(_) => (24, strip_alpha(bitmap)),
+    if force_png_env() {
+        return match encode_png_fast_rgb(bitmap) {
+            Ok(png) => (100, 0, png),
+            Err(_) => (24, 0, strip_alpha(bitmap)),
+        };
     }
+    match encode_rgb_zlib(bitmap) {
+        Ok(deflated) => (24, b'z', deflated),
+        Err(_) => (24, 0, strip_alpha(bitmap)),
+    }
+}
+
+/// Strip alpha, then zlib-deflate the RGB bytes. Returns the `o=z`
+/// payload for kitty `f=24,o=z` transmit. Uses `flate2` at the default
+/// compression level (6) — slower than `Fast` would be but yields
+/// noticeably smaller output for PDF page content (text, large flat
+/// regions); the wire savings dominate the encode delta on a typical
+/// SSH or even local terminal session.
+fn encode_rgb_zlib(bitmap: &RgbaImage) -> std::io::Result<Vec<u8>> {
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let rgb = strip_alpha(bitmap);
+    // PDF pages typically deflate 5–20× on real content. Reserve a
+    // generous lower bound so the inner Vec doesn't grow during the
+    // flush (encoder writes in ~32 KB chunks).
+    let mut enc = ZlibEncoder::new(Vec::with_capacity(384 * 1024), Compression::default());
+    enc.write_all(&rgb)?;
+    enc.finish()
 }
 
 /// Copy RGBA → RGB, dropping the alpha byte. Iterates 4-byte chunks
@@ -825,12 +891,27 @@ fn force_raw_env() -> bool {
     })
 }
 
+/// Cached lookup of `TERMPDF_TRANSMIT_PNG`. Forces the legacy PNG
+/// (`f=100`) path for opaque pages — escape hatch for terminals that
+/// mishandle `f=24,o=z`. Same one-shot caching pattern as
+/// `force_raw_env`.
+fn force_png_env() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("TERMPDF_TRANSMIT_PNG")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
+
 /// Build the kitty `a=T,U=1` chunked transmit for an already-encoded
 /// payload. Pure formatting — no encode work — so it's cheap to call
 /// even after a cache hit.
 fn build_transmit_string(
     payload: &[u8],
     format_code: u8,
+    compression: u8,
     id: u32,
     pixel_w: u32,
     pixel_h: u32,
@@ -862,14 +943,22 @@ fn build_transmit_string(
             // q=2 suppresses kitty responses; t=d = direct transmit
             // (data inline); a=T = transmit-and-store (no immediate
             // placement); U=1 = mark for unicode placeholder use.
-            // f=32 raw RGBA (s/v needed) or f=100 PNG (decoder reads
-            // dims from PNG header but we send s/v anyway — kitty
-            // accepts and uses them as a hint).
+            // f=32 raw RGBA / f=24 raw RGB (s/v required) or f=100 PNG
+            // (decoder reads dims from PNG header but we send s/v
+            // anyway — kitty accepts and uses them as a hint).
+            // o=z (zlib) only emitted when the encode path zlib-deflated
+            // the raw bytes (page bitmaps via encode_rgb_zlib); PNG and
+            // uncompressed raw paths leave it off — PNG carries its own
+            // zlib stream inside the container, double-deflate is wasted
+            // work and Ghostty rejects it.
             write!(
                 data,
                 "i={id},a=T,U=1,f={format_code},t=d,s={pixel_w},v={pixel_h},"
             )
             .unwrap();
+            if compression == b'z' {
+                write!(data, "o=z,").unwrap();
+            }
         }
         let more = u8::from(chunk_count > i + 1);
         write!(data, "m={more};").unwrap();
@@ -894,10 +983,11 @@ fn build_transmit_string(
 /// which adds the payload cache on top.
 #[cfg(test)]
 fn transmit(bitmap: &RgbaImage, id: u32, is_tmux: bool) -> String {
-    let (format_code, payload) = encode_payload(bitmap);
+    let (format_code, compression, payload) = encode_payload(bitmap);
     build_transmit_string(
         &payload,
         format_code,
+        compression,
         id,
         bitmap.width(),
         bitmap.height(),
@@ -2285,26 +2375,26 @@ mod tests {
     }
 
     #[test]
-    fn encode_payload_opaque_png_uses_rgb_color_type() {
-        // Render a tiny opaque image; encoded PNG's IHDR must say RGB.
+    fn encode_payload_opaque_default_is_rgb_zlib() {
+        // The default opaque encode path is `f=24, o=z` — raw RGB
+        // wrapped in a zlib stream. Round-trip the output through
+        // flate2 and confirm the inflated bytes match the alpha-
+        // stripped source.
         let mut img = RgbaImage::new(4, 4);
         for p in img.pixels_mut() {
             *p = image::Rgba([200, 100, 50, 255]);
         }
-        let (format_code, bytes) = encode_payload_opaque(&img);
-        assert_eq!(format_code, 100, "PNG path expected for opaque encode");
-        // PNG signature + IHDR. IHDR color type byte is at offset 25:
-        //   0..8   PNG signature
-        //   8..12  IHDR length
-        //   12..16 "IHDR"
-        //   16..20 width
-        //   20..24 height
-        //   24     bit depth
-        //   25     color type (2 = RGB, 6 = RGBA)
+        let (format_code, compression, bytes) = encode_payload_opaque(&img);
+        assert_eq!(format_code, 24, "default opaque format must be RGB (f=24)");
+        assert_eq!(compression, b'z', "default opaque path must set o=z");
+        use flate2::read::ZlibDecoder;
+        use std::io::Read;
+        let mut inflated = Vec::new();
+        ZlibDecoder::new(&bytes[..]).read_to_end(&mut inflated).unwrap();
+        let expected = strip_alpha(&img);
         assert_eq!(
-            bytes[25], 2,
-            "PNG color type at byte 25 must be 2 (RGB), got {}",
-            bytes[25]
+            inflated, expected,
+            "deflated payload must round-trip to alpha-stripped RGB"
         );
     }
 
