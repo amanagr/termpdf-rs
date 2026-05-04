@@ -355,13 +355,22 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
     // forget if multiple events arrive within the threshold.
     let mut needs_settle_redraw = false;
 
+    // Idle gating: only call term.draw when something has actually
+    // changed since the last paint. Without this, the loop poked
+    // ratatui every 250 ms (idle poll cadence), each draw causing
+    // Ghostty to wake on the pty and re-composite — sustained 50-90 %
+    // Ghostty CPU even with the PDF "doing nothing." First frame
+    // always paints; subsequent frames require an explicit dirty
+    // signal: input dispatched, settle catch-up, cold-redraw catch-up.
+    let mut dirty = true;
+
     while !app.should_quit {
         // Pre-draw peek: if more input is already queued, don't paint
         // the intermediate state — drain first, then paint the result.
         // The watchdog guarantees we still paint at ~60 Hz so very
         // long input bursts (mouse drags, autorepeat) don't lock the
         // screen.
-        let mut should_draw = true;
+        let mut should_draw = dirty;
         let now = std::time::Instant::now();
         if now.duration_since(last_draw) < MIN_FRAME_INTERVAL && event::poll(Duration::ZERO)? {
             should_draw = false;
@@ -375,6 +384,7 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
             term.draw(|f| ui::draw(f, app))?;
             drop(_draw);
             last_draw = std::time::Instant::now();
+            dirty = false;
         }
 
         // Settle-redraw poll timing: when the user is mid-burst we
@@ -403,6 +413,7 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
         if app.pending_cold_redraw {
             app.pending_cold_redraw = false;
             last_draw = std::time::Instant::now() - MIN_FRAME_INTERVAL;
+            dirty = true;
             continue;
         }
 
@@ -410,6 +421,7 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
             dispatch_event_coalesced(app, event::read()?)?;
             app.note_input();
             needs_settle_redraw = true;
+            dirty = true;
             while !app.should_quit && event::poll(Duration::ZERO)? {
                 dispatch_event_coalesced(app, event::read()?)?;
                 app.note_input();
@@ -421,6 +433,7 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
             // draw immediately.
             needs_settle_redraw = false;
             last_draw = std::time::Instant::now() - MIN_FRAME_INTERVAL;
+            dirty = true;
         } else {
             // True idle: no input pending and no settle to do. Use
             // the moment to warm one upcoming page so the next j/k

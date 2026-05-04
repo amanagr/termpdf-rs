@@ -648,6 +648,30 @@ fn scenarios() -> Vec<Scenario> {
             ],
             measured: vec![Idle(Duration::from_secs(5))],
         },
+        // Idle AFTER settling — proxy for "Ghostty CPU when user does
+        // nothing." Setup spends 4 s draining the post-input transmit
+        // burst (idle warm + Sharp upgrade re-transmits); the
+        // measured window is the next 3 s, which should be near-silent
+        // on the pty. If anything keeps firing here — a 60 Hz draw
+        // loop, an unguarded periodic redraw, an idle warm path that
+        // re-transmits forever — bytes_out spikes and the test
+        // catches it. Set the baseline tight so a regression is
+        // visible. The user reported a sustained 50-90% Ghostty CPU
+        // during exactly this window before we gated term.draw on a
+        // `dirty` flag.
+        Scenario {
+            name: "idle_after_settle_quiet",
+            fixture: FixtureSize::Large,
+            setup: vec![
+                Keys(b"g", Duration::from_millis(100)),
+                Keys(b"j", Duration::from_millis(150)),
+                // Long enough that warm prefetch + Sharp upgrade
+                // settle. 4 s clears all visible-page upgrades on
+                // the Large fixture (50 pages, ~5 visible).
+                Idle(Duration::from_secs(4)),
+            ],
+            measured: vec![Idle(Duration::from_secs(3))],
+        },
         // Casual scroll on a large book — what the user reported.
         // Each j press lands on an uncached page; the per-scroll
         // cost path runs end-to-end (pdfium render + bake +

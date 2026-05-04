@@ -259,6 +259,25 @@ fn perf_optimizations_stay_wired_into_binary() {
 
     let after_idle_transmits = count_kitty_transmit_headers(&buf);
 
+    // === Assertion 3 (added later) baseline marker ===
+    //
+    // Snapshot the byte count NOW. The warm pipeline (page warmups +
+    // Sharp upgrade re-transmits) is fully drained — every cold page
+    // in the 5-page test PDF has been warmed and the visible page
+    // upgraded to Sharp. Any bytes after this point would mean the
+    // idle path is still poking the terminal — which is exactly the
+    // class of regression that drove Ghostty CPU to 50-90 % when the
+    // user had a PDF open and "nothing" happening.
+    let bytes_after_warm_settled = buf.len();
+
+    // Now drain another 3 s of *fully-settled* idle. Anything that
+    // arrives in this window is a regression: term.draw firing on a
+    // periodic timer, an idle warm path that re-transmits cached
+    // pages, etc. Tolerate up to 4 KB to absorb tiny things like a
+    // single HUD cell update — but no more.
+    drain_until(&rx, &mut buf, Duration::from_secs(3), |_| false);
+    let bytes_during_quiet_window = buf.len() - bytes_after_warm_settled;
+
     // Quit cleanly so we can inspect the disk cache without races
     // against the still-writing process.
     writer.write_all(b":q\r").ok();
@@ -290,6 +309,27 @@ fn perf_optimizations_stay_wired_into_binary() {
          {after_idle_transmits} after 2s idle (expected ≥+2). \
          If `warm_one_idle` no longer calls `build_transmit` and \
          writes to stdout, this assertion fails."
+    );
+
+    // === Assertion 3: idle is silent ===
+    //
+    // After the warm pipeline drains, the binary should write
+    // essentially nothing to the pty until the user does something.
+    // The dirty-flag in run_loop is what guarantees this — without
+    // it, term.draw fires on every 250 ms idle poll and ratatui's
+    // backend flushes whatever it has, which in practice means
+    // Ghostty's CPU climbs to 50-90 % even when the user is doing
+    // nothing. The 4 KB ceiling absorbs incidental writes (e.g. one
+    // HUD cell update) without being so loose that a real regression
+    // (per-frame placement re-emit) slips through.
+    const IDLE_BYTES_CEIL: usize = 4096;
+    assert!(
+        bytes_during_quiet_window <= IDLE_BYTES_CEIL,
+        "fully-settled idle is no longer silent: {bytes_during_quiet_window} bytes \
+         emitted in 3 s after the warm pipeline drained (ceiling = \
+         {IDLE_BYTES_CEIL} B). If you see this, something in the run-loop is \
+         calling term.draw on a periodic timer, or warm_one_idle is re-transmitting \
+         pages forever. Look at the `dirty` gating in src/main.rs::run_loop."
     );
 
     // === Assertion 2: disk cache writes happen ===

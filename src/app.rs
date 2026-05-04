@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use image::{DynamicImage, Rgba, RgbaImage};
@@ -385,17 +384,6 @@ pub struct App<'doc> {
     /// True after typing `'`, awaiting the mark name to jump to.
     pub awaiting_mark_jump: bool,
 
-    /// "Where you were before the last big-jump" marker for the
-    /// resume-reading hint after `<Space>`. Stored in document-pixel
-    /// space so zoom changes still place it correctly. None when no
-    /// marker is active or the active one has expired.
-    pub resume_marker: Option<ResumeMarker>,
-    /// Timestamp of the last `<Space>` keypress. Used to gate the
-    /// resume marker — only show one if at least 10s elapsed since
-    /// the previous Space, so a user paging fast doesn't get the
-    /// line flickering on every jump.
-    pub last_space_at: Option<Instant>,
-
     /// Counter for new highlight `group_id`s. All rects from a single
     /// yank share one id so `x` can delete the whole group at once.
     /// Seeded from the highest existing group_id in the loaded store
@@ -420,28 +408,6 @@ pub struct App<'doc> {
 
     pub should_quit: bool,
 }
-
-/// Transient "you were reading here" marker shown for 3s after a
-/// `<Space>` jump that wasn't part of a continuous burst. Drawn as
-/// a single row of `─` glyphs at `doc_y_px` (document-pixel space,
-/// converted to a viewport row at draw time).
-#[derive(Debug, Clone, Copy)]
-pub struct ResumeMarker {
-    pub shown_at: Instant,
-    pub doc_y_px: i64,
-}
-
-impl ResumeMarker {
-    pub const TTL: Duration = Duration::from_secs(3);
-    pub fn is_live(&self, now: Instant) -> bool {
-        now.duration_since(self.shown_at) < Self::TTL
-    }
-}
-
-/// Time-window after which a fresh `<Space>` press counts as
-/// "user lost their place" rather than "user is paging fast." Only
-/// the first Space in a burst sets a resume marker.
-pub const RESUME_MARKER_REARM: Duration = Duration::from_secs(10);
 
 /// Inter-input gap (ms) below which we count consecutive presses as
 /// part of the same scroll burst. 250 ms — was 120 ms, which only
@@ -602,8 +568,6 @@ impl<'doc> App<'doc> {
             jump_idx: 0,
             awaiting_mark_set: false,
             awaiting_mark_jump: false,
-            resume_marker: None,
-            last_space_at: None,
             next_highlight_group_id,
             awaiting_highlight_delete_confirm: false,
             cache_dir,
@@ -1152,50 +1116,6 @@ impl<'doc> App<'doc> {
     pub fn scroll_by_screens(&mut self, dy_screens: f32) {
         let viewport_h = self.viewport_px.1 as i64;
         self.scroll_by_px((viewport_h as f32 * dy_screens).round() as i64);
-    }
-
-    /// Hook called by the `<Space>` key handler BEFORE the actual
-    /// scroll. If at least `RESUME_MARKER_REARM` has elapsed since
-    /// the last Space press, capture a "you were here" marker at the
-    /// current viewport's bottom edge. Then update the timestamp.
-    ///
-    /// Counted forms (e.g. `5<Space>`) capture once before the first
-    /// jump — the marker corresponds to where the user was looking
-    /// when they hit Space, not to any intermediate stop.
-    pub fn note_space_scroll(&mut self) {
-        let now = Instant::now();
-        let rearm = self
-            .last_space_at
-            .is_none_or(|t| now.duration_since(t) >= RESUME_MARKER_REARM);
-        if rearm {
-            // viewport bottom in document-pixel space — survives any
-            // future zoom because the conversion happens at draw time.
-            let doc_y_px = self
-                .scroll_y_px
-                .saturating_add(self.viewport_px.1 as i64);
-            self.resume_marker = Some(ResumeMarker {
-                shown_at: now,
-                doc_y_px,
-            });
-            // Force a redraw so the marker appears even if the
-            // resulting scroll happened to land on an identical
-            // ComposeKey (e.g. doc end clamps the scroll to a no-op).
-            self.invalidate_compose();
-        }
-        self.last_space_at = Some(now);
-    }
-
-    /// Drop a resume marker that has aged past its TTL. Called from
-    /// the draw path so an idle frame still expires the marker even
-    /// if no key was pressed.
-    pub fn expire_resume_marker(&mut self) {
-        let now = Instant::now();
-        if let Some(m) = self.resume_marker {
-            if !m.is_live(now) {
-                self.resume_marker = None;
-                self.invalidate_compose();
-            }
-        }
     }
 
     /// Horizontal scroll, only meaningful when fit_width > viewport_w

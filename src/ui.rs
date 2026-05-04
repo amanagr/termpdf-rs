@@ -255,14 +255,6 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
     // tmux+Ghostty: ratatui-image packs each row's kitty escape into
     // column 0 and our post-image cell writes never reached the wire.
 
-    // Resume-reading marker: a single dim row of `─` at the position
-    // where the viewport bottom was *before* the last `<Space>` jump.
-    // Suppressed while a popup is up so the marker doesn't bleed at
-    // the popup edges.
-    if !app.show_help && !app.show_toc {
-        draw_resume_marker(f, app, img_area);
-    }
-
     // Perf HUD pinned to the bottom-right corner. Rendered *before*
     // the status line so the status_line area can shrink to leave
     // room — otherwise long status messages would overpaint the HUD
@@ -297,101 +289,6 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
     if app.show_help {
         draw_help(f, img_area);
     }
-}
-
-/// Paint the "resume reading here" marker if one is active and
-/// within the current viewport. Expires the marker if its TTL has
-/// elapsed. The marker lives in document-pixel space so zoom and
-/// scroll changes leave it where the user expects; if it has scrolled
-/// out of view we just skip drawing (it'll reappear if the user
-/// scrolls back within its TTL).
-///
-/// Layout: occupies the LEFT 30% of the image area (so the rest of
-/// the row stays untouched and the underlying PDF text remains
-/// readable). Content is a centered bold "resume here" label flanked
-/// by `─` rules: `─── resume here ───`. Below a narrow-terminal
-/// threshold the label is dropped and only the rule renders.
-fn draw_resume_marker(f: &mut Frame, app: &mut App<'_>, img_area: Rect) {
-    app.expire_resume_marker();
-    let Some(marker) = app.resume_marker else { return };
-    let cell_h = app.cell_size_px.1.max(1) as i64;
-    let viewport_top = app.scroll_y_px;
-    let rel_px = marker.doc_y_px - viewport_top;
-    if rel_px < 0 || rel_px >= app.viewport_px.1 as i64 {
-        return;
-    }
-    let row = (rel_px / cell_h) as u16;
-    if row >= img_area.height {
-        return;
-    }
-
-    let marker_w = resume_marker_width(img_area.width);
-    let line = resume_marker_line(marker_w);
-    let strip = Rect {
-        x: img_area.x,
-        y: img_area.y + row,
-        width: marker_w,
-        height: 1,
-    };
-    f.render_widget(Paragraph::new(line), strip);
-    // Same trap as the selection overlay: ratatui-image's kitty
-    // backend left every cell beyond column 0 with `skip=true`, and
-    // Paragraph's render doesn't clear that flag. Clear it here or
-    // the marker is buffered but never written to the terminal.
-    let buf = f.buffer_mut();
-    for x in strip.x..strip.x.saturating_add(strip.width) {
-        if let Some(cell) = buf.cell_mut((x, strip.y)) {
-            cell.set_skip(false);
-        }
-    }
-}
-
-/// Pure helper: marker width = round(0.3 * image width), clamped to
-/// at least 1 cell and at most the image width itself.
-pub fn resume_marker_width(image_w: u16) -> u16 {
-    let w = ((image_w as f32) * 0.30).round() as u16;
-    w.max(1).min(image_w)
-}
-
-/// Pure builder for the resume-marker line content. Returns a fully
-/// styled `Line` so a `TestBackend` snapshot test can inspect every
-/// span (chars + colors + modifiers) without spinning up an `App`.
-///
-/// Layout:
-/// - Below `MIN_LABELED_WIDTH` cells: line-only `────` (yellow).
-/// - At or above: `─── resume here ───` with the label centered.
-///   Label = bold black on yellow background (pops against any PDF
-///   page bitmap regardless of dark mode). Rules = plain yellow.
-///   Odd remainder goes to the right flank so the weight feels
-///   left-anchored.
-///
-/// The earlier version used `Modifier::DIM` for both rule and label;
-/// some terminals render DIM as ~transparent, which made the label
-/// invisible. Solid colours instead.
-pub fn resume_marker_line(marker_w: u16) -> Line<'static> {
-    const LABEL: &str = "resume here";
-    const MIN_LABELED_WIDTH: u16 = (LABEL.len() as u16) + 4 + 2;
-    let rule_style = Style::default().fg(Color::Yellow);
-    if marker_w < MIN_LABELED_WIDTH {
-        return Line::from(Span::styled("─".repeat(marker_w as usize), rule_style));
-    }
-    let inner = marker_w - LABEL.len() as u16 - 2;
-    let left_rule = inner / 2;
-    let right_rule = inner - left_rule;
-    let left = "─".repeat(left_rule as usize);
-    let right = "─".repeat(right_rule as usize);
-    // Black-on-yellow tag style for the label — guaranteed visible
-    // on top of either a light or dark PDF render. BOLD reinforces
-    // the focal-point role.
-    let label_style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
-    Line::from(vec![
-        Span::styled(left, rule_style),
-        Span::styled(format!(" {LABEL} "), label_style),
-        Span::styled(right, rule_style),
-    ])
 }
 
 // The selection-overlay cell-styling helpers used to live here.
@@ -2439,7 +2336,6 @@ pub fn help_overlay_lines() -> Vec<&'static str> {
         "  j / k                  next / prev page (jump to page boundary)",
         "  N j  /  N k            jump N pages forward / back",
         "  Space / b              scroll one screen down / up (less-style)",
-        "                         (Space drops a 3s 'resume here' line at your last bottom)",
         "  Ctrl-d / Ctrl-u        scroll a half-screen down / up",
         "  gg / G                 doc top / bottom",
         "  N G                    jump to page N",
@@ -3102,123 +2998,6 @@ mod tests {
         );
     }
 
-    // ---- Resume-marker pure builder ---------------------------------
-
-    #[test]
-    fn resume_marker_width_is_30_percent() {
-        assert_eq!(resume_marker_width(100), 30);
-        assert_eq!(resume_marker_width(80), 24);
-        assert_eq!(resume_marker_width(50), 15);
-        // Tiny terminals: clamped to ≥ 1 cell.
-        assert_eq!(resume_marker_width(1), 1);
-        assert_eq!(resume_marker_width(2), 1);
-    }
-
-    #[test]
-    fn resume_marker_line_full_width_has_label() {
-        let line = resume_marker_line(40);
-        // 3 spans expected: left rule, " resume here ", right rule.
-        let spans: Vec<&Span<'_>> = line.spans.iter().collect();
-        assert_eq!(spans.len(), 3, "expected 3 spans, got {:?}", spans);
-        assert!(spans[0].content.chars().all(|c| c == '─'));
-        assert_eq!(spans[1].content, " resume here ");
-        assert!(spans[2].content.chars().all(|c| c == '─'));
-        // Total width must equal what we asked for.
-        let total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-        assert_eq!(total, 40);
-    }
-
-    #[test]
-    fn resume_marker_line_label_is_bold_black_on_yellow() {
-        // Black-on-yellow tag style — visible on any PDF page bitmap
-        // regardless of dark mode. Earlier `Modifier::DIM` rendered as
-        // ~transparent on some terminals, hiding the label entirely.
-        let line = resume_marker_line(40);
-        let label_span = &line.spans[1];
-        assert_eq!(label_span.style.fg, Some(Color::Black));
-        assert_eq!(label_span.style.bg, Some(Color::Yellow));
-        assert!(label_span.style.add_modifier.contains(Modifier::BOLD));
-        assert!(
-            !label_span.style.add_modifier.contains(Modifier::DIM),
-            "DIM is unreliable across terminals; never set it on the label"
-        );
-    }
-
-    #[test]
-    fn resume_marker_line_rules_are_solid_yellow() {
-        let line = resume_marker_line(40);
-        for (i, span) in [&line.spans[0], &line.spans[2]].iter().enumerate() {
-            assert_eq!(span.style.fg, Some(Color::Yellow), "rule span {i}");
-            assert!(
-                !span.style.add_modifier.contains(Modifier::DIM),
-                "rule span {i} must not be DIM (terminal-dependent)"
-            );
-        }
-    }
-
-    #[test]
-    fn resume_marker_line_narrow_falls_back_to_line_only() {
-        let line = resume_marker_line(10);
-        assert_eq!(line.spans.len(), 1, "narrow fallback = single span");
-        assert!(line.spans[0].content.chars().all(|c| c == '─'));
-        assert_eq!(line.spans[0].content.chars().count(), 10);
-        assert_eq!(line.spans[0].style.fg, Some(Color::Yellow));
-    }
-
-    /// Render the marker through a real (test) backend and walk the
-    /// resulting cell buffer. The closest thing to "did the terminal
-    /// get the right bytes" that we can write headlessly.
-    #[test]
-    fn resume_marker_renders_to_buffer_with_correct_chars_and_colors() {
-        let backend = TestBackend::new(40, 1);
-        let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| {
-            let line = resume_marker_line(40);
-            f.render_widget(
-                Paragraph::new(line),
-                Rect { x: 0, y: 0, width: 40, height: 1 },
-            );
-        })
-        .unwrap();
-        let buf = term.backend().buffer();
-        let mut rendered = String::new();
-        let mut yellow_bg_cells = 0;
-        let mut yellow_fg_cells = 0;
-        let mut bold_cells = 0;
-        for x in 0..40 {
-            let cell = buf.cell((x, 0)).unwrap();
-            rendered.push_str(cell.symbol());
-            if cell.bg == Color::Yellow {
-                yellow_bg_cells += 1;
-            }
-            if cell.fg == Color::Yellow {
-                yellow_fg_cells += 1;
-            }
-            if cell.modifier.contains(Modifier::BOLD) {
-                bold_cells += 1;
-            }
-        }
-        assert!(
-            rendered.contains("resume here"),
-            "rendered cells must contain the label, got {rendered:?}"
-        );
-        assert!(
-            rendered.starts_with('─') && rendered.ends_with('─'),
-            "rendered cells should start and end with rule glyphs, got {rendered:?}"
-        );
-        // Label is the 13-cell tag. Black fg on yellow BG, bold.
-        assert_eq!(
-            yellow_bg_cells, 13,
-            "exactly the 13-cell label should have yellow background"
-        );
-        assert_eq!(bold_cells, 13, "exactly the label should be bold");
-        // Rules are the other 27 cells: yellow FG, no bg.
-        assert_eq!(
-            yellow_fg_cells, 27,
-            "rule cells must be yellow fg (27 = 40 - 13)"
-        );
-    }
-
     // The selection-overlay-style tests used to live here. They tested
     // the cell-overlay code path, which has been removed in favour of
     // baking the selection band into the page bitmap (where the
@@ -3257,15 +3036,6 @@ mod tests {
                 "help overlay missing entry: {needed:?}"
             );
         }
-    }
-
-    #[test]
-    fn help_overlay_mentions_resume_marker() {
-        let body = help_overlay_lines().join("\n");
-        assert!(
-            body.contains("resume here"),
-            "Space-marker feature should be documented in the help overlay"
-        );
     }
 
     #[test]
