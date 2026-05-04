@@ -2711,7 +2711,25 @@ fn ordered_float(f: f32) -> u32 {
 }
 
 fn stable_kitty_id() -> u32 {
-    let mixed = (std::process::id() as u64).wrapping_mul(0x9E37_79B1_185E_BCA1);
+    // PID alone collides on the kitty image-id namespace if two
+    // termpdf instances run in the same Ghostty/tmux session — the
+    // second instance's deletes (`a=d,d=R,x=lo,y=hi`) sweep the
+    // first's page bitmaps, producing missing-image placeholders +
+    // (per the 2026-05-04 incident) journald spam that crashes
+    // Ghostty. Mix in nanoseconds-since-epoch so two instances
+    // started in the same wall-clock second still get disjoint
+    // namespaces. The XOR-fold to u32 is non-cryptographic but the
+    // birthday-paradox collision space is ~2³² which is plenty for
+    // a "user has a few PDFs open" workload.
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let pid = std::process::id() as u64;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mixed = pid
+        .wrapping_mul(0x9E37_79B1_185E_BCA1)
+        .wrapping_add(nanos.wrapping_mul(0xBF58_476D_1CE4_E5B9));
     let id = ((mixed >> 32) ^ mixed) as u32;
     id.max(1)
 }
