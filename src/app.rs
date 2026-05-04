@@ -262,6 +262,14 @@ pub struct App<'doc> {
     /// crashing on the multi-MB transmit burst that a big jump (e.g.
     /// `100G` on a 600-page book) used to dump in a single frame.
     pub pending_cold_redraw: bool,
+    /// Timestamp of the last full re-transmit triggered by the
+    /// idle auto-refresh. Used together with `last_input_at` in the
+    /// run loop to invalidate the kitty registry's `transmitted_layout`
+    /// flags after a sustained idle gap so any silent terminal-side
+    /// image eviction (Ghostty `image-storage-limit` LRU sweep) self-
+    /// recovers without the user having to hit Ctrl-L. `None` until
+    /// the first auto-refresh fires.
+    pub last_auto_refresh_at: Option<std::time::Instant>,
     pub last_compose_key: Option<ComposeKey>,
     /// Inclusive `(lo, hi)` page range the previous compose's
     /// selection touched. Lets `try_selection_only_repaint` re-blit
@@ -555,6 +563,7 @@ impl<'doc> App<'doc> {
             input_burst_count: 0,
             last_scroll_applied_at: None,
             pending_cold_redraw: false,
+            last_auto_refresh_at: None,
             canvas_buf: None,
             bg_row_buf: Vec::new(),
             bg_row_key: None,

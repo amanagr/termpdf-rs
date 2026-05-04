@@ -570,6 +570,28 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
             // input yet" as idle, producing ~40% CPU and a flood of
             // kitty graphics escapes through tmux on open.)
             let action = idle_action(app.last_input_at.map(|t| t.elapsed()));
+
+            // Auto-refresh safety net for Ghostty's silent
+            // image-storage-limit eviction: after a sustained idle
+            // gap, invalidate every page's `transmitted_layout` flag
+            // so the next draw re-transmits cached payload bytes.
+            // Crossterm 0.29 has no APC parser (researched 2026-05-04
+            // — see incident_blank_pages_after_scroll.md) so we can't
+            // probe with `a=q,i=N` and read back OK/ENOENT; this is
+            // the next-best thing. Cost: one full re-transmit per
+            // 60 s of idle, fully hidden under the wait.
+            if should_auto_refresh(
+                app.last_input_at.map(|t| t.elapsed()),
+                app.last_auto_refresh_at.map(|t| t.elapsed()),
+            ) {
+                if let Some(kp) = app.kitty_pages.as_mut() {
+                    kp.invalidate_all_transmits();
+                    app.last_auto_refresh_at = Some(std::time::Instant::now());
+                    last_draw = std::time::Instant::now() - MIN_FRAME_INTERVAL;
+                    dirty = true;
+                }
+            }
+
             if action != IdleAction::Skip {
                 let _s = profile::span(profile::Phase::IdleWarm);
                 let _ = warm_one_idle(app, action);
@@ -596,6 +618,19 @@ pub(crate) const IDLE_TEXT_INDEX_MS: u64 = 2000;
 /// previously locked Ghostty up on big books.
 pub(crate) const MAX_WARMS_PER_IDLE: u32 = 2;
 
+/// Minimum idle gap before the auto-refresh safety net kicks in.
+/// Picked so quick page-flips don't trigger spurious re-transmits.
+/// 30 s is short enough that a blank page caused by Ghostty's silent
+/// `image-storage-limit` eviction won't persist for a full reading
+/// session, and long enough that an attentive reader staring at one
+/// page doesn't cost a full re-transmit cycle every few seconds.
+pub(crate) const AUTO_REFRESH_GUARD_MS: u64 = 30_000;
+/// Minimum gap between successive auto-refreshes during sustained
+/// idle. After the first refresh fires we wait this long before the
+/// next one — keeps the cost bounded if the user walks away from
+/// the laptop with the doc open.
+pub(crate) const AUTO_REFRESH_INTERVAL_MS: u64 = 60_000;
+
 /// What kind of idle-tick work the run-loop should consider doing,
 /// based on how long the user has been idle since their last input.
 /// Pulled out as a pure function so the tier policy is unit-testable.
@@ -608,6 +643,32 @@ pub(crate) enum IdleAction {
     BitmapWarm,
     /// Bitmap prefetch *and* doc-text indexing.
     BitmapWarmAndTextIndex,
+}
+
+/// Pure decision: should the run loop trigger an auto-refresh on this
+/// idle tick? Both inputs are `Option<Duration>` so the "never" case
+/// (user hasn't typed yet, or first auto-refresh) flows naturally.
+///
+/// Rules:
+///   - Never trigger if the user hasn't typed yet — no point refreshing
+///     a freshly-opened doc the user may not even be looking at.
+///   - Need at least `AUTO_REFRESH_GUARD_MS` of idle to consider it.
+///   - If a previous auto-refresh exists, additionally require
+///     `AUTO_REFRESH_INTERVAL_MS` since that one — bounds cost.
+pub(crate) fn should_auto_refresh(
+    last_input_elapsed: Option<Duration>,
+    last_refresh_elapsed: Option<Duration>,
+) -> bool {
+    let Some(input) = last_input_elapsed else {
+        return false;
+    };
+    if input < Duration::from_millis(AUTO_REFRESH_GUARD_MS) {
+        return false;
+    }
+    match last_refresh_elapsed {
+        Some(prev) => prev >= Duration::from_millis(AUTO_REFRESH_INTERVAL_MS),
+        None => true,
+    }
 }
 
 pub(crate) fn idle_action(last_input_elapsed: Option<Duration>) -> IdleAction {
@@ -981,6 +1042,56 @@ mod idle_tier_tests {
             idle_action(Some(Duration::from_secs(30))),
             IdleAction::BitmapWarmAndTextIndex
         );
+    }
+
+    #[test]
+    fn auto_refresh_held_off_until_first_input() {
+        // No input yet → never auto-refresh. The original idle-policy
+        // bug was that a fresh-open PDF triggered prefetch+transmit
+        // bursts before the user had touched the keyboard; the
+        // auto-refresh path inherits that guard.
+        assert!(!should_auto_refresh(None, None));
+        assert!(!should_auto_refresh(None, Some(Duration::from_secs(120))));
+    }
+
+    #[test]
+    fn auto_refresh_below_guard_does_not_fire() {
+        // Quick page-flip cadence (every few seconds) must not
+        // trigger auto-refresh. The guard window is what stops a
+        // continuous reading session from re-transmitting every page
+        // at every micro-pause.
+        assert!(!should_auto_refresh(
+            Some(Duration::from_millis(AUTO_REFRESH_GUARD_MS - 1)),
+            None,
+        ));
+    }
+
+    #[test]
+    fn auto_refresh_first_fire_at_guard_threshold() {
+        assert!(should_auto_refresh(
+            Some(Duration::from_millis(AUTO_REFRESH_GUARD_MS)),
+            None,
+        ));
+    }
+
+    #[test]
+    fn auto_refresh_throttled_after_recent_refresh() {
+        // After a refresh fires we wait `AUTO_REFRESH_INTERVAL_MS`
+        // before the next one, even if input has been silent the
+        // entire time. Bounds the cost of a walk-away-from-laptop
+        // session at one transmit cycle per minute.
+        assert!(!should_auto_refresh(
+            Some(Duration::from_secs(120)),
+            Some(Duration::from_millis(AUTO_REFRESH_INTERVAL_MS - 1)),
+        ));
+    }
+
+    #[test]
+    fn auto_refresh_fires_again_after_interval() {
+        assert!(should_auto_refresh(
+            Some(Duration::from_secs(120)),
+            Some(Duration::from_millis(AUTO_REFRESH_INTERVAL_MS)),
+        ));
     }
 
     // Compile-time consistency: bitmap tier must trigger before (or
