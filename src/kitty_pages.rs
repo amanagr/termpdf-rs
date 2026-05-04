@@ -413,6 +413,26 @@ impl KittyPageRegistry {
         }
     }
 
+    /// Force `is_fresh` to return false on every page in the registry.
+    /// Used by the manual Ctrl-L refresh path: if Ghostty's internal
+    /// image cache silently evicts one of our images (its
+    /// image-storage-limit got hit, or it ran some internal LRU we
+    /// can't observe), every placeholder cell pointing at that
+    /// image_id renders blank but our `is_fresh` still returns true.
+    /// Without an external nudge the page stays blank until the user
+    /// happens to do something that flips the page's revision (e.g.
+    /// click → selection signature → re-transmit). Cheaper than
+    /// triggering the zoom-out-zoom-in dance because no layout flip
+    /// is involved (no scroll jump, no compose-key invalidation).
+    /// Keeps the cached payload bytes — only the transmitted_layout
+    /// flag is cleared, so the next transmit re-uses the existing
+    /// PNG without re-encoding.
+    pub fn invalidate_all_transmits(&mut self) {
+        for entry in self.pages.values_mut() {
+            entry.transmitted_layout = None;
+        }
+    }
+
     /// True if the cached transmit for this page is fresh — caller
     /// can skip the transmit step. Read-only; pairs with
     /// `mark_transmitted` after the actual transmit string has been

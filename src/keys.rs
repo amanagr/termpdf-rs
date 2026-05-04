@@ -167,6 +167,20 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         KeyCode::Char('i') if ctrl => app.jump_forward(),
         KeyCode::Tab => app.jump_forward(),
         KeyCode::Char('h') if !ctrl => app.scroll_x_by(-SCROLL_LINE),
+        // Manual refresh: re-transmit every cached page on the next
+        // frame. Recovers from Ghostty's internal image-cache eviction
+        // (image-storage-limit, default 320 MB) which silently drops
+        // our images and leaves placeholder cells pointing at freed
+        // image_ids — the page renders blank until something forces a
+        // re-transmit. Same effect as the user's zoom-out + zoom-in
+        // workaround, without the layout/scroll churn.
+        KeyCode::Char('l') if ctrl => {
+            if let Some(kp) = app.kitty_pages.as_mut() {
+                kp.invalidate_all_transmits();
+            }
+            app.invalidate_compose();
+            app.status = "refreshed".into();
+        }
         KeyCode::Char('l') if !ctrl => app.scroll_x_by(SCROLL_LINE),
         KeyCode::Char('d') => app.toggle_dark(),
 
