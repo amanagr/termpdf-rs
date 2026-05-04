@@ -206,12 +206,22 @@ fn render_page_at_width_quality(
                 .min(RENDER_W_CAP.max(target))
         }
     };
+    // LCD subpixel text rendering does 3 samples per RGB pixel — visibly
+    // sharper on body copy but ~40-60% more pdfium time per page. Use it
+    // on the Sharp tier (idle background upgrade) where the user's hands
+    // aren't moving; the Fast tier (scroll keystroke) skips it so the
+    // cold-render cost during a held `j` doesn't drive a sustained CPU
+    // burn — the user reported >35 W draw and 75-90 °C with LCD on, and
+    // the Sharp upgrade lands the higher-quality bitmap within ~200 ms
+    // of the scroll settling. Override the Fast-tier default with
+    // `TERMPDF_FAST_LCD=1` for users who'd rather pay the heat cost.
+    let lcd = match quality {
+        RenderQuality::Fast => fast_lcd_enabled(),
+        RenderQuality::Sharp => true,
+    };
     let config = PdfRenderConfig::new()
         .set_target_width(render_w as i32)
-        // LCD-style text anti-aliasing — sharper edges than greyscale AA.
-        // Safe for terminal display because we never rotate or scale the
-        // image after pdfium produces it (terminal cell grid is rect-aligned).
-        .use_lcd_text_rendering(true);
+        .use_lcd_text_rendering(lcd);
     let bitmap = page.render_with_config(&config)?;
     let img = bitmap.as_image()?;
     if render_w == target {
@@ -219,4 +229,20 @@ fn render_page_at_width_quality(
     }
     let scaled_h = ((img.height() as u64 * target as u64) / render_w as u64) as u32;
     Ok(img.resize_exact(target, scaled_h.max(1), image::imageops::FilterType::Lanczos3))
+}
+
+/// Whether the Fast tier should request LCD subpixel text rendering.
+/// Default off — LCD is significant sustained CPU on big docs and the
+/// Sharp upgrade lands the higher-quality bitmap shortly after scroll
+/// settles. Set `TERMPDF_FAST_LCD=1` to force LCD on the Fast path
+/// (eats more CPU but each rendered page is sharper from the first
+/// frame).
+fn fast_lcd_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("TERMPDF_FAST_LCD")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
 }

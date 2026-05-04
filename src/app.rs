@@ -443,6 +443,22 @@ impl ResumeMarker {
 /// the first Space in a burst sets a resume marker.
 pub const RESUME_MARKER_REARM: Duration = Duration::from_secs(10);
 
+/// Inter-input gap (ms) below which we count consecutive presses as
+/// part of the same scroll burst. 250 ms — was 120 ms, which only
+/// caught held-key autorepeat (~30 ms) and missed normal-cadence
+/// tap-tap scrolling (200-300 ms). At the tap rate we'd pay a full
+/// pdfium cold-render + PNG encode + pty transmit per keystroke and
+/// the user reported sustained 35 W draw + 75-90 °C from this. 250 ms
+/// covers held-key, mouse-wheel spam (50-200 ms), and aggressive
+/// skim cadence; single isolated taps stay below the burst minimum
+/// so the page they revealed still renders on the keystroke.
+pub const RAPID_SCROLL_THRESHOLD_MS: u128 = 250;
+/// Minimum consecutive inputs in the burst window before we treat the
+/// scroll as rapid. =3 keeps a single isolated keypress from being
+/// flagged as a burst (it would defer the only page the user wanted
+/// to see).
+pub const RAPID_SCROLL_BURST_MIN: u32 = 3;
+
 impl<'doc> App<'doc> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -880,10 +896,11 @@ impl<'doc> App<'doc> {
     }
 
     /// True if the user is in a sustained input burst (autorepeat
-    /// j/k, mouse-wheel spam, held-arrow). Used by the kitty draw
-    /// path to defer cold-page transmits — each cold transmit ships
-    /// hundreds of KB of base64; shipping 5 of them per frame during
-    /// a rapid scroll cliffs us into 200 ms+ frames.
+    /// j/k, mouse-wheel spam, held-arrow, tap-tap reading). Used by
+    /// the kitty draw path to defer cold-page transmits — each cold
+    /// transmit ships hundreds of KB of base64 + a heavy pdfium render;
+    /// burning that per keystroke at 5 Hz drives sustained 35 W+ on a
+    /// laptop and the user reported 75-90 °C as a result.
     ///
     /// Two-condition check: most recent input was within
     /// `RAPID_SCROLL_THRESHOLD_MS` AND we've seen at least
@@ -891,9 +908,13 @@ impl<'doc> App<'doc> {
     /// The count guard prevents a single isolated keypress (count=1)
     /// from being flagged as a burst — that would defer the only
     /// page the user wanted to see.
+    ///
+    /// Threshold = 350 ms: covers normal reading-cadence tap-tap j
+    /// (~4-5 Hz) plus mouse-wheel spam (50-200 ms) and held-key
+    /// autorepeat (~30 ms). The earlier 120 ms ceiling missed normal
+    /// reading and let the cold-render cost burn through every
+    /// keystroke.
     pub fn is_rapid_scrolling(&self) -> bool {
-        const RAPID_SCROLL_THRESHOLD_MS: u128 = 120;
-        const RAPID_SCROLL_BURST_MIN: u32 = 3;
         let recent = match self.last_input_at {
             Some(t) => t.elapsed().as_millis() < RAPID_SCROLL_THRESHOLD_MS,
             None => false,
@@ -906,7 +927,6 @@ impl<'doc> App<'doc> {
     /// window; resets it otherwise so isolated keypresses don't get
     /// stuck in burst mode after a long pause.
     pub fn note_input(&mut self) {
-        const RAPID_SCROLL_THRESHOLD_MS: u128 = 120;
         let now = std::time::Instant::now();
         let in_window = self
             .last_input_at
@@ -2948,20 +2968,18 @@ mod tests {
     /// Pure version of `App::note_input` + `App::is_rapid_scrolling`
     /// for unit testing. Returns the new (last_input_at, burst_count,
     /// is_rapid) given the current state and the time of the new event.
-    /// Mirrors the constants in the real impl so a regression in one
+    /// Uses the real module-level constants so a regression in one
     /// fails the other.
     fn step_burst(
         prev_at: Option<std::time::Instant>,
         prev_count: u32,
         now: std::time::Instant,
     ) -> (std::time::Instant, u32, bool) {
-        const RAPID_SCROLL_THRESHOLD_MS: u128 = 120;
-        const RAPID_SCROLL_BURST_MIN: u32 = 3;
         let in_window = prev_at
-            .map(|t| (now - t).as_millis() < RAPID_SCROLL_THRESHOLD_MS)
+            .map(|t| (now - t).as_millis() < super::RAPID_SCROLL_THRESHOLD_MS)
             .unwrap_or(false);
         let count = if in_window { prev_count.saturating_add(1) } else { 1 };
-        let rapid = count >= RAPID_SCROLL_BURST_MIN;
+        let rapid = count >= super::RAPID_SCROLL_BURST_MIN;
         (now, count, rapid)
     }
 
