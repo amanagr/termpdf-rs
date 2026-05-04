@@ -268,18 +268,52 @@ impl KittyPageRegistry {
         }
         let victim_set: std::collections::HashSet<usize> =
             victims.iter().copied().collect();
+        // Collect all freed image_ids first so we can coalesce
+        // contiguous runs into a single `d=R` range delete (kitty
+        // protocol v0.33.0+). Forward scroll evicts oldest pages
+        // first; their image_ids — assigned `seed + page_idx` at
+        // first reference — naturally cluster, so most evictions
+        // collapse to one range escape instead of N per-id ones.
+        let mut freed_ids: Vec<u32> = Vec::with_capacity(victims.len() * 2);
         for v in &victims {
             if let Some(entry) = self.pages.remove(v) {
-                self.queue_delete(entry.image_id);
+                freed_ids.push(entry.image_id);
             }
             if let Some(entry) = self.overlays.remove(v) {
-                self.queue_delete(entry.image_id);
+                freed_ids.push(entry.image_id);
             }
         }
         self.lru.retain(|p| !victim_set.contains(p));
+        self.queue_deletes(&mut freed_ids);
     }
 
-    fn queue_delete(&mut self, id: u32) {
+    /// Append the most efficient delete sequence for a set of freed
+    /// image_ids. Sorts the input in place, walks contiguous runs,
+    /// and emits one `a=d,d=R,x=lo,y=hi` per run (≥2 IDs) or one
+    /// `a=d,d=I,i=ID` per singleton. For a typical 3-page forward-
+    /// scroll eviction with consecutive ids this is one APC instead
+    /// of three.
+    fn queue_deletes(&mut self, ids: &mut [u32]) {
+        if ids.is_empty() {
+            return;
+        }
+        ids.sort_unstable();
+        let mut i = 0;
+        while i < ids.len() {
+            let mut j = i;
+            while j + 1 < ids.len() && ids[j + 1] == ids[j] + 1 {
+                j += 1;
+            }
+            if j == i {
+                self.queue_delete_single(ids[i]);
+            } else {
+                self.queue_delete_range(ids[i], ids[j]);
+            }
+            i = j + 1;
+        }
+    }
+
+    fn queue_delete_single(&mut self, id: u32) {
         let (start, escape, end) = tmux_wrap(self.is_tmux);
         // `a=d` = delete; `d=I` = by image id; `q=2` = suppress reply.
         // Not freeing placement state explicitly — placements that
@@ -289,6 +323,19 @@ impl KittyPageRegistry {
         write!(
             self.pending_deletes,
             "{start}{escape}_Ga=d,d=I,i={id},q=2;{escape}\\{end}"
+        )
+        .unwrap();
+    }
+
+    fn queue_delete_range(&mut self, lo: u32, hi: u32) {
+        let (start, escape, end) = tmux_wrap(self.is_tmux);
+        // `d=R` = range delete by image id (kitty v0.33.0+).
+        // x = lower bound inclusive, y = upper bound inclusive.
+        // Also frees the image data (uppercase R = free, lowercase r
+        // = placement-only — we want both).
+        write!(
+            self.pending_deletes,
+            "{start}{escape}_Ga=d,d=R,x={lo},y={hi},q=2;{escape}\\{end}"
         )
         .unwrap();
     }
@@ -655,7 +702,7 @@ impl KittyPageRegistry {
     /// selection moves off this page or is cleared.
     pub fn overlay_drop(&mut self, page_idx: usize) {
         if let Some(entry) = self.overlays.remove(&page_idx) {
-            self.queue_delete(entry.image_id);
+            self.queue_delete_single(entry.image_id);
         }
     }
 
@@ -1349,10 +1396,22 @@ mod tests {
         }
         r.evict_to_budget(&[]);
         assert_eq!(r.pages.len(), MAX_CACHED_PAGES);
-        // Pending deletes should reference the 8 evicted ids.
+        // Pending deletes should free the 8 evicted ids. With the
+        // d=R range-coalesce, contiguous-ID evictions collapse to one
+        // range escape; here all 8 victims (pages 0..8 with IDs
+        // 1001..1009) are contiguous so we expect exactly one
+        // `_Ga=d,d=R,...` and zero per-id escapes.
         let deletes = r.take_pending_deletes().expect("evictions queued deletes");
-        // 8 eviction events, each emits one `_Ga=d,d=I,i=...` blob.
-        assert_eq!(deletes.matches("_Ga=d,d=I,i=").count(), 8);
+        assert_eq!(
+            deletes.matches("_Ga=d,d=R,").count(),
+            1,
+            "8 contiguous-id evictions must collapse to one range escape; got {deletes:?}"
+        );
+        assert_eq!(
+            deletes.matches("_Ga=d,d=I,").count(),
+            0,
+            "no per-id escapes expected when evictions are contiguous"
+        );
     }
 
     #[test]
@@ -1611,6 +1670,39 @@ mod tests {
         assert!(s.contains("\x1b\x1b_G"), "inner ESCs must be doubled inside tmux passthrough");
     }
 
+    /// queue_deletes must collapse contiguous-id runs into one
+    /// `d=R` and leave singletons as `d=I`. The mixed case (one
+    /// range + one isolated id) is the realistic situation when
+    /// some evictions are forward-scroll consecutive and one or
+    /// two are random scroll-back jumps.
+    #[test]
+    fn queue_deletes_coalesces_runs_and_keeps_singletons() {
+        let mut r = KittyPageRegistry::new(false, 0);
+        let mut ids = vec![5u32, 7, 8, 9, 12];
+        r.queue_deletes(&mut ids);
+        let s = r.take_pending_deletes().expect("queued");
+        // Expect: d=I,i=5 + d=R,x=7,y=9 + d=I,i=12.
+        assert_eq!(s.matches("_Ga=d,d=R,").count(), 1, "got {s:?}");
+        assert_eq!(s.matches("_Ga=d,d=I,").count(), 2, "got {s:?}");
+        assert!(s.contains("d=I,i=5,"), "singleton 5 must be d=I; got {s:?}");
+        assert!(s.contains("d=R,x=7,y=9,"), "run 7..9 must be d=R; got {s:?}");
+        assert!(s.contains("d=I,i=12,"), "singleton 12 must be d=I; got {s:?}");
+    }
+
+    #[test]
+    fn queue_deletes_handles_unsorted_input() {
+        let mut r = KittyPageRegistry::new(false, 0);
+        // Out-of-order; queue_deletes sorts internally.
+        let mut ids = vec![20u32, 10, 11, 22, 21];
+        r.queue_deletes(&mut ids);
+        let s = r.take_pending_deletes().expect("queued");
+        // Sorted: 10,11, 20,21,22 → two ranges, no singletons.
+        assert_eq!(s.matches("_Ga=d,d=R,").count(), 2);
+        assert_eq!(s.matches("_Ga=d,d=I,").count(), 0);
+        assert!(s.contains("d=R,x=10,y=11,"));
+        assert!(s.contains("d=R,x=20,y=22,"));
+    }
+
     /// Evicting a page that owns both a page image AND an overlay
     /// image must queue deletes for BOTH ids — otherwise an overlay
     /// bitmap could outlive its page on the terminal side and leak.
@@ -1627,8 +1719,20 @@ mod tests {
         }
         r.evict_to_budget(&[]);
         let deletes = r.take_pending_deletes().expect("evictions queue deletes");
-        // 4 evicted pages × 2 deletes each (page id + overlay id) = 8.
-        assert_eq!(deletes.matches("_Ga=d,d=I,i=").count(), 8);
+        // 4 evicted pages → 8 freed image_ids: page IDs (4 contiguous
+        // around id_base+1) and overlay IDs (4 contiguous starting at
+        // id_base+OVERLAY_ID_OFFSET). With d=R coalescing this is two
+        // separate ranges (page band and overlay band are far apart).
+        assert_eq!(
+            deletes.matches("_Ga=d,d=R,").count(),
+            2,
+            "page-id band and overlay-id band → 2 ranges; got {deletes:?}"
+        );
+        assert_eq!(
+            deletes.matches("_Ga=d,d=I,").count(),
+            0,
+            "no per-id escapes when all evictions are contiguous"
+        );
     }
 
     /// Regression: a placeholder cell from the prior frame that
