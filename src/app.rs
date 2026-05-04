@@ -1577,14 +1577,37 @@ impl<'doc> App<'doc> {
                 self.status = format!("→ page {}", p + 1);
             }
             LinkAction::Url(url) => {
-                // Spawn xdg-open detached so the binary doesn't block
-                // on the browser launch. We don't wait for status —
-                // success vs failure is tedious to report and the
-                // user will notice if their browser doesn't open.
-                let r = std::process::Command::new("xdg-open").arg(&url).spawn();
-                match r {
-                    Ok(_) => self.status = format!("opened: {url}"),
-                    Err(e) => self.status = format!("xdg-open failed for {url}: {e}"),
+                // PDF link annotations are attacker-controlled. Two
+                // hardenings before handing the URL to xdg-open:
+                //
+                //   1. Scheme allow-list. file://, javascript:, ssh://,
+                //      tel:, etc. all dispatch through xdg-open's MIME
+                //      handlers — file:// can leak/exfiltrate the
+                //      user's filesystem, javascript: gets handed to
+                //      a browser as code. Only http(s)/mailto are
+                //      reasonable for a PDF reading workflow.
+                //   2. `--` argv separator. xdg-open treats argv
+                //      starting with `-` as flags ("--version",
+                //      "--help"), so a malicious link target like
+                //      "--version" would do something unexpected
+                //      instead of erroring. The `--` ensures the URL
+                //      is interpreted as a positional arg.
+                if !is_safe_external_url(&url) {
+                    self.status = format!(
+                        "blocked link with unsafe scheme: {}",
+                        truncate_for_status(&url, 80)
+                    );
+                } else {
+                    let r = std::process::Command::new("xdg-open")
+                        .arg("--")
+                        .arg(&url)
+                        .spawn();
+                    match r {
+                        Ok(_) => self.status = format!("opened: {url}"),
+                        Err(e) => {
+                            self.status = format!("xdg-open failed for {url}: {e}")
+                        }
+                    }
                 }
             }
             LinkAction::Other => {
@@ -2627,6 +2650,34 @@ pub fn next_section_target(
     }
 }
 
+/// True iff `url` uses a scheme we're willing to dispatch via
+/// xdg-open. PDF link annotations are attacker-controlled, so the
+/// allow-list is intentionally short: http(s) for browsers,
+/// mailto: for mail clients. Everything else (file://, javascript:,
+/// data:, ssh://, tel:, intent://, etc.) gets rejected — they're
+/// each their own exfiltration / RCE vector through xdg-open's
+/// MIME-handler dispatch.
+pub(crate) fn is_safe_external_url(url: &str) -> bool {
+    let lower_prefix = |s: &str| {
+        url.len() >= s.len()
+            && url.as_bytes()[..s.len()].eq_ignore_ascii_case(s.as_bytes())
+    };
+    lower_prefix("http://") || lower_prefix("https://") || lower_prefix("mailto:")
+}
+
+/// Trim PDF-derived strings before they hit the status bar. ratatui's
+/// Span filters control chars at render time, but a 64 KiB title
+/// would still wrap the bar. Keep status messages tight; if the URL
+/// is overlong, show a prefix + "…".
+pub(crate) fn truncate_for_status(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 /// Compact byte-count formatter for `:info`. Picks the largest unit
 /// that keeps the number ≤ 1024 and prints to 1 decimal (omitted for
 /// bytes). 1234567 → "1.2 MB"; 999 → "999 B".
@@ -2782,6 +2833,45 @@ pub fn nudge_rect(sel: Rect01, dx: f32, dy: f32, resize: bool) -> Rect01 {
 mod tests {
     use super::*;
     use crate::pdf::PageMetrics;
+
+    /// PDF link annotations are attacker-controlled; only http(s) and
+    /// mailto: are safe to dispatch through xdg-open. file://,
+    /// javascript:, data:, ssh://, tel: each become exfiltration or
+    /// RCE vectors via xdg-open's MIME-handler dispatch.
+    #[test]
+    fn url_scheme_allowlist_rejects_dangerous_schemes() {
+        assert!(is_safe_external_url("http://example.com"));
+        assert!(is_safe_external_url("https://example.com/path?q=1"));
+        assert!(is_safe_external_url("HTTPS://Example.COM"));
+        assert!(is_safe_external_url("mailto:user@example.com"));
+        assert!(is_safe_external_url("MailTo:user@example.com"));
+
+        assert!(!is_safe_external_url("file:///etc/passwd"));
+        assert!(!is_safe_external_url("javascript:alert(1)"));
+        assert!(!is_safe_external_url("data:text/html,<script>"));
+        assert!(!is_safe_external_url("ssh://host"));
+        assert!(!is_safe_external_url("tel:+15551234"));
+        assert!(!is_safe_external_url("intent://app"));
+        // Defenses against argv flag-confusion at xdg-open: the URL
+        // path also gets `--` argv-separated, but reject obvious
+        // flag-shaped things at the gate too.
+        assert!(!is_safe_external_url("--version"));
+        assert!(!is_safe_external_url("-h"));
+        assert!(!is_safe_external_url(""));
+        // Almost-http: substring match must be anchored at the start.
+        assert!(!is_safe_external_url(" https://example.com"));
+        assert!(!is_safe_external_url("xhttp://example.com"));
+    }
+
+    #[test]
+    fn truncate_for_status_drops_excess_with_ellipsis() {
+        assert_eq!(truncate_for_status("short", 10), "short");
+        assert_eq!(truncate_for_status("exactly_10", 10), "exactly_10");
+        assert_eq!(truncate_for_status("0123456789abc", 10), "012345678…");
+        // Multi-byte chars count as one each, not by byte length.
+        let s = "αβγδεζηθικλμνξ";
+        assert_eq!(truncate_for_status(s, 5).chars().count(), 5);
+    }
 
     fn metrics(n: usize) -> Vec<PageMetrics> {
         // 100×200pt portrait pages.
