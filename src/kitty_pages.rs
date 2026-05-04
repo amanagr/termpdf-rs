@@ -164,11 +164,19 @@ pub struct KittyPageRegistry {
     /// to the back; eviction pops from the front. Entries here mirror
     /// keys in `pages`.
     lru: VecDeque<usize>,
-    /// Kitty `a=d,d=I,i=ID` delete escapes accumulated during eviction.
-    /// Caller drains via `take_pending_deletes()` and prepends to the
-    /// next transmit (or a synthetic one) so the terminal frees its
-    /// decoded RGBA copy of the evicted image.
-    pending_deletes: String,
+    /// Image IDs accumulated for deletion during eviction. Caller
+    /// drains via `take_pending_deletes()` (which serializes the
+    /// vec into a kitty APC blob) and prepends to the next transmit
+    /// so the terminal frees its decoded RGBA copy.
+    ///
+    /// Stored as a Vec instead of the pre-formatted APC string so
+    /// `mark_transmitted` can drop the entry for any page that gets
+    /// resurrected (re-rendered + re-marked) before the queued
+    /// delete has ridden out. Without that scrub the resurrection
+    /// can be clobbered when the delete finally rides on a
+    /// different page's transmit — caught by the registry property
+    /// tests at I4 ("no live image_id is queued for delete").
+    pending_deletes: Vec<u32>,
     /// Scratch buffers reused across `place_page` calls. Memoizes the
     /// per-row diacritic string (varies by viewport `cols` only) and
     /// the restore-cursor escape (varies by `area.width`/`area.height`
@@ -226,7 +234,7 @@ impl KittyPageRegistry {
             pages: HashMap::new(),
             overlays: HashMap::new(),
             lru: VecDeque::new(),
-            pending_deletes: String::new(),
+            pending_deletes: Vec::new(),
             place_scratch: PlaceScratch::default(),
         }
     }
@@ -249,6 +257,17 @@ impl KittyPageRegistry {
         self.overlays.clear();
         self.lru.clear();
         self.pending_deletes.clear();
+    }
+
+    /// Drop any queued delete for `image_id` from `pending_deletes`.
+    /// Called from `mark_transmitted` so a resurrected page (one that
+    /// was evicted, then re-rendered + re-marked before the queued
+    /// delete had ridden out) doesn't get clobbered by its own stale
+    /// delete on the next ride-along. The cost is O(n) on the queued
+    /// vec, but `n <= MAX_CACHED_PAGES + a couple of overlays` so the
+    /// scan is trivial.
+    fn drop_pending_delete(&mut self, image_id: u32) {
+        self.pending_deletes.retain(|&id| id != image_id);
     }
 
     /// Move `page_idx` to the MRU end of the LRU list. Idempotent.
@@ -311,87 +330,49 @@ impl KittyPageRegistry {
             }
         }
         self.lru.retain(|p| !victim_set.contains(p));
-        self.queue_deletes(&mut freed_ids);
+        self.queue_deletes(&freed_ids);
     }
 
-    /// Append the most efficient delete sequence for a set of freed
-    /// image_ids. Sorts the input in place, walks contiguous runs,
-    /// and emits one `a=d,d=R,x=lo,y=hi` per run (≥2 IDs) or one
-    /// `a=d,d=I,i=ID` per singleton. For a typical 3-page forward-
-    /// scroll eviction with consecutive ids this is one APC instead
-    /// of three.
-    fn queue_deletes(&mut self, ids: &mut [u32]) {
-        if ids.is_empty() {
-            return;
-        }
-        ids.sort_unstable();
-        let mut i = 0;
-        while i < ids.len() {
-            let mut j = i;
-            while j + 1 < ids.len() && ids[j + 1] == ids[j] + 1 {
-                j += 1;
-            }
-            if j == i {
-                self.queue_delete_single(ids[i]);
-            } else {
-                self.queue_delete_range(ids[i], ids[j]);
-            }
-            i = j + 1;
-        }
-    }
-
-    fn queue_delete_single(&mut self, id: u32) {
-        let (start, escape, end) = tmux_wrap(self.is_tmux);
-        // `a=d` = delete; `d=I` = by image id; `q=2` = suppress reply.
-        // Not freeing placement state explicitly — placements that
-        // referenced this id will simply render nothing once the
-        // image is gone, which is fine because we only evict
-        // non-visible (= unreferenced) pages.
-        write!(
-            self.pending_deletes,
-            "{start}{escape}_Ga=d,d=I,i={id},q=2;{escape}\\{end}"
-        )
-        .unwrap();
-    }
-
-    fn queue_delete_range(&mut self, lo: u32, hi: u32) {
-        let (start, escape, end) = tmux_wrap(self.is_tmux);
-        // `d=R` = range delete by image id (kitty v0.33.0+).
-        // x = lower bound inclusive, y = upper bound inclusive.
-        // Also frees the image data (uppercase R = free, lowercase r
-        // = placement-only — we want both).
-        write!(
-            self.pending_deletes,
-            "{start}{escape}_Ga=d,d=R,x={lo},y={hi},q=2;{escape}\\{end}"
-        )
-        .unwrap();
+    /// Append a set of freed image_ids to the pending-deletes queue.
+    /// Stores raw ids; the run-length / range coalesce happens at
+    /// `take_pending_deletes` time so a resurrection between push
+    /// and take can scrub a single id out of the queue without
+    /// having to walk a serialized blob.
+    fn queue_deletes(&mut self, ids: &[u32]) {
+        self.pending_deletes.extend_from_slice(ids);
     }
 
     /// Drain accumulated delete escapes (from prior evictions). The
     /// caller should prepend the result to its next transmit string
     /// so the terminal processes the deletes alongside the new frame.
+    /// Serializes the queued ids into kitty `a=d,d=R,x=LO,y=HI` (run)
+    /// + `a=d,d=I,i=ID` (singleton) APCs — one APC per contiguous
+    /// id run for byte efficiency on typical forward-scroll evictions.
     pub fn take_pending_deletes(&mut self) -> Option<String> {
         if self.pending_deletes.is_empty() {
-            None
-        } else {
-            Some(std::mem::take(&mut self.pending_deletes))
+            return None;
         }
+        let mut ids = std::mem::take(&mut self.pending_deletes);
+        Some(serialize_pending_deletes(&mut ids, self.is_tmux))
     }
 
     /// Push a delete-escape blob back onto the pending queue. Used
     /// when the caller drained but couldn't find a transmit to ride
     /// it in on; the next frame with any transmit will pick it up.
+    /// Re-parses the ids out of the blob — `take_pending_deletes`'s
+    /// shape inversion. The parse is exact for the formats we emit
+    /// (`d=I,i=ID` and `d=R,x=LO,y=HI`); anything else is silently
+    /// dropped (defensive — should never happen in practice).
     pub fn put_back_pending_deletes(&mut self, s: String) {
-        if self.pending_deletes.is_empty() {
-            self.pending_deletes = s;
-        } else {
-            // Existing buffer was modified between take/put_back —
-            // shouldn't happen in our single-threaded draw loop, but
-            // handle it by prepending so order is preserved.
-            let mut combined = s;
-            combined.push_str(&self.pending_deletes);
-            self.pending_deletes = combined;
+        let ids = parse_pending_delete_blob(&s);
+        if ids.is_empty() {
+            return;
         }
+        // Prepend so the originally-queued ids retain their order
+        // ahead of any new ones queued since.
+        let mut combined = ids;
+        combined.append(&mut self.pending_deletes);
+        self.pending_deletes = combined;
     }
 
     fn id_for(&self, page_idx: usize) -> u32 {
@@ -479,6 +460,14 @@ impl KittyPageRegistry {
         pixel_h: u32,
     ) {
         let id = self.id_for(page_idx);
+        // If this page was just evicted (its image_id is queued for
+        // delete) and we're now resurrecting it via a fresh transmit,
+        // the queued delete is stale: leaving it in the queue would
+        // clobber the resurrection on the next ride-along that picks
+        // up this delete alongside some OTHER page's transmit. Drop
+        // the stale delete now. Caught by the registry property
+        // tests at I4.
+        self.drop_pending_delete(id);
         let entry = self.pages.entry(page_idx).or_insert(PageEntry {
             image_id: id,
             transmitted_layout: None,
@@ -768,7 +757,7 @@ impl KittyPageRegistry {
     /// selection moves off this page or is cleared.
     pub fn overlay_drop(&mut self, page_idx: usize) {
         if let Some(entry) = self.overlays.remove(&page_idx) {
-            self.queue_delete_single(entry.image_id);
+            self.pending_deletes.push(entry.image_id);
         }
     }
 
@@ -1332,6 +1321,110 @@ fn tmux_wrap(is_tmux: bool) -> (&'static str, &'static str, &'static str) {
     } else {
         ("", "\x1b", "")
     }
+}
+
+/// Serialize a vec of image_ids into kitty `a=d,d=R,x=LO,y=HI` (range)
+/// + `a=d,d=I,i=ID` (singleton) APCs, picking whichever form is more
+/// byte-efficient for each contiguous run of ids. Sorts the input in
+/// place. Empty input returns an empty String.
+///
+/// Free function instead of a method on `KittyPageRegistry` so
+/// `take_pending_deletes` can move-out the vec and serialize it
+/// without a second mutable borrow.
+fn serialize_pending_deletes(ids: &mut Vec<u32>, is_tmux: bool) -> String {
+    if ids.is_empty() {
+        return String::new();
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    let (start, escape, end) = tmux_wrap(is_tmux);
+    let mut out = String::with_capacity(ids.len() * 24);
+    let mut i = 0;
+    while i < ids.len() {
+        let mut j = i;
+        while j + 1 < ids.len() && ids[j + 1] == ids[j] + 1 {
+            j += 1;
+        }
+        if j == i {
+            // Singleton: `a=d,d=I,i=ID,q=2`. q=2 suppresses the
+            // OK reply since we never read responses anyway.
+            write!(
+                out,
+                "{start}{escape}_Ga=d,d=I,i={id},q=2;{escape}\\{end}",
+                id = ids[i]
+            )
+            .unwrap();
+        } else {
+            // Range (kitty v0.33.0+): `a=d,d=R,x=LO,y=HI`. Capital
+            // R also frees the image data (lowercase r is placement-
+            // only — we want both).
+            write!(
+                out,
+                "{start}{escape}_Ga=d,d=R,x={lo},y={hi},q=2;{escape}\\{end}",
+                lo = ids[i],
+                hi = ids[j]
+            )
+            .unwrap();
+        }
+        i = j + 1;
+    }
+    out
+}
+
+/// Inverse of `serialize_pending_deletes`: parse a serialized
+/// pending-deletes blob back into the vec of ids it represents.
+/// Used by `put_back_pending_deletes` when the caller drained but
+/// couldn't ride the deletes on a transmit this frame. Tolerant of
+/// the tmux-wrapped and bare forms; ignores anything that doesn't
+/// match `d=I,i=ID` or `d=R,x=LO,y=HI`.
+fn parse_pending_delete_blob(blob: &str) -> Vec<u32> {
+    let bytes = blob.as_bytes();
+    let mut ids = Vec::new();
+    let mut i = 0;
+    while i + 6 < bytes.len() {
+        if &bytes[i..i + 6] == b"d=I,i=" {
+            let start = i + 6;
+            let mut end = start;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if let Ok(n) = std::str::from_utf8(&bytes[start..end])
+                .unwrap_or("")
+                .parse::<u32>()
+            {
+                ids.push(n);
+            }
+            i = end;
+        } else if &bytes[i..i + 6] == b"d=R,x=" {
+            let lo_start = i + 6;
+            let mut lo_end = lo_start;
+            while lo_end < bytes.len() && bytes[lo_end].is_ascii_digit() {
+                lo_end += 1;
+            }
+            if lo_end + 3 < bytes.len() && &bytes[lo_end..lo_end + 3] == b",y=" {
+                let hi_start = lo_end + 3;
+                let mut hi_end = hi_start;
+                while hi_end < bytes.len() && bytes[hi_end].is_ascii_digit() {
+                    hi_end += 1;
+                }
+                let lo = std::str::from_utf8(&bytes[lo_start..lo_end])
+                    .unwrap_or("")
+                    .parse::<u32>();
+                let hi = std::str::from_utf8(&bytes[hi_start..hi_end])
+                    .unwrap_or("")
+                    .parse::<u32>();
+                if let (Ok(l), Ok(h)) = (lo, hi) {
+                    ids.extend(l..=h);
+                }
+                i = hi_end;
+            } else {
+                i += 6;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    ids
 }
 
 #[inline]
@@ -2198,8 +2291,8 @@ mod tests {
     #[test]
     fn queue_deletes_coalesces_runs_and_keeps_singletons() {
         let mut r = KittyPageRegistry::new(false, 0);
-        let mut ids = vec![5u32, 7, 8, 9, 12];
-        r.queue_deletes(&mut ids);
+        let ids = vec![5u32, 7, 8, 9, 12];
+        r.queue_deletes(&ids);
         let s = r.take_pending_deletes().expect("queued");
         // Expect: d=I,i=5 + d=R,x=7,y=9 + d=I,i=12.
         assert_eq!(s.matches("_Ga=d,d=R,").count(), 1, "got {s:?}");
@@ -2218,15 +2311,49 @@ mod tests {
     #[test]
     fn queue_deletes_handles_unsorted_input() {
         let mut r = KittyPageRegistry::new(false, 0);
-        // Out-of-order; queue_deletes sorts internally.
-        let mut ids = vec![20u32, 10, 11, 22, 21];
-        r.queue_deletes(&mut ids);
+        // Out-of-order; serialize_pending_deletes sorts internally
+        // at take time.
+        let ids = vec![20u32, 10, 11, 22, 21];
+        r.queue_deletes(&ids);
         let s = r.take_pending_deletes().expect("queued");
         // Sorted: 10,11, 20,21,22 → two ranges, no singletons.
         assert_eq!(s.matches("_Ga=d,d=R,").count(), 2);
         assert_eq!(s.matches("_Ga=d,d=I,").count(), 0);
         assert!(s.contains("d=R,x=10,y=11,"));
         assert!(s.contains("d=R,x=20,y=22,"));
+    }
+
+    /// Property: a page that's been evicted (id queued for delete)
+    /// then resurrected via `mark_transmitted` MUST NOT have its id
+    /// in `pending_deletes` after the mark — otherwise the next
+    /// ride-along would clobber the resurrection. This is the
+    /// concrete reproduction of invariant I4 from the registry
+    /// proptest, kept here as a deterministic regression on the
+    /// resurrection-clobber bug.
+    #[test]
+    fn mark_transmitted_drops_stale_pending_delete() {
+        let mut r = KittyPageRegistry::new(false, 1000);
+        let layout = LayoutKey {
+            fit_width_px: 64,
+            dark: false,
+        };
+        // Fill past the cap so eviction triggers.
+        for i in 0..(MAX_CACHED_PAGES + 1) {
+            r.mark_transmitted(i, layout, 0, 16, 16);
+        }
+        r.evict_to_budget(&[]);
+        // Page 0 (lru-front) should now be queued for delete.
+        let evicted_id = 1001u32; // id_base(1000) + 1 + page_idx(0)
+        assert!(
+            r.pending_deletes.contains(&evicted_id),
+            "setup precondition: page 0's id must be queued for delete after evict_to_budget"
+        );
+        // Resurrect page 0 via a fresh mark_transmitted.
+        r.mark_transmitted(0, layout, 1, 16, 16);
+        assert!(
+            !r.pending_deletes.contains(&evicted_id),
+            "I4: resurrected image_id must be removed from pending_deletes"
+        );
     }
 
     /// Evicting a page that owns both a page image AND an overlay
@@ -2736,5 +2863,170 @@ mod tests {
             !cell.skip,
             "placement col-0 must have skip=false so ratatui emits it; was skip=true → blank-page bug",
         );
+    }
+}
+
+/// Property-based tests for the registry's state machine.
+///
+/// Drives randomized sequences of `mark_transmitted` / `evict_to_budget`
+/// / `invalidate_*` ops and asserts five invariants after each step:
+///
+///   I1. **LRU == pages keys** — every page in the cache appears in the
+///       LRU exactly once, and vice versa. Drift here is the upstream
+///       cause of "we evict an image_id whose entry was already gone."
+///   I2. **Cache cap respected** — `pages.len() <= MAX_CACHED_PAGES + |pinned|`
+///       after any `evict_to_budget(pinned)` call. Pinned pages never
+///       evict, so the over-cap only equals the pin count.
+///   I3. **Fresh after mark** — `is_fresh(...)` returns true immediately
+///       after `mark_transmitted` with the same parameters. The
+///       blank-page bug class typically violates this when an
+///       intermediate evict drops the entry between mark and check.
+///   I4. **No live image_id is queued for delete** — every `i={N},`
+///       token in `pending_deletes` references a page that has been
+///       removed from `pages`. A live page whose id is queued would
+///       blank on the next transmit.
+///   I5. **LRU has no duplicates** — proxy for the touch/remove pairs
+///       in `evict_to_budget` keeping the deque a true permutation.
+///
+/// Direct access to private fields (`pages`, `lru`, `pending_deletes`)
+/// is the reason this test sits in the same module instead of a
+/// `tests/` integration test — adding `pub` test-only accessors would
+/// pollute the production API surface.
+#[cfg(test)]
+mod registry_proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    const N_PAGES: usize = 12; // bounded universe forces collisions
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        MarkTransmitted {
+            page_idx: usize,
+            w: u32,
+            h: u32,
+            layout: LayoutKey,
+            revision: u64,
+        },
+        EvictToBudget {
+            pinned: Vec<usize>,
+        },
+        Invalidate {
+            page_idx: usize,
+        },
+        InvalidateAll,
+        TakeDeletes,
+    }
+
+    fn layout_strategy() -> impl Strategy<Value = LayoutKey> {
+        (200u32..=2000, any::<bool>()).prop_map(|(w, dark)| LayoutKey {
+            fit_width_px: w,
+            dark,
+        })
+    }
+
+    fn op_strategy() -> impl Strategy<Value = Op> {
+        // Listed simplest-first so proptest's shrinker prefers the
+        // cheap ops when reducing a failing counterexample. Weights
+        // bias the distribution toward MarkTransmitted (the only op
+        // that adds entries) so eviction has work to do.
+        prop_oneof![
+            1 => Just(Op::InvalidateAll),
+            1 => Just(Op::TakeDeletes),
+            2 => (0..N_PAGES).prop_map(|p| Op::Invalidate { page_idx: p }),
+            3 => prop::collection::vec(0..N_PAGES, 0..=4)
+                    .prop_map(|pinned| Op::EvictToBudget { pinned }),
+            5 => (
+                    0..N_PAGES,
+                    64u32..=4096,
+                    64u32..=4096,
+                    layout_strategy(),
+                    0u64..16,
+                )
+                    .prop_map(|(p, w, h, l, r)| Op::MarkTransmitted {
+                        page_idx: p,
+                        w,
+                        h,
+                        layout: l,
+                        revision: r,
+                    }),
+        ]
+    }
+
+    fn check_invariants(r: &KittyPageRegistry) -> Result<(), TestCaseError> {
+        // I1 / I5: LRU is a permutation of pages keys.
+        let mut keys: Vec<usize> = r.pages.keys().copied().collect();
+        let mut lru: Vec<usize> = r.lru.iter().copied().collect();
+        let lru_len = lru.len();
+        keys.sort_unstable();
+        lru.sort_unstable();
+        prop_assert_eq!(
+            keys.clone(),
+            lru.clone(),
+            "I1 violated: LRU and pages map disagree on membership"
+        );
+        let lru_set: std::collections::HashSet<usize> = lru.into_iter().collect();
+        prop_assert_eq!(
+            lru_set.len(),
+            lru_len,
+            "I5 violated: LRU has duplicate entries"
+        );
+
+        // I4: no live image_id is queued for delete. After the
+        // String → Vec<u32> refactor (commit landing alongside this
+        // test), the queue is the authoritative ids list directly.
+        for entry in r.pages.values() {
+            prop_assert!(
+                !r.pending_deletes.contains(&entry.image_id),
+                "I4 violated: image_id {} is queued for delete but page is still live",
+                entry.image_id
+            );
+        }
+        Ok(())
+    }
+
+    proptest! {
+        // 64 cases × ~30 ops each = ~2000 op replays per run. Surfaces
+        // LRU / cache / pending_deletes drift in well under a second.
+        // Bump via PROPTEST_CASES env var when paranoid.
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            .. ProptestConfig::default()
+        })]
+
+        #[test]
+        fn registry_invariants_hold_under_random_ops(
+            ops in prop::collection::vec(op_strategy(), 1..=30)
+        ) {
+            let mut r = KittyPageRegistry::new(false, 1000);
+            for op in ops {
+                match op {
+                    Op::MarkTransmitted { page_idx, w, h, layout, revision } => {
+                        r.mark_transmitted(page_idx, layout, revision, w, h);
+                        // I3: fresh-after-mark.
+                        prop_assert!(
+                            r.is_fresh(page_idx, layout, revision, w, h),
+                            "I3 violated: !is_fresh immediately after mark_transmitted"
+                        );
+                    }
+                    Op::EvictToBudget { ref pinned } => {
+                        r.evict_to_budget(pinned);
+                        // I2: cache cap respected (allow over-cap by |pinned| since pinned never evict).
+                        prop_assert!(
+                            r.pages.len() <= MAX_CACHED_PAGES + pinned.len(),
+                            "I2 violated: pages.len()={} > MAX_CACHED_PAGES+|pinned|={}",
+                            r.pages.len(),
+                            MAX_CACHED_PAGES + pinned.len()
+                        );
+                    }
+                    Op::Invalidate { page_idx } => r.invalidate_transmit(page_idx),
+                    Op::InvalidateAll => r.invalidate_all_transmits(),
+                    Op::TakeDeletes => {
+                        let _ = r.take_pending_deletes();
+                    }
+                }
+                check_invariants(&r)?;
+            }
+        }
     }
 }

@@ -76,6 +76,14 @@ flate2 = "1"
 # overlay actually reaches the wire (and not just the ratatui
 # buffer). Heavy dep, kept dev-only.
 portable-pty = "0.9"
+# Property-based tests for the kitty page registry's state machine
+# (LRU + cache + pending_deletes). Drives randomized sequences of
+# transmit/mark/evict/invalidate ops and asserts invariants after
+# each op. `regex` is default-on but unused by us (we don't write
+# string-shaped Strategies) — no clean way to exclude it without
+# dropping `std`, which we want for `PROPTEST_CASES` env-var
+# support and `proptest-regressions/` replay of past counterexamples.
+proptest = "1"
 
 [profile.release]
 # Smaller binary, no measurable perf loss for our workload.

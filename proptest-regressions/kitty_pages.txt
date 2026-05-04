@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc daf5ac4102831caf5195bf8211f019cad9c6704e97cd0b0f80d938d063127863 # shrinks to ops = [MarkTransmitted { page_idx: 10, w: 64, h: 64, layout: LayoutKey { fit_width_px: 200, dark: false }, revision: 0 }, MarkTransmitted { page_idx: 2, w: 64, h: 64, layout: LayoutKey { fit_width_px: 200, dark: false }, revision: 0 }, MarkTransmitted { page_idx: 7, w: 64, h: 64, layout: LayoutKey { fit_width_px: 200, dark: false }, revision: 0 }, MarkTransmitted { page_idx: 3, w: 64, h: 64, layout: LayoutKey { fit_width_px: 200, dark: false }, revision: 0 }, MarkTransmitted { page_idx: 4, w: 64, h: 64, layout: LayoutKey { fit_width_px: 200, dark: false }, revision: 0 }, MarkTransmitted { page_idx: 0, w: 64, h: 64, layout: LayoutKey { fit_width_px: 200, dark: false }, revision: 0 }, MarkTransmitted { page_idx: 1, w: 64, h: 64, layout: LayoutKey { fit_width_px: 200, dark: false }, revision: 0 }, MarkTransmitted { page_idx: 5, w: 64, h: 64, layout: LayoutKey { fit_width_px: 200, dark: false }, revision: 0 }, EvictToBudget { pinned: [] }, MarkTransmitted { page_idx: 10, w: 64, h: 64, layout: LayoutKey { fit_width_px: 200, dark: false }, revision: 0 }]
