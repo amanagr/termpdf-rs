@@ -167,14 +167,21 @@ There's a benchmark script in the repo that measures both on your
 machine: `scripts/bench-vs-browser.sh path/to/file.pdf`. It opens
 the same PDF in termpdf-rs and in your default browser, samples
 CPU% and RSS over an idle window, and prints a markdown comparison
-table. Order-of-magnitude differences are typical:
+table.
 
-- RSS: termpdf-rs ~30-50 MB vs. browser ~250-500 MB (single-PDF
-  tab including renderer + GPU + main processes).
-- Idle CPU%: termpdf-rs <1% vs. browser typically 1-5% (web
-  pipelines never fully sleep).
-- Scroll CPU%: termpdf-rs single-digit % vs. browser 10-30% on a
-  long PDF.
+A reference observation from a 600-page PDF on Firefox:
+
+| Metric                    | termpdf-rs   | Firefox        |
+| ------------------------- | ------------ | -------------- |
+| Idle CPU%                 | near 0%      | ~3%            |
+| Scroll CPU%               | single-digit | ~30%           |
+| RSS                       | ~30-50 MB    | ~200-400 MB    |
+
+Firefox is the leaner of the two common browsers; chromium is
+heavier still on the same workload (multi-process accounting +
+GPU compositor process). The aim isn't to beat the absolute
+ceiling — it's to make the case that for a "just open this PDF"
+session, you don't need the web platform's overhead.
 
 Run the script yourself for the actual numbers on your hardware —
 GPU support, browser version, and PDF size all move the result.
