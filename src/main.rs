@@ -316,7 +316,19 @@ fn main() -> Result<()> {
 
 fn setup_terminal() -> Result<()> {
     enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    // Hide the terminal's blinking cursor. We're a viewer, not an
+    // editor — there's no logical cursor to show. Without this, the
+    // user sees the cursor blinking at wherever our last kitty escape
+    // happened to leave it (typically the bottom-right of a page
+    // placement, which lands somewhere inside the rendered image).
+    // Particularly visible in Visual mode where each caret move
+    // re-emits placements and the cursor jumps around.
+    execute!(
+        io::stdout(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        crossterm::cursor::Hide,
+    )?;
     Ok(())
 }
 
@@ -329,7 +341,12 @@ fn teardown_terminal() -> Result<()> {
     let mut out = io::stdout();
     let _ = write!(out, "\x1b[?2026l");
     let _ = out.flush();
-    execute!(out, DisableMouseCapture, LeaveAlternateScreen)?;
+    execute!(
+        out,
+        crossterm::cursor::Show,
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+    )?;
     disable_raw_mode()?;
     Ok(())
 }
