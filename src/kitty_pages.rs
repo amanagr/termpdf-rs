@@ -819,10 +819,15 @@ fn build_transmit_string(
 ) -> String {
     let (start, escape, end) = tmux_wrap(is_tmux);
 
-    // Chunk size matches ratatui-image: 4096 base64 chars per chunk
-    // → 3072 raw bytes per chunk. Both kitty and tmux passthrough
-    // expect chunked DCS sequences.
-    const CHARS_PER_CHUNK: usize = 4096;
+    // Chunk size matches kitty's own canonical reference
+    // (kittens/tools/tui/graphics/command.go: const chunk_size = 128 * 1024).
+    // 131072 base64 chars = 98304 raw bytes per chunk. A 250 KB PNG
+    // ships in 1-3 chunks instead of 85 at the prior 4096-char value
+    // ratatui-image used. Each chunk amortises one APC envelope +
+    // one tmux-passthrough wrap + one syscall write, so the
+    // per-chunk overhead drops by ~30×. Both kitty and Ghostty
+    // accept any chunk size — the protocol mandates it.
+    const CHARS_PER_CHUNK: usize = 131_072;
     const RAW_PER_CHUNK: usize = (CHARS_PER_CHUNK / 4) * 3;
 
     // Iterate `payload.chunks(RAW_PER_CHUNK)` directly instead of
