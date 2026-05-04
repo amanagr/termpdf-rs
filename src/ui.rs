@@ -475,6 +475,18 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     }
     app.pending_cold_redraw = deferred_for_budget;
 
+    // Materialize visible_range once so the kitty registry's
+    // evict_to_budget at the end of the frame can pin LAYOUT-visible
+    // pages, not just the cell-filtered `visible` Vec. A page whose
+    // cell-quantized height rounds to 0 (sub-cell scroll position at
+    // a page boundary, page_h not divisible by cell_h) falls out of
+    // `visible` but is still layout-visible and still has placeholder
+    // cells in ratatui's buffer from prior frames. If it falls out of
+    // pinning, the LRU evicts its image_id and queues a `_Ga=d` to
+    // Ghostty; the placeholder cells suddenly reference a freed image
+    // and the page renders blank until something forces a re-transmit
+    // (revision flip, layout change, click).
+    let visible_range_pin: Vec<usize> = visible_range.clone().collect();
     app.evict_far_pages(visible_range.clone());
     app.enforce_byte_budget(page_cache_budget_bytes(), visible_range);
 
@@ -891,7 +903,7 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
             kp.overlay_mark_transmitted(b.page_idx, layout_key, rev, sel_sig, w, h);
         }
     }
-    kp.evict_to_budget(&visible);
+    kp.evict_to_budget(&visible_range_pin);
 
     // Link-hint overlay: rendered last so labels sit on top of
     // placeholder cells. Cells we paint here override ratatui's
