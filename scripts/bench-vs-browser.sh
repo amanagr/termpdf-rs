@@ -15,10 +15,9 @@
 # windowing system (browser). Past versions sampled a "scroll window"
 # that was really an extra idle window, which produced misleading
 # numbers (the second window was always lower because warmup had
-# completed). For a real scroll comparison, use the in-app HUD: hold
-# `j` in termpdf-rs and watch the bottom-right "cpu N%·30s"; switch
-# to the browser tab and hold Page Down while watching `top`/`htop`
-# for the browser process tree.
+# completed). For a real scroll comparison, use the companion
+# `monitor-scroll.sh` script, which delta-samples /proc/<pid>/stat
+# during a manual scroll burst — same machinery `top` uses.
 #
 # Usage:
 #   scripts/bench-vs-browser.sh path/to/some.pdf [browser]
@@ -234,7 +233,7 @@ echo "  - $BROWSER's numbers sum the process tree (renderer + GPU"
 echo "    + main); a single-process browser like firefox is more"
 echo "    apples-to-apples but chromium/chrome reflects the full cost."
 echo "  - This benchmark only measures IDLE. For scroll comparison,"
-echo "    open termpdf-rs in your usual terminal and hold j while"
-echo "    watching the bottom-right HUD ('cpu N%·30s'); separately"
-echo "    open the same PDF in the browser and hold Page Down while"
-echo "    watching top/htop for the browser process tree."
+echo "    use scripts/monitor-scroll.sh: in one pane open the PDF"
+echo "    (in termpdf-rs or the browser) and hold j / Page Down;"
+echo "    in another pane run 'monitor-scroll.sh termpdf ghostty'"
+echo "    or 'monitor-scroll.sh firefox'."
