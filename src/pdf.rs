@@ -219,9 +219,30 @@ fn render_page_at_width_quality(
         RenderQuality::Fast => fast_lcd_enabled(),
         RenderQuality::Sharp => true,
     };
-    let config = PdfRenderConfig::new()
+    // Fast-tier disables a stack of pdfium render passes that don't
+    // visibly affect body-copy reading at our render resolution: form
+    // widget rendering (most reading PDFs have no fillable forms),
+    // annotations (we render those at Sharp upgrade), and the image /
+    // path smoothing passes. limit_render_image_cache_size caps
+    // pdfium's internal image cache so multi-page renders don't pile
+    // memory in the FFI side. The Sharp tier re-enables annotations
+    // + smoothing so the polished bitmap that lands ~200 ms after
+    // scroll settles is identical to what the user used to see.
+    //
+    // Per pdfium-render API depth research (2026-05-04): all four
+    // disables are mid-pipeline early-outs in pdfium itself; they
+    // don't widen the visible/invisible delta on body-text PDFs.
+    let mut config = PdfRenderConfig::new()
         .set_target_width(render_w as i32)
-        .use_lcd_text_rendering(lcd);
+        .use_lcd_text_rendering(lcd)
+        .render_form_data(false)
+        .limit_render_image_cache_size(true);
+    if matches!(quality, RenderQuality::Fast) {
+        config = config
+            .render_annotations(false)
+            .set_image_smoothing(false)
+            .set_path_smoothing(false);
+    }
     let bitmap = page.render_with_config(&config)?;
     let img = bitmap.as_image()?;
     if render_w == target {
