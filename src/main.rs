@@ -521,10 +521,15 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
                 app.note_input();
             }
         } else if needs_settle_redraw {
-            // Poll timed out → input is idle. The next iteration's
-            // draw will see is_rapid_scrolling() == false and do the
-            // deferred transmits. Force the watchdog to allow that
-            // draw immediately.
+            // Poll timed out → input is idle for SETTLE_MS. Reset the
+            // input burst so is_rapid_scrolling returns false on the
+            // catch-up draw — otherwise SETTLE_MS (120) <
+            // RAPID_SCROLL_THRESHOLD_MS (250) and the catch-up
+            // re-defers the cold page, leaving the current page blank
+            // until 130 ms later. The next real scroll re-arms the
+            // burst counter from 1, so this only affects the gap
+            // between this catch-up and the next input.
+            app.clear_input_burst();
             needs_settle_redraw = false;
             last_draw = std::time::Instant::now() - MIN_FRAME_INTERVAL;
             dirty = true;
@@ -784,10 +789,18 @@ fn warm_next_uncached(app: &mut App<'_>) -> Result<bool> {
 }
 
 /// Same as `dispatch_event` but with explicit per-event coalescing
-/// for mouse drags: when a `Drag` is dispatched, peek for more drags
-/// behind it and skip the intermediate ones. Each Drag mutates
-/// `text_selection.head` and triggers a recompose; the user only
-/// cares about the final position.
+/// for two high-rate event kinds:
+///
+/// 1. **Mouse drags** — fire 30-100 events/sec. Each Drag mutates
+///    `text_selection.head` and triggers a recompose; the user only
+///    cares about the final position.
+///
+/// 2. **Mouse wheel scrolls** — modern wheels and trackpads emit 5-10
+///    `ScrollUp`/`ScrollDown` events per detent at 60-120 Hz. Without
+///    coalescing, each one drives a full recompose + buffer redraw,
+///    even though the only meaningful state delta is the cumulative
+///    vertical offset. Drain the run, sum net up vs. down, apply one
+///    `scroll_by_screens` call.
 fn dispatch_event_coalesced(app: &mut App<'_>, ev: Event) -> Result<()> {
     use crossterm::event::{MouseEvent, MouseEventKind};
     if let Event::Mouse(MouseEvent { kind: MouseEventKind::Drag(btn), .. }) = ev {
@@ -810,7 +823,53 @@ fn dispatch_event_coalesced(app: &mut App<'_>, ev: Event) -> Result<()> {
         }
         return dispatch_event(app, latest);
     }
+    if let Event::Mouse(me0) = ev {
+        if matches!(me0.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
+            // Sum net vertical scroll across this run. Shifted scroll
+            // is horizontal — keep separate so we don't merge h/v.
+            let shifted = me0.modifiers.contains(crossterm::event::KeyModifiers::SHIFT);
+            let mut net = match me0.kind {
+                MouseEventKind::ScrollDown => 1i32,
+                MouseEventKind::ScrollUp => -1i32,
+                _ => 0,
+            };
+            while event::poll(Duration::ZERO)? {
+                let next = event::read()?;
+                if let Event::Mouse(me) = next {
+                    let m_shift = me.modifiers.contains(crossterm::event::KeyModifiers::SHIFT);
+                    if m_shift == shifted {
+                        match me.kind {
+                            MouseEventKind::ScrollDown => { net += 1; continue; }
+                            MouseEventKind::ScrollUp => { net -= 1; continue; }
+                            _ => {}
+                        }
+                    }
+                    // Different modifier or non-scroll mouse event: flush
+                    // the coalesced scroll first, then dispatch normally.
+                    apply_coalesced_scroll(app, net, shifted);
+                    return dispatch_event(app, Event::Mouse(me));
+                }
+                // Non-mouse event (key / resize): flush + dispatch.
+                apply_coalesced_scroll(app, net, shifted);
+                return dispatch_event(app, next);
+            }
+            apply_coalesced_scroll(app, net, shifted);
+            return Ok(());
+        }
+    }
     dispatch_event(app, ev)
+}
+
+fn apply_coalesced_scroll(app: &mut App<'_>, net: i32, shifted: bool) {
+    if net == 0 {
+        return;
+    }
+    let amount = net as f32 * keys::SCROLL_LINE;
+    if shifted {
+        app.scroll_x_by(amount);
+    } else {
+        app.scroll_by_screens(amount);
+    }
 }
 
 fn dispatch_event(app: &mut App<'_>, ev: Event) -> Result<()> {

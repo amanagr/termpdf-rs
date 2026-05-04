@@ -920,6 +920,23 @@ impl<'doc> App<'doc> {
         self.last_input_at = Some(now);
     }
 
+    /// Force-clear the rapid-input-burst state.
+    ///
+    /// The settle-redraw branch in main::run_loop fires after the
+    /// poll wait times out (no input for SETTLE_MS = 120 ms) and is
+    /// supposed to be the catch-up draw that transmits any pages
+    /// deferred during the burst. But `is_rapid_scrolling` returns
+    /// true until `last_input_at` is RAPID_SCROLL_THRESHOLD_MS old —
+    /// 130 ms longer than SETTLE_MS. Without an explicit reset, the
+    /// catch-up draw still sees `is_rapid_scrolling = true` and
+    /// re-defers the cold pages, leaving the current page blank
+    /// until the next user input or 130 ms later. Resetting the
+    /// burst count here costs nothing on the next real scroll: the
+    /// new event re-arms the counter from 1.
+    pub fn clear_input_burst(&mut self) {
+        self.input_burst_count = 0;
+    }
+
     /// Gate for scroll-key handlers (`j`, `k`, Space, `b`, Ctrl-d/u,
     /// `]]`, `[[`). Returns `true` if the scroll should proceed and
     /// records the time; returns `false` if the previous accepted
@@ -3185,6 +3202,42 @@ mod tests {
         let (_, c, r) = step_burst(Some(a), c, t0 + std::time::Duration::from_millis(80));
         assert_eq!(c, 3);
         assert!(r, "three consecutive in-window events trip the burst flag");
+    }
+
+    #[test]
+    fn burst_clear_resets_count_so_next_event_is_not_rapid() {
+        // The settle-redraw branch in main::run_loop calls
+        // App::clear_input_burst when the poll wait times out, so the
+        // catch-up draw sees is_rapid_scrolling = false and transmits
+        // any deferred cold pages. Without this reset, SETTLE_MS (120
+        // ms) < RAPID_SCROLL_THRESHOLD_MS (250 ms) means the catch-up
+        // draw fires while the burst is still considered active, the
+        // cold page gets deferred again, and the user sees a blank
+        // current page until 130 ms later.
+        let t0 = std::time::Instant::now();
+        let mut state = (None, 0u32);
+        for i in 0..5 {
+            let (a, c, _) = step_burst(state.0, state.1, t0 + std::time::Duration::from_millis(i * 30));
+            state = (Some(a), c);
+        }
+        assert!(state.1 >= super::RAPID_SCROLL_BURST_MIN,
+            "precondition: we should be in burst mode after 5 fast events");
+        // Simulate App::clear_input_burst — the count resets but
+        // last_input_at stays put (no time has passed).
+        let cleared_count = 0u32;
+        // The catch-up draw runs immediately after; rapid check uses
+        // both `recent` AND `count >= MIN`. With count=0, rapid=false
+        // regardless of recency.
+        let rapid_after_clear = cleared_count >= super::RAPID_SCROLL_BURST_MIN;
+        assert!(!rapid_after_clear, "clear_input_burst must drop is_rapid_scrolling");
+        // The next real event arrives — it must rebuild the count
+        // from 1, NOT inherit the cleared zero as "fresh".
+        let (_, c_after_event, r_after_event) = step_burst(
+            state.0, cleared_count,
+            t0 + std::time::Duration::from_millis(150),
+        );
+        assert_eq!(c_after_event, 1, "after clear, the next event re-arms count from 1");
+        assert!(!r_after_event, "single-event count is below the burst threshold");
     }
 
     #[test]

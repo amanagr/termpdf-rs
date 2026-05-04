@@ -12,7 +12,7 @@ use crate::cmd;
 /// is intentionally less than 1.0 so the user keeps a sliver of
 /// context across a page-down — same trick Vim's `<C-f>` and less'
 /// `<space>` use.
-const SCROLL_LINE: f32 = 0.05;
+pub(crate) const SCROLL_LINE: f32 = 0.05;
 const SCROLL_HALF: f32 = 0.50;
 const SCROLL_SCREEN: f32 = 0.85;
 
