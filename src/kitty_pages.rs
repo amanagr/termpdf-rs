@@ -52,13 +52,16 @@ use crate::app::LayoutKey;
 /// internally evicts when its image store fills up. When that happens
 /// any of our placement cells still pointing at the freed image_id
 /// triggers `warning(renderer_image): missing image for virtual
-/// placement` per cell per render-frame — observed 132 warnings vs
-/// 112 Ghostty internal evictions in 10 minutes at cap=64 (one stale
-/// reference per eviction, cleared on the next placement frame).
-/// Cap=24 keeps the working set under ~250 MB on the terminal side
-/// so Ghostty's image store never has to evict on its own; we still
-/// hold ~5× the typical viewport for scroll-back without re-render.
-const MAX_CACHED_PAGES: usize = 24;
+/// placement` per cell per render-frame.
+///
+/// 7 = current page ±3, which covers the typical viewport (~2-3
+/// pages), idle-warm prefetch (`MAX_WARMS_PER_IDLE=2` per tick), and
+/// a small scroll-back budget. Under ~70 MB on the terminal side, so
+/// Ghostty's image store has plenty of headroom and never needs to
+/// evict on its own. Scrolling back further than ±3 re-renders the
+/// page (~30 ms), which is the explicit tradeoff for keeping
+/// terminal memory tight.
+const MAX_CACHED_PAGES: usize = 7;
 
 /// Image-cache entry per page index.
 #[derive(Debug, Clone)]
