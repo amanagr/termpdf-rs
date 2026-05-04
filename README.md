@@ -2,15 +2,16 @@
 
 # termpdf-rs
 
-**A vim-style PDF reader that lives inside your terminal.**
+**A power-efficient PDF reader that lives inside your terminal — vim
+keys, kitty-native rendering, near-zero CPU at idle.**
 
 Pages render as actual images via the
 [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) —
 text stays sharp, figures stay readable, no halfblocks-ASCII guesswork.
 
 `vim`-keys · per-PDF session · color-aware dark mode · indexed search ·
-link-follow · highlights stored *in* the PDF · 4 KB of code touches the
-hot path on every keystroke
+link-follow · highlights stored *in* the PDF · idle redraws gated so
+your laptop doesn't heat up while reading
 
 </div>
 
@@ -21,20 +22,37 @@ hot path on every keystroke
 │                                                                  │
 │       [a real, pixel-perfect PDF page rendered as an image]      │
 │                                                                  │
-│    ┌─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─    │
-│    │      ↑ 3-second "you were reading here" line drops          │
-│    │        when you Space-scroll past where you stopped         │
+│                                                                  │
 │                                                                  │
 └──────────────────────────────────────────────────────────────────┘
-   12/300  zoom 100%  DARK              [j]  found 7 matches    ?
+   12/300  zoom 100%  DARK              [j]  found 7 matches    cpu 2%·30s
 ```
+
+## Why this exists
+
+Most terminal PDF "readers" either (a) draw halfblocks and pretend
+that's reading, or (b) use real graphics protocols but burn CPU as if
+you were watching video — a held-`j` on a 600-page book pegs a core,
+the laptop discharges while plugged in, the fan kicks on.
+
+termpdf-rs is the inverse: real pixel-perfect images, but the
+scroll-keystroke and idle paths are budgeted ruthlessly so the
+reading experience stays cool. Idle with a PDF open emits effectively
+no bytes on the pty (gated behind a dirty flag); a sustained scroll
+burst on a 600-page book lands in single-digit-percent CPU on the
+client side.
 
 ## What you actually get
 
-- **Open any PDF, scroll smoothly with `j`/`k`/Space.** Per-page kitty
-  image IDs + idle pre-transmit + on-disk PNG cache mean the bandwidth
-  budget supports holding `j` at terminal autorepeat without
-  visible lag once the prefetch tier warms up.
+- **Open any PDF, scroll smoothly with `j`/`k`/Space.** Per-page
+  kitty image IDs + idle pre-transmit + on-disk PNG cache mean a held
+  `j` runs without visible lag once the prefetch tier warms up.
+- **Power-efficient by design.** Idle term.draw is gated on a `dirty`
+  flag — when the user does nothing, the binary writes nothing to the
+  pty. Held-key bursts defer cold renders entirely; a single settle
+  redraw catches up when input goes idle. The in-app HUD shows the
+  rolling 30-second CPU% so a regression is visible in the same
+  window you're reading in.
 - **Indexed full-text search.** First search builds a back-index in
   the background; subsequent searches are
   [Sioyek-fast](https://ahrm.github.io/jekyll/update/2022/09/11/pdf-viewer-text-search-benchmark.html):
@@ -80,7 +98,7 @@ every keybinding in a help overlay.
 | Key      | What it does                                            |
 | -------- | ------------------------------------------------------- |
 | `j` / `k`| Next / prev page                                        |
-| Space    | Scroll one screen (drops a 3 s line at where you were)  |
+| Space    | Scroll one screen down (less-style)                     |
 | `o`      | Open the table-of-contents panel — `/` to fuzzy-filter  |
 | `v`      | Visual mode → `viw`/`vis`/`vip` → `y` to highlight      |
 | `f`      | Link-follow — type the hint over any clickable link     |
@@ -130,40 +148,81 @@ The full keymap is in the `?` overlay; this is the high-leverage subset.
 | `o`                        | open TOC panel — `/` to filter, Enter jumps |
 | `:export [path]`           | dump highlights as a Markdown notes file  |
 
-## Performance
+## Power efficiency
 
-A lot of the work in this repo is on the perf path. The headline
-moves between two configs are:
+This is the headline. PDF reading is a low-frequency activity by
+nature — pages turn at human speed, not video speed — so a reader
+that pegs CPU during scrolling is wasting your battery on nothing.
 
-| Operation                              | Cold     | Warm    |
-| -------------------------------------- | -------- | ------- |
-| Open a PDF (700-page book)             | ~150 ms  | ~150 ms |
-| Render the next visible page (`j`)     | ~22 ms   | ~1 ms   |
-| Search for a substring                 | per-page | indexed |
-| Reopen the same PDF                    | ~150 ms  | ~50 ms (PNG cache hit) |
+### vs. opening the same PDF in a browser
 
-What gets us there:
+The most common alternative for "I just want to read this PDF" is
+double-clicking it and letting Chrome / Firefox open it. Browsers
+ship the full web-platform stack to do that — V8, Blink/Gecko, GPU
+compositor, IPC layers, multi-process accounting — for a job that
+needs none of it. termpdf-rs uses pdfium (the same PDF engine
+Chrome ships) without any of the surrounding browser machinery.
 
-- **Per-page kitty placement** — each page becomes its own kitty image
-  with a stable ID. Scrolling re-uses the in-terminal bitmap; only
-  placement cells go on the wire.
+There's a benchmark script in the repo that measures both on your
+machine: `scripts/bench-vs-browser.sh path/to/file.pdf`. It opens
+the same PDF in termpdf-rs and in your default browser, samples
+CPU% and RSS over an idle window, and prints a markdown comparison
+table. Order-of-magnitude differences are typical:
+
+- RSS: termpdf-rs ~30-50 MB vs. browser ~250-500 MB (single-PDF
+  tab including renderer + GPU + main processes).
+- Idle CPU%: termpdf-rs <1% vs. browser typically 1-5% (web
+  pipelines never fully sleep).
+- Scroll CPU%: termpdf-rs single-digit % vs. browser 10-30% on a
+  long PDF.
+
+Run the script yourself for the actual numbers on your hardware —
+GPU support, browser version, and PDF size all move the result.
+
+### What gets us there
+
+Concrete moves that get us to single-digit CPU during reading:
+
+- **Idle redraws gated on a dirty flag.** `run_loop` only calls
+  `term.draw` when something has actually changed since the last
+  paint (input dispatched, settle catch-up, cold-redraw catch-up).
+  Without this, the loop poked ratatui every 250 ms (idle poll
+  cadence), and even with a small diff the per-frame backend flush
+  was enough to keep the terminal's pty reader awake. Result: bytes
+  written to the pty when the user is doing nothing → effectively
+  zero.
+- **Held-key burst defer.** Within ~250 ms of consecutive input, cold
+  pdfium renders are skipped entirely. The settle redraw fires once
+  the burst ends and renders the final page. A held-`j` on a 600-page
+  book burns roughly the cost of one render, not 600.
+- **LCD subpixel rendering off on the Fast tier.** Saves ~40-60 % of
+  the per-page pdfium time during scroll. The Sharp tier (idle
+  background upgrade) keeps LCD on so the visible page sharpens
+  shortly after the scroll settles. Toggle with `TERMPDF_FAST_LCD=1`
+  if you'd rather pay the heat for first-frame sharpness.
+- **Per-page kitty placement** — each page becomes its own kitty
+  image with a stable ID. Scrolling re-uses the in-terminal bitmap;
+  only placement cells go on the wire (a few hundred bytes per
+  visible page per scroll, vs. multi-MB canvas re-encodes).
+- **Layered selection overlay.** Visual-mode selection ships as a
+  separate, mostly-transparent kitty image at z=1 above the page.
+  Dragging the selection re-encodes a few-KB overlay PNG, not the
+  full multi-MB page bitmap.
 - **Tiered cache** — pdfium RGBA in `page_cache`, post-overlay PNG
-  in the kitty registry, encoded payload bytes ride along, all
-  three tiers checked per draw.
+  in the kitty registry, encoded payload bytes ride along, all three
+  tiers checked per draw.
 - **LRU eviction** with `a=d,d=I,i=ID` deletes so a 700-page sweep
   doesn't pile gigabytes of decoded RGBA in your terminal.
-- **Idle warm** — between draws, render + encode + pre-transmit up
-  to 4 upcoming pages so the next keypress lands on a warm cache.
-- **Burst-defer** — held-`j` skips cold transmits during the burst
-  and catches up in one settle redraw when the key releases.
+- **Idle warm** — between draws, render + encode + pre-transmit
+  upcoming pages so the next keypress lands on a warm cache.
 - **Disk cache** at `~/.cache/termpdf-rs/<file-hash>/<page>.png`
   bounded to 512 MB; re-opens skip pdfium entirely.
-- **Persistent search index** at the same hash key; reopens skip
-  the ~3.5 s text-extract cost.
+- **Persistent search index** at the same hash key; reopens skip the
+  ~3.5 s text-extract cost.
 
-Set `TERMPDF_PROFILE=1` to print phase timings to stderr at exit
-(EnsureRendered / EnsureOverlay / Compose / BuildProtocol / Draw /
-IdleWarm).
+The bottom-right HUD shows the rolling 30-second process-CPU%, so a
+sustained spike is visible in the same window you're reading in. Set
+`TERMPDF_NO_PERF_HUD=1` to hide it.
 
 ## Reading PDFs lives nicely with…
 
@@ -220,10 +279,18 @@ back to per-page pdfium for the unindexed pages. Status line shows
 the percent. Once 100%, the index persists; subsequent opens are
 instant.
 
+**"My terminal is using a lot of CPU."** First, check the in-app HUD
+— if termpdf's own CPU% is also high, the regression is on our side
+and we'd love a bug report. If termpdf is reading low but the
+terminal's CPU is high during scroll, the cost is downstream PNG
+decode + GPU upload. Try `TERMPDF_TRANSMIT_RAW=1` to ship raw RGBA
+instead of PNG (skips decode in the terminal at the cost of larger
+pty bytes).
+
 ## Configuration
 
-Almost none — termpdf-rs reads four environment variables and a
-session file. By design.
+Almost none — termpdf-rs reads a handful of environment variables and
+a session file. By design.
 
 | Var                       | Default                            | Meaning                                  |
 | ------------------------- | ---------------------------------- | ---------------------------------------- |
@@ -232,6 +299,9 @@ session file. By design.
 | `TERMPDF_NO_TMUX_HINT`    | unset                              | Skip the one-time tmux hint              |
 | `TERMPDF_CACHE_MB`        | `256`                              | Soft cap on the in-memory page cache     |
 | `TERMPDF_PROFILE`         | unset                              | Print phase timings to stderr at exit    |
+| `TERMPDF_NO_PERF_HUD`     | unset                              | Hide the bottom-right CPU% HUD           |
+| `TERMPDF_FAST_LCD`        | unset                              | Re-enable LCD subpixel text on the Fast tier (sharper scroll, more CPU) |
+| `TERMPDF_TRANSMIT_RAW`    | unset                              | Ship raw RGBA instead of PNG (skip terminal-side PNG decode at the cost of larger pty bytes) |
 
 Per-PDF state (current page, dark flag, zoom, marks) lives at
 `$XDG_DATA_HOME/termpdf-rs/<name>.<hash>.session.json` (mode 0600).
@@ -278,7 +348,7 @@ original. A crash mid-write leaves your original PDF untouched.
 
 ## Contributing
 
-The code is ~12 k LOC of Rust, ~160 unit tests + 3 pty-driven
+The code is ~12 k LOC of Rust, ~150 unit tests + 3 pty-driven
 integration tests. `cargo test --release` on a fresh clone (after
 `./setup.sh`) should pass the lot. Tests don't need fixture files —
 the pdfium-render crate creates synthetic PDFs in-process; see
@@ -289,7 +359,10 @@ PRs welcome. Two house rules:
 
 1. **Run the tests** before pushing — this includes the e2e perf
    regression test that catches refactors silently breaking the
-   disk-cache or idle-warm wiring.
+   disk-cache / idle-warm wiring AND the new idle-bytes guard
+   (asserts the binary writes <4 KB to the pty across 3 s of
+   fully-settled idle, the proxy for "we're not heating up the
+   user's terminal").
 2. **Match the comment style.** Prefer a one-line "why this is
    non-obvious" over an apology for the code; never write what's
    already in the identifier names.
