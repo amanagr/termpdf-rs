@@ -283,8 +283,7 @@ impl KittyPageRegistry {
         if victims.is_empty() {
             return;
         }
-        let victim_set: std::collections::HashSet<usize> =
-            victims.iter().copied().collect();
+        let victim_set: std::collections::HashSet<usize> = victims.iter().copied().collect();
         // Collect all freed image_ids first so we can coalesce
         // contiguous runs into a single `d=R` range delete (kitty
         // protocol v0.33.0+). Forward scroll evicts oldest pages
@@ -876,7 +875,14 @@ fn build_transmit_string(
 #[cfg(test)]
 fn transmit(bitmap: &RgbaImage, id: u32, is_tmux: bool) -> String {
     let (format_code, payload) = encode_payload(bitmap);
-    build_transmit_string(&payload, format_code, id, bitmap.width(), bitmap.height(), is_tmux)
+    build_transmit_string(
+        &payload,
+        format_code,
+        id,
+        bitmap.width(),
+        bitmap.height(),
+        is_tmux,
+    )
 }
 
 /// Build a classical kitty placement APC for a previously-transmitted
@@ -916,7 +922,6 @@ pub fn build_overlay_place_apc(
     s
 }
 
-
 /// PNG-encode with `Fast` compression + `Up` filter. Benchmarked on a
 /// 1600×2300 synthetic page: NoFilter = 2.8× compression at 14 ms,
 /// Up filter = 50× compression at 1.9 ms. The Up predictor (each
@@ -929,11 +934,7 @@ fn encode_png_fast(bitmap: &RgbaImage) -> Result<Vec<u8>, image::ImageError> {
     // Best-case PNG of a typical page is ~250 KB; reserve in that
     // ballpark to avoid a few growth reallocations during encode.
     let mut buf = Vec::with_capacity(512 * 1024);
-    let encoder = PngEncoder::new_with_quality(
-        &mut buf,
-        CompressionType::Fast,
-        FilterType::Up,
-    );
+    let encoder = PngEncoder::new_with_quality(&mut buf, CompressionType::Fast, FilterType::Up);
     encoder.write_image(
         bitmap.as_raw(),
         bitmap.width(),
@@ -952,11 +953,7 @@ fn encode_png_fast_rgb(bitmap: &RgbaImage) -> Result<Vec<u8>, image::ImageError>
     use image::ImageEncoder;
     let rgb = strip_alpha(bitmap);
     let mut buf = Vec::with_capacity(384 * 1024);
-    let encoder = PngEncoder::new_with_quality(
-        &mut buf,
-        CompressionType::Fast,
-        FilterType::Up,
-    );
+    let encoder = PngEncoder::new_with_quality(&mut buf, CompressionType::Fast, FilterType::Up);
     encoder.write_image(
         &rgb,
         bitmap.width(),
@@ -1029,9 +1026,10 @@ pub fn place_page(
     let cols = (width_cells as u32).min(MAX_COLS) as u16;
     if scratch.cached_cols != cols {
         scratch.row_diacritics.clear();
-        scratch
-            .row_diacritics
-            .extend(std::iter::repeat_n('\u{10EEEE}', cols.saturating_sub(1) as usize));
+        scratch.row_diacritics.extend(std::iter::repeat_n(
+            '\u{10EEEE}',
+            cols.saturating_sub(1) as usize,
+        ));
         scratch.cached_cols = cols;
     }
     let area_dims = (area.width, area.height);
@@ -1258,9 +1256,7 @@ fn tmux_wrap(is_tmux: bool) -> (&'static str, &'static str, &'static str) {
 
 #[inline]
 fn diacritic(n: u16) -> char {
-    *DIACRITICS
-        .get(usize::from(n))
-        .unwrap_or(&DIACRITICS[0])
+    *DIACRITICS.get(usize::from(n)).unwrap_or(&DIACRITICS[0])
 }
 
 const MAX_COLS: u32 = DIACRITICS.len() as u32;
@@ -1270,46 +1266,303 @@ const MAX_COLS: u32 = DIACRITICS.len() as u32;
 /// 297 entries cover image grids up to 297×297 cells, which is
 /// comfortably more than any viewport.
 static DIACRITICS: [char; 297] = [
-    '\u{305}', '\u{30D}', '\u{30E}', '\u{310}', '\u{312}', '\u{33D}', '\u{33E}', '\u{33F}',
-    '\u{346}', '\u{34A}', '\u{34B}', '\u{34C}', '\u{350}', '\u{351}', '\u{352}', '\u{357}',
-    '\u{35B}', '\u{363}', '\u{364}', '\u{365}', '\u{366}', '\u{367}', '\u{368}', '\u{369}',
-    '\u{36A}', '\u{36B}', '\u{36C}', '\u{36D}', '\u{36E}', '\u{36F}', '\u{483}', '\u{484}',
-    '\u{485}', '\u{486}', '\u{487}', '\u{592}', '\u{593}', '\u{594}', '\u{595}', '\u{597}',
-    '\u{598}', '\u{599}', '\u{59C}', '\u{59D}', '\u{59E}', '\u{59F}', '\u{5A0}', '\u{5A1}',
-    '\u{5A8}', '\u{5A9}', '\u{5AB}', '\u{5AC}', '\u{5AF}', '\u{5C4}', '\u{610}', '\u{611}',
-    '\u{612}', '\u{613}', '\u{614}', '\u{615}', '\u{616}', '\u{617}', '\u{657}', '\u{658}',
-    '\u{659}', '\u{65A}', '\u{65B}', '\u{65D}', '\u{65E}', '\u{6D6}', '\u{6D7}', '\u{6D8}',
-    '\u{6D9}', '\u{6DA}', '\u{6DB}', '\u{6DC}', '\u{6DF}', '\u{6E0}', '\u{6E1}', '\u{6E2}',
-    '\u{6E4}', '\u{6E7}', '\u{6E8}', '\u{6EB}', '\u{6EC}', '\u{730}', '\u{732}', '\u{733}',
-    '\u{735}', '\u{736}', '\u{73A}', '\u{73D}', '\u{73F}', '\u{740}', '\u{741}', '\u{743}',
-    '\u{745}', '\u{747}', '\u{749}', '\u{74A}', '\u{7EB}', '\u{7EC}', '\u{7ED}', '\u{7EE}',
-    '\u{7EF}', '\u{7F0}', '\u{7F1}', '\u{7F3}', '\u{816}', '\u{817}', '\u{818}', '\u{819}',
-    '\u{81B}', '\u{81C}', '\u{81D}', '\u{81E}', '\u{81F}', '\u{820}', '\u{821}', '\u{822}',
-    '\u{823}', '\u{825}', '\u{826}', '\u{827}', '\u{829}', '\u{82A}', '\u{82B}', '\u{82C}',
-    '\u{82D}', '\u{951}', '\u{953}', '\u{954}', '\u{F82}', '\u{F83}', '\u{F86}', '\u{F87}',
-    '\u{135D}', '\u{135E}', '\u{135F}', '\u{17DD}', '\u{193A}', '\u{1A17}', '\u{1A75}',
-    '\u{1A76}', '\u{1A77}', '\u{1A78}', '\u{1A79}', '\u{1A7A}', '\u{1A7B}', '\u{1A7C}',
-    '\u{1B6B}', '\u{1B6D}', '\u{1B6E}', '\u{1B6F}', '\u{1B70}', '\u{1B71}', '\u{1B72}',
-    '\u{1B73}', '\u{1CD0}', '\u{1CD1}', '\u{1CD2}', '\u{1CDA}', '\u{1CDB}', '\u{1CE0}',
-    '\u{1DC0}', '\u{1DC1}', '\u{1DC3}', '\u{1DC4}', '\u{1DC5}', '\u{1DC6}', '\u{1DC7}',
-    '\u{1DC8}', '\u{1DC9}', '\u{1DCB}', '\u{1DCC}', '\u{1DD1}', '\u{1DD2}', '\u{1DD3}',
-    '\u{1DD4}', '\u{1DD5}', '\u{1DD6}', '\u{1DD7}', '\u{1DD8}', '\u{1DD9}', '\u{1DDA}',
-    '\u{1DDB}', '\u{1DDC}', '\u{1DDD}', '\u{1DDE}', '\u{1DDF}', '\u{1DE0}', '\u{1DE1}',
-    '\u{1DE2}', '\u{1DE3}', '\u{1DE4}', '\u{1DE5}', '\u{1DE6}', '\u{1DFE}', '\u{20D0}',
-    '\u{20D1}', '\u{20D4}', '\u{20D5}', '\u{20D6}', '\u{20D7}', '\u{20DB}', '\u{20DC}',
-    '\u{20E1}', '\u{20E7}', '\u{20E9}', '\u{20F0}', '\u{2CEF}', '\u{2CF0}', '\u{2CF1}',
-    '\u{2DE0}', '\u{2DE1}', '\u{2DE2}', '\u{2DE3}', '\u{2DE4}', '\u{2DE5}', '\u{2DE6}',
-    '\u{2DE7}', '\u{2DE8}', '\u{2DE9}', '\u{2DEA}', '\u{2DEB}', '\u{2DEC}', '\u{2DED}',
-    '\u{2DEE}', '\u{2DEF}', '\u{2DF0}', '\u{2DF1}', '\u{2DF2}', '\u{2DF3}', '\u{2DF4}',
-    '\u{2DF5}', '\u{2DF6}', '\u{2DF7}', '\u{2DF8}', '\u{2DF9}', '\u{2DFA}', '\u{2DFB}',
-    '\u{2DFC}', '\u{2DFD}', '\u{2DFE}', '\u{2DFF}', '\u{A66F}', '\u{A67C}', '\u{A67D}',
-    '\u{A6F0}', '\u{A6F1}', '\u{A8E0}', '\u{A8E1}', '\u{A8E2}', '\u{A8E3}', '\u{A8E4}',
-    '\u{A8E5}', '\u{A8E6}', '\u{A8E7}', '\u{A8E8}', '\u{A8E9}', '\u{A8EA}', '\u{A8EB}',
-    '\u{A8EC}', '\u{A8ED}', '\u{A8EE}', '\u{A8EF}', '\u{A8F0}', '\u{A8F1}', '\u{AAB0}',
-    '\u{AAB2}', '\u{AAB3}', '\u{AAB7}', '\u{AAB8}', '\u{AABE}', '\u{AABF}', '\u{AAC1}',
-    '\u{FE20}', '\u{FE21}', '\u{FE22}', '\u{FE23}', '\u{FE24}', '\u{FE25}', '\u{FE26}',
-    '\u{10A0F}', '\u{10A38}', '\u{1D185}', '\u{1D186}', '\u{1D187}', '\u{1D188}', '\u{1D189}',
-    '\u{1D1AA}', '\u{1D1AB}', '\u{1D1AC}', '\u{1D1AD}', '\u{1D242}', '\u{1D243}', '\u{1D244}',
+    '\u{305}',
+    '\u{30D}',
+    '\u{30E}',
+    '\u{310}',
+    '\u{312}',
+    '\u{33D}',
+    '\u{33E}',
+    '\u{33F}',
+    '\u{346}',
+    '\u{34A}',
+    '\u{34B}',
+    '\u{34C}',
+    '\u{350}',
+    '\u{351}',
+    '\u{352}',
+    '\u{357}',
+    '\u{35B}',
+    '\u{363}',
+    '\u{364}',
+    '\u{365}',
+    '\u{366}',
+    '\u{367}',
+    '\u{368}',
+    '\u{369}',
+    '\u{36A}',
+    '\u{36B}',
+    '\u{36C}',
+    '\u{36D}',
+    '\u{36E}',
+    '\u{36F}',
+    '\u{483}',
+    '\u{484}',
+    '\u{485}',
+    '\u{486}',
+    '\u{487}',
+    '\u{592}',
+    '\u{593}',
+    '\u{594}',
+    '\u{595}',
+    '\u{597}',
+    '\u{598}',
+    '\u{599}',
+    '\u{59C}',
+    '\u{59D}',
+    '\u{59E}',
+    '\u{59F}',
+    '\u{5A0}',
+    '\u{5A1}',
+    '\u{5A8}',
+    '\u{5A9}',
+    '\u{5AB}',
+    '\u{5AC}',
+    '\u{5AF}',
+    '\u{5C4}',
+    '\u{610}',
+    '\u{611}',
+    '\u{612}',
+    '\u{613}',
+    '\u{614}',
+    '\u{615}',
+    '\u{616}',
+    '\u{617}',
+    '\u{657}',
+    '\u{658}',
+    '\u{659}',
+    '\u{65A}',
+    '\u{65B}',
+    '\u{65D}',
+    '\u{65E}',
+    '\u{6D6}',
+    '\u{6D7}',
+    '\u{6D8}',
+    '\u{6D9}',
+    '\u{6DA}',
+    '\u{6DB}',
+    '\u{6DC}',
+    '\u{6DF}',
+    '\u{6E0}',
+    '\u{6E1}',
+    '\u{6E2}',
+    '\u{6E4}',
+    '\u{6E7}',
+    '\u{6E8}',
+    '\u{6EB}',
+    '\u{6EC}',
+    '\u{730}',
+    '\u{732}',
+    '\u{733}',
+    '\u{735}',
+    '\u{736}',
+    '\u{73A}',
+    '\u{73D}',
+    '\u{73F}',
+    '\u{740}',
+    '\u{741}',
+    '\u{743}',
+    '\u{745}',
+    '\u{747}',
+    '\u{749}',
+    '\u{74A}',
+    '\u{7EB}',
+    '\u{7EC}',
+    '\u{7ED}',
+    '\u{7EE}',
+    '\u{7EF}',
+    '\u{7F0}',
+    '\u{7F1}',
+    '\u{7F3}',
+    '\u{816}',
+    '\u{817}',
+    '\u{818}',
+    '\u{819}',
+    '\u{81B}',
+    '\u{81C}',
+    '\u{81D}',
+    '\u{81E}',
+    '\u{81F}',
+    '\u{820}',
+    '\u{821}',
+    '\u{822}',
+    '\u{823}',
+    '\u{825}',
+    '\u{826}',
+    '\u{827}',
+    '\u{829}',
+    '\u{82A}',
+    '\u{82B}',
+    '\u{82C}',
+    '\u{82D}',
+    '\u{951}',
+    '\u{953}',
+    '\u{954}',
+    '\u{F82}',
+    '\u{F83}',
+    '\u{F86}',
+    '\u{F87}',
+    '\u{135D}',
+    '\u{135E}',
+    '\u{135F}',
+    '\u{17DD}',
+    '\u{193A}',
+    '\u{1A17}',
+    '\u{1A75}',
+    '\u{1A76}',
+    '\u{1A77}',
+    '\u{1A78}',
+    '\u{1A79}',
+    '\u{1A7A}',
+    '\u{1A7B}',
+    '\u{1A7C}',
+    '\u{1B6B}',
+    '\u{1B6D}',
+    '\u{1B6E}',
+    '\u{1B6F}',
+    '\u{1B70}',
+    '\u{1B71}',
+    '\u{1B72}',
+    '\u{1B73}',
+    '\u{1CD0}',
+    '\u{1CD1}',
+    '\u{1CD2}',
+    '\u{1CDA}',
+    '\u{1CDB}',
+    '\u{1CE0}',
+    '\u{1DC0}',
+    '\u{1DC1}',
+    '\u{1DC3}',
+    '\u{1DC4}',
+    '\u{1DC5}',
+    '\u{1DC6}',
+    '\u{1DC7}',
+    '\u{1DC8}',
+    '\u{1DC9}',
+    '\u{1DCB}',
+    '\u{1DCC}',
+    '\u{1DD1}',
+    '\u{1DD2}',
+    '\u{1DD3}',
+    '\u{1DD4}',
+    '\u{1DD5}',
+    '\u{1DD6}',
+    '\u{1DD7}',
+    '\u{1DD8}',
+    '\u{1DD9}',
+    '\u{1DDA}',
+    '\u{1DDB}',
+    '\u{1DDC}',
+    '\u{1DDD}',
+    '\u{1DDE}',
+    '\u{1DDF}',
+    '\u{1DE0}',
+    '\u{1DE1}',
+    '\u{1DE2}',
+    '\u{1DE3}',
+    '\u{1DE4}',
+    '\u{1DE5}',
+    '\u{1DE6}',
+    '\u{1DFE}',
+    '\u{20D0}',
+    '\u{20D1}',
+    '\u{20D4}',
+    '\u{20D5}',
+    '\u{20D6}',
+    '\u{20D7}',
+    '\u{20DB}',
+    '\u{20DC}',
+    '\u{20E1}',
+    '\u{20E7}',
+    '\u{20E9}',
+    '\u{20F0}',
+    '\u{2CEF}',
+    '\u{2CF0}',
+    '\u{2CF1}',
+    '\u{2DE0}',
+    '\u{2DE1}',
+    '\u{2DE2}',
+    '\u{2DE3}',
+    '\u{2DE4}',
+    '\u{2DE5}',
+    '\u{2DE6}',
+    '\u{2DE7}',
+    '\u{2DE8}',
+    '\u{2DE9}',
+    '\u{2DEA}',
+    '\u{2DEB}',
+    '\u{2DEC}',
+    '\u{2DED}',
+    '\u{2DEE}',
+    '\u{2DEF}',
+    '\u{2DF0}',
+    '\u{2DF1}',
+    '\u{2DF2}',
+    '\u{2DF3}',
+    '\u{2DF4}',
+    '\u{2DF5}',
+    '\u{2DF6}',
+    '\u{2DF7}',
+    '\u{2DF8}',
+    '\u{2DF9}',
+    '\u{2DFA}',
+    '\u{2DFB}',
+    '\u{2DFC}',
+    '\u{2DFD}',
+    '\u{2DFE}',
+    '\u{2DFF}',
+    '\u{A66F}',
+    '\u{A67C}',
+    '\u{A67D}',
+    '\u{A6F0}',
+    '\u{A6F1}',
+    '\u{A8E0}',
+    '\u{A8E1}',
+    '\u{A8E2}',
+    '\u{A8E3}',
+    '\u{A8E4}',
+    '\u{A8E5}',
+    '\u{A8E6}',
+    '\u{A8E7}',
+    '\u{A8E8}',
+    '\u{A8E9}',
+    '\u{A8EA}',
+    '\u{A8EB}',
+    '\u{A8EC}',
+    '\u{A8ED}',
+    '\u{A8EE}',
+    '\u{A8EF}',
+    '\u{A8F0}',
+    '\u{A8F1}',
+    '\u{AAB0}',
+    '\u{AAB2}',
+    '\u{AAB3}',
+    '\u{AAB7}',
+    '\u{AAB8}',
+    '\u{AABE}',
+    '\u{AABF}',
+    '\u{AAC1}',
+    '\u{FE20}',
+    '\u{FE21}',
+    '\u{FE22}',
+    '\u{FE23}',
+    '\u{FE24}',
+    '\u{FE25}',
+    '\u{FE26}',
+    '\u{10A0F}',
+    '\u{10A38}',
+    '\u{1D185}',
+    '\u{1D186}',
+    '\u{1D187}',
+    '\u{1D188}',
+    '\u{1D189}',
+    '\u{1D1AA}',
+    '\u{1D1AB}',
+    '\u{1D1AC}',
+    '\u{1D1AD}',
+    '\u{1D242}',
+    '\u{1D243}',
+    '\u{1D244}',
 ];
 
 #[cfg(test)]
@@ -1326,7 +1579,10 @@ mod tests {
     #[test]
     fn fresh_after_mark() {
         let mut r = KittyPageRegistry::new(false, 1000);
-        let layout = LayoutKey { fit_width_px: 64, dark: false };
+        let layout = LayoutKey {
+            fit_width_px: 64,
+            dark: false,
+        };
         assert!(!r.is_fresh(0, layout, 7, 64, 32));
         r.mark_transmitted(0, layout, 7, 64, 32);
         assert!(r.is_fresh(0, layout, 7, 64, 32));
@@ -1335,7 +1591,10 @@ mod tests {
     #[test]
     fn revision_change_marks_stale() {
         let mut r = KittyPageRegistry::new(false, 1000);
-        let layout = LayoutKey { fit_width_px: 64, dark: false };
+        let layout = LayoutKey {
+            fit_width_px: 64,
+            dark: false,
+        };
         r.mark_transmitted(0, layout, 7, 64, 32);
         assert!(r.is_fresh(0, layout, 7, 64, 32));
         // Bumping revision (e.g. user moved selection) → not fresh.
@@ -1345,8 +1604,14 @@ mod tests {
     #[test]
     fn layout_change_marks_stale() {
         let mut r = KittyPageRegistry::new(false, 1000);
-        let l1 = LayoutKey { fit_width_px: 64, dark: false };
-        let l2 = LayoutKey { fit_width_px: 64, dark: true };
+        let l1 = LayoutKey {
+            fit_width_px: 64,
+            dark: false,
+        };
+        let l2 = LayoutKey {
+            fit_width_px: 64,
+            dark: true,
+        };
         r.mark_transmitted(0, l1, 0, 64, 32);
         assert!(!r.is_fresh(0, l2, 0, 64, 32));
     }
@@ -1354,7 +1619,10 @@ mod tests {
     #[test]
     fn dimension_change_marks_stale() {
         let mut r = KittyPageRegistry::new(false, 1000);
-        let layout = LayoutKey { fit_width_px: 64, dark: false };
+        let layout = LayoutKey {
+            fit_width_px: 64,
+            dark: false,
+        };
         r.mark_transmitted(0, layout, 0, 64, 32);
         assert!(!r.is_fresh(0, layout, 0, 64, 64));
     }
@@ -1404,7 +1672,10 @@ mod tests {
         // Same (layout, revision, dims) → second call must reuse the
         // cached encoded payload (no re-encode).
         let mut r = KittyPageRegistry::new(false, 1000);
-        let layout = LayoutKey { fit_width_px: 64, dark: false };
+        let layout = LayoutKey {
+            fit_width_px: 64,
+            dark: false,
+        };
         let bm = RgbaImage::new(16, 16);
         let s1 = r.build_transmit(&bm, 0, layout, 7);
         // Pull the cache pointer / len so we can prove it didn't get
@@ -1430,10 +1701,21 @@ mod tests {
     #[test]
     fn build_transmit_invalidates_cache_on_revision_change() {
         let mut r = KittyPageRegistry::new(false, 1000);
-        let layout = LayoutKey { fit_width_px: 64, dark: false };
+        let layout = LayoutKey {
+            fit_width_px: 64,
+            dark: false,
+        };
         let bm = RgbaImage::new(16, 16);
         r.build_transmit(&bm, 0, layout, 7);
-        let len_before = r.pages.get(&0).unwrap().cached_payload.as_ref().unwrap().bytes.len();
+        let len_before = r
+            .pages
+            .get(&0)
+            .unwrap()
+            .cached_payload
+            .as_ref()
+            .unwrap()
+            .bytes
+            .len();
         // Modify bitmap (simulating an overlay change) and bump revision.
         let mut bm2 = RgbaImage::new(16, 16);
         for px in bm2.pixels_mut() {
@@ -1450,7 +1732,10 @@ mod tests {
     #[test]
     fn pre_encode_populates_cache() {
         let mut r = KittyPageRegistry::new(false, 1000);
-        let layout = LayoutKey { fit_width_px: 64, dark: false };
+        let layout = LayoutKey {
+            fit_width_px: 64,
+            dark: false,
+        };
         let bm = RgbaImage::new(16, 16);
         r.pre_encode(&bm, 5, layout, 3);
         let entry = r.pages.get(&5).expect("page entry exists after pre_encode");
@@ -1465,12 +1750,31 @@ mod tests {
     #[test]
     fn build_transmit_after_pre_encode_skips_re_encode() {
         let mut r = KittyPageRegistry::new(false, 1000);
-        let layout = LayoutKey { fit_width_px: 64, dark: false };
+        let layout = LayoutKey {
+            fit_width_px: 64,
+            dark: false,
+        };
         let bm = RgbaImage::new(16, 16);
         r.pre_encode(&bm, 0, layout, 7);
-        let ptr_after_pre = r.pages.get(&0).unwrap().cached_payload.as_ref().unwrap().bytes.as_ptr() as usize;
+        let ptr_after_pre = r
+            .pages
+            .get(&0)
+            .unwrap()
+            .cached_payload
+            .as_ref()
+            .unwrap()
+            .bytes
+            .as_ptr() as usize;
         let _s = r.build_transmit(&bm, 0, layout, 7);
-        let ptr_after_transmit = r.pages.get(&0).unwrap().cached_payload.as_ref().unwrap().bytes.as_ptr() as usize;
+        let ptr_after_transmit = r
+            .pages
+            .get(&0)
+            .unwrap()
+            .cached_payload
+            .as_ref()
+            .unwrap()
+            .bytes
+            .as_ptr() as usize;
         assert_eq!(
             ptr_after_pre, ptr_after_transmit,
             "build_transmit after pre_encode must reuse the bytes the pre-encode produced"
@@ -1480,7 +1784,10 @@ mod tests {
     #[test]
     fn evict_caps_at_max() {
         let mut r = KittyPageRegistry::new(false, 1000);
-        let layout = LayoutKey { fit_width_px: 64, dark: false };
+        let layout = LayoutKey {
+            fit_width_px: 64,
+            dark: false,
+        };
         let bm = RgbaImage::new(16, 16);
         // Fill past cap.
         for i in 0..(MAX_CACHED_PAGES + 8) {
@@ -1511,7 +1818,10 @@ mod tests {
     #[test]
     fn evict_skips_pinned_visible() {
         let mut r = KittyPageRegistry::new(false, 1000);
-        let layout = LayoutKey { fit_width_px: 64, dark: false };
+        let layout = LayoutKey {
+            fit_width_px: 64,
+            dark: false,
+        };
         // Prime LRU: pages 0..N+4 marked, in order. 0..4 are LRU.
         for i in 0..(MAX_CACHED_PAGES + 4) {
             r.mark_transmitted(i, layout, 0, 16, 16);
@@ -1539,7 +1849,10 @@ mod tests {
     #[test]
     fn touch_reorders_lru() {
         let mut r = KittyPageRegistry::new(false, 1000);
-        let layout = LayoutKey { fit_width_px: 64, dark: false };
+        let layout = LayoutKey {
+            fit_width_px: 64,
+            dark: false,
+        };
         r.mark_transmitted(0, layout, 0, 16, 16);
         r.mark_transmitted(1, layout, 0, 16, 16);
         r.mark_transmitted(2, layout, 0, 16, 16);
@@ -1557,16 +1870,26 @@ mod tests {
     /// image's leftmost columns.
     #[test]
     fn place_page_honors_src_left_cell() {
-        let mut buf = Buffer::empty(Rect { x: 0, y: 0, width: 10, height: 4 });
-        let area = Rect { x: 0, y: 0, width: 10, height: 4 };
+        let mut buf = Buffer::empty(Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 4,
+        });
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 4,
+        };
         let mut scratch = PlaceScratch::default();
         let written = place_page(
             &mut buf,
             area,
             /*page_idx*/ 0,
             /*image_id*/ 1,
-            /*pixel_w*/ 200,        // 20 cols at cell_w=10
-            /*pixel_h*/ 80,         // 4 rows at cell_h=20
+            /*pixel_w*/ 200, // 20 cols at cell_w=10
+            /*pixel_h*/ 80, // 4 rows at cell_h=20
             /*cell_w_px*/ 10,
             /*cell_h_px*/ 20,
             /*dst_top_cell*/ 0,
@@ -1585,9 +1908,13 @@ mod tests {
         assert!(
             symbol.contains(want_col),
             "first cell symbol must encode col=5 (= {:?}); got {:?}",
-            want_col, symbol
+            want_col,
+            symbol
         );
-        assert!(symbol.contains(want_row), "first cell must still encode row=0");
+        assert!(
+            symbol.contains(want_row),
+            "first cell must still encode row=0"
+        );
     }
 
     /// When src_left_cell would point past the rightmost image column,
@@ -1596,8 +1923,18 @@ mod tests {
     /// garbage / repeated content).
     #[test]
     fn place_page_clamps_width_at_image_right_edge() {
-        let mut buf = Buffer::empty(Rect { x: 0, y: 0, width: 10, height: 4 });
-        let area = Rect { x: 0, y: 0, width: 10, height: 4 };
+        let mut buf = Buffer::empty(Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 4,
+        });
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 4,
+        };
         let mut scratch = PlaceScratch::default();
         // 12-col-wide image; src_left_cell=8 leaves only 4 valid cols.
         let written = place_page(
@@ -1607,8 +1944,13 @@ mod tests {
             1,
             /*pixel_w*/ 120,
             /*pixel_h*/ 80,
-            10, 20,
-            0, 4, 0, /*src_left_cell*/ 8, /*requested width*/ 10,
+            10,
+            20,
+            0,
+            4,
+            0,
+            /*src_left_cell*/ 8,
+            /*requested width*/ 10,
             None,
             &mut scratch,
         );
@@ -1639,7 +1981,10 @@ mod tests {
             // Distance is at least the offset constant; means even a
             // 100k-page PDF won't have its last page's id collide with
             // page 0's overlay id.
-            assert!(o > p + 1000, "page {page}: overlay id should be far from page id");
+            assert!(
+                o > p + 1000,
+                "page {page}: overlay id should be far from page id"
+            );
         }
     }
 
@@ -1650,13 +1995,19 @@ mod tests {
     #[test]
     fn overlay_is_fresh_only_when_all_fields_match() {
         let mut r = KittyPageRegistry::new(false, 1000);
-        let layout = LayoutKey { fit_width_px: 64, dark: false };
+        let layout = LayoutKey {
+            fit_width_px: 64,
+            dark: false,
+        };
         r.overlay_mark_transmitted(0, layout, 7, 12345, 100, 50);
 
         // Exact match → fresh.
         assert!(r.overlay_is_fresh(0, layout, 7, 12345, 100, 50));
         // Layout change → stale (e.g. user changed zoom).
-        let layout2 = LayoutKey { fit_width_px: 128, dark: false };
+        let layout2 = LayoutKey {
+            fit_width_px: 128,
+            dark: false,
+        };
         assert!(!r.overlay_is_fresh(0, layout2, 7, 12345, 100, 50));
         // Revision change → stale (a highlight added on this page).
         assert!(!r.overlay_is_fresh(0, layout, 8, 12345, 100, 50));
@@ -1676,20 +2027,40 @@ mod tests {
     #[test]
     fn overlay_build_transmit_caches_payload() {
         let mut r = KittyPageRegistry::new(false, 1000);
-        let layout = LayoutKey { fit_width_px: 64, dark: false };
+        let layout = LayoutKey {
+            fit_width_px: 64,
+            dark: false,
+        };
         let bm = RgbaImage::new(16, 16);
 
         let s1 = r.overlay_build_transmit(&bm, 0, layout, 0, 1);
-        let cached_ptr_1 =
-            r.overlays.get(&0).unwrap().cached_payload.as_ref().unwrap().bytes.as_ptr() as usize;
+        let cached_ptr_1 = r
+            .overlays
+            .get(&0)
+            .unwrap()
+            .cached_payload
+            .as_ref()
+            .unwrap()
+            .bytes
+            .as_ptr() as usize;
 
         // Same fingerprint → reuse cache. Returned strings should match
         // byte-for-byte AND the cached bytes Vec must not have been
         // reallocated.
         let s2 = r.overlay_build_transmit(&bm, 0, layout, 0, 1);
-        let cached_ptr_2 =
-            r.overlays.get(&0).unwrap().cached_payload.as_ref().unwrap().bytes.as_ptr() as usize;
-        assert_eq!(s1, s2, "second build with same fingerprint should return identical string");
+        let cached_ptr_2 = r
+            .overlays
+            .get(&0)
+            .unwrap()
+            .cached_payload
+            .as_ref()
+            .unwrap()
+            .bytes
+            .as_ptr() as usize;
+        assert_eq!(
+            s1, s2,
+            "second build with same fingerprint should return identical string"
+        );
         assert_eq!(
             cached_ptr_1, cached_ptr_2,
             "cached payload Vec must not have been reallocated"
@@ -1697,8 +2068,15 @@ mod tests {
 
         // Different sel_sig → new encode (different bitmap intent).
         let _ = r.overlay_build_transmit(&bm, 0, layout, 0, 2);
-        let cached_ptr_3 =
-            r.overlays.get(&0).unwrap().cached_payload.as_ref().unwrap().bytes.as_ptr() as usize;
+        let cached_ptr_3 = r
+            .overlays
+            .get(&0)
+            .unwrap()
+            .cached_payload
+            .as_ref()
+            .unwrap()
+            .bytes
+            .as_ptr() as usize;
         // Pointer may or may not match (Vec might reuse the same
         // backing allocation if grown into the same slot) — what we
         // *can* assert is that the cached fingerprint flipped.
@@ -1714,14 +2092,22 @@ mod tests {
     #[test]
     fn overlay_drop_queues_terminal_delete() {
         let mut r = KittyPageRegistry::new(false, 1000);
-        let layout = LayoutKey { fit_width_px: 64, dark: false };
+        let layout = LayoutKey {
+            fit_width_px: 64,
+            dark: false,
+        };
         let bm = RgbaImage::new(16, 16);
         let _ = r.overlay_build_transmit(&bm, 0, layout, 0, 1);
         r.overlay_mark_transmitted(0, layout, 0, 1, 16, 16);
 
         r.overlay_drop(0);
-        let deletes = r.take_pending_deletes().expect("overlay_drop should queue a delete");
-        assert!(deletes.contains("_Ga=d,d=I,i="), "expected delete APC, got {deletes:?}");
+        let deletes = r
+            .take_pending_deletes()
+            .expect("overlay_drop should queue a delete");
+        assert!(
+            deletes.contains("_Ga=d,d=I,i="),
+            "expected delete APC, got {deletes:?}"
+        );
     }
 
     /// `build_overlay_place_apc` must emit a classical placement APC
@@ -1731,16 +2117,14 @@ mod tests {
     #[test]
     fn build_overlay_place_apc_format() {
         let s = build_overlay_place_apc(
-            /*overlay_id*/ 42,
-            /*width_cells*/ 30,
-            /*height_cells*/ 12,
-            /*src_left_px*/ 0,
-            /*src_top_px*/ 16,
-            /*src_w_px*/ 240,
-            /*src_h_px*/ 192,
-            /*is_tmux*/ false,
+            /*overlay_id*/ 42, /*width_cells*/ 30, /*height_cells*/ 12,
+            /*src_left_px*/ 0, /*src_top_px*/ 16, /*src_w_px*/ 240,
+            /*src_h_px*/ 192, /*is_tmux*/ false,
         );
-        assert!(s.starts_with("\x1b_G"), "APC must start with \\x1b_G; got {s:?}");
+        assert!(
+            s.starts_with("\x1b_G"),
+            "APC must start with \\x1b_G; got {s:?}"
+        );
         assert!(s.contains("a=p"), "must place");
         assert!(s.contains("U=0"), "classical (cursor-positioned) placement");
         assert!(s.contains("i=42"), "must reference image id");
@@ -1751,7 +2135,10 @@ mod tests {
         assert!(s.contains("Y=16"), "source y");
         assert!(s.contains("w=240"), "source w");
         assert!(s.contains("h=192"), "source h");
-        assert!(s.ends_with("\x1b\\"), "APC must end with \\x1b\\\\; got {s:?}");
+        assert!(
+            s.ends_with("\x1b\\"),
+            "APC must end with \\x1b\\\\; got {s:?}"
+        );
     }
 
     /// The same APC under tmux must be wrapped in the DCS passthrough
@@ -1760,8 +2147,14 @@ mod tests {
     #[test]
     fn build_overlay_place_apc_tmux_wraps() {
         let s = build_overlay_place_apc(1, 10, 5, 0, 0, 80, 80, /*is_tmux*/ true);
-        assert!(s.starts_with("\x1bPtmux;"), "tmux APC must start with DCS wrap; got {s:?}");
-        assert!(s.contains("\x1b\x1b_G"), "inner ESCs must be doubled inside tmux passthrough");
+        assert!(
+            s.starts_with("\x1bPtmux;"),
+            "tmux APC must start with DCS wrap; got {s:?}"
+        );
+        assert!(
+            s.contains("\x1b\x1b_G"),
+            "inner ESCs must be doubled inside tmux passthrough"
+        );
     }
 
     /// queue_deletes must collapse contiguous-id runs into one
@@ -1779,8 +2172,14 @@ mod tests {
         assert_eq!(s.matches("_Ga=d,d=R,").count(), 1, "got {s:?}");
         assert_eq!(s.matches("_Ga=d,d=I,").count(), 2, "got {s:?}");
         assert!(s.contains("d=I,i=5,"), "singleton 5 must be d=I; got {s:?}");
-        assert!(s.contains("d=R,x=7,y=9,"), "run 7..9 must be d=R; got {s:?}");
-        assert!(s.contains("d=I,i=12,"), "singleton 12 must be d=I; got {s:?}");
+        assert!(
+            s.contains("d=R,x=7,y=9,"),
+            "run 7..9 must be d=R; got {s:?}"
+        );
+        assert!(
+            s.contains("d=I,i=12,"),
+            "singleton 12 must be d=I; got {s:?}"
+        );
     }
 
     #[test]
@@ -1803,7 +2202,10 @@ mod tests {
     #[test]
     fn evict_drops_overlay_alongside_page() {
         let mut r = KittyPageRegistry::new(false, 1000);
-        let layout = LayoutKey { fit_width_px: 64, dark: false };
+        let layout = LayoutKey {
+            fit_width_px: 64,
+            dark: false,
+        };
         let bm = RgbaImage::new(16, 16);
         // Fill above cap; mark each page with an overlay too.
         for i in 0..(MAX_CACHED_PAGES + 4) {
@@ -1842,7 +2244,12 @@ mod tests {
     /// characters that hold the dead image_id reference.
     #[test]
     fn clear_page_area_overwrites_placement_with_row_clear_escape() {
-        let area = Rect { x: 0, y: 0, width: 6, height: 3 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 6,
+            height: 3,
+        };
         let mut buf = Buffer::empty(area);
         let mut scratch = PlaceScratch::default();
         // Paint a placement so cell (0,0) carries the kitty placeholder
@@ -1971,7 +2378,12 @@ mod tests {
     /// row-clear escape over the entire image area — wasted bandwidth.
     #[test]
     fn clear_page_area_is_idempotent_for_diff_purposes() {
-        let area = Rect { x: 0, y: 0, width: 8, height: 4 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 4,
+        };
         let mut buf_a = Buffer::empty(area);
         let mut buf_b = Buffer::empty(area);
         let mut scratch_a = PlaceScratch::default();
@@ -1996,7 +2408,12 @@ mod tests {
     /// + a per-cell `push(' ')` loop on every redraw.
     #[test]
     fn clear_page_area_caches_escape_until_dims_change() {
-        let area = Rect { x: 0, y: 0, width: 12, height: 5 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 12,
+            height: 5,
+        };
         let mut buf = Buffer::empty(area);
         let mut scratch = PlaceScratch::default();
         clear_page_area(&mut buf, area, &mut scratch);
@@ -2011,8 +2428,15 @@ mod tests {
         // Same area on a fresh buffer — must reuse the cached string.
         let mut buf2 = Buffer::empty(area);
         clear_page_area(&mut buf2, area, &mut scratch);
-        assert_eq!(scratch.cached_row_clear, cached_first, "string content changed");
-        assert_eq!(scratch.cached_row_clear.capacity(), cap_first, "string was reallocated");
+        assert_eq!(
+            scratch.cached_row_clear, cached_first,
+            "string content changed"
+        );
+        assert_eq!(
+            scratch.cached_row_clear.capacity(),
+            cap_first,
+            "string was reallocated"
+        );
         assert_eq!(
             scratch.cached_row_clear.as_ptr() as usize,
             ptr_first,
@@ -2021,10 +2445,18 @@ mod tests {
 
         // Resize — the cache MUST rebuild (different W/H means the
         // restore-cursor offsets in the escape are different).
-        let resized = Rect { x: 0, y: 0, width: 20, height: 8 };
+        let resized = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 8,
+        };
         let mut buf3 = Buffer::empty(resized);
         clear_page_area(&mut buf3, resized, &mut scratch);
-        assert_eq!(scratch.cached_row_clear_dims, (resized.width, resized.height));
+        assert_eq!(
+            scratch.cached_row_clear_dims,
+            (resized.width, resized.height)
+        );
         assert_ne!(
             scratch.cached_row_clear, cached_first,
             "cache must rebuild on dim change"
@@ -2037,17 +2469,32 @@ mod tests {
     /// rebuild the head string; switching to a different page must.
     #[test]
     fn place_page_caches_row_head_per_image_id() {
-        let area = Rect { x: 0, y: 0, width: 8, height: 4 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 4,
+        };
         let mut buf = Buffer::empty(area);
         let mut scratch = PlaceScratch::default();
 
         // First call with image_id=42 should populate the cache.
         place_page(
-            &mut buf, area,
-            /*page_idx*/ 0, /*image_id*/ 42,
-            /*pixel_w*/ 80, /*pixel_h*/ 80,
-            /*cell_w_px*/ 10, /*cell_h_px*/ 20,
-            0, 4, 0, 0, 8, None, &mut scratch,
+            &mut buf,
+            area,
+            /*page_idx*/ 0,
+            /*image_id*/ 42,
+            /*pixel_w*/ 80,
+            /*pixel_h*/ 80,
+            /*cell_w_px*/ 10,
+            /*cell_h_px*/ 20,
+            0,
+            4,
+            0,
+            0,
+            8,
+            None,
+            &mut scratch,
         );
         assert_eq!(scratch.cached_row_head_id, Some(42));
         let head_first = scratch.cached_row_head.clone();
@@ -2060,23 +2507,46 @@ mod tests {
 
         // Second call with same id must reuse the same allocation.
         place_page(
-            &mut buf, area,
-            0, 42,
-            80, 80, 10, 20,
-            0, 4, 0, 0, 8, None, &mut scratch,
+            &mut buf,
+            area,
+            0,
+            42,
+            80,
+            80,
+            10,
+            20,
+            0,
+            4,
+            0,
+            0,
+            8,
+            None,
+            &mut scratch,
         );
         assert_eq!(scratch.cached_row_head, head_first, "head changed");
         assert_eq!(
-            scratch.cached_row_head.as_ptr() as usize, ptr_first,
+            scratch.cached_row_head.as_ptr() as usize,
+            ptr_first,
             "row head was reallocated for the same image_id"
         );
 
         // Different id must rebuild the head with the new SGR.
         place_page(
-            &mut buf, area,
-            0, /*image_id*/ 99,
-            80, 80, 10, 20,
-            0, 4, 0, 0, 8, None, &mut scratch,
+            &mut buf,
+            area,
+            0,
+            /*image_id*/ 99,
+            80,
+            80,
+            10,
+            20,
+            0,
+            4,
+            0,
+            0,
+            8,
+            None,
+            &mut scratch,
         );
         assert_eq!(scratch.cached_row_head_id, Some(99));
         assert!(
@@ -2096,7 +2566,12 @@ mod tests {
     /// 40k+ "missing image for virtual placement" warnings → crash.
     #[test]
     fn placement_then_clear_marks_cell_as_emittable_diff() {
-        let area = Rect { x: 0, y: 0, width: 8, height: 3 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 3,
+        };
         let mut buf_prev = Buffer::empty(area);
         let mut buf_curr = Buffer::empty(area);
         let mut scratch = PlaceScratch::default();
@@ -2107,12 +2582,18 @@ mod tests {
         // end-of-frame state here.)
         clear_page_area(&mut buf_prev, area, &mut scratch);
         place_page(
-            &mut buf_prev, area,
-            /*page_idx*/ 0, /*image_id*/ 99,
-            /*pixel_w*/ 80, /*pixel_h*/ 60,
-            /*cell_w_px*/ 10, /*cell_h_px*/ 20,
-            /*dst_top_cell*/ 0, /*dst_height_cells*/ 3,
-            /*src_top_cell*/ 0, /*src_left_cell*/ 0,
+            &mut buf_prev,
+            area,
+            /*page_idx*/ 0,
+            /*image_id*/ 99,
+            /*pixel_w*/ 80,
+            /*pixel_h*/ 60,
+            /*cell_w_px*/ 10,
+            /*cell_h_px*/ 20,
+            /*dst_top_cell*/ 0,
+            /*dst_height_cells*/ 3,
+            /*src_top_cell*/ 0,
+            /*src_left_cell*/ 0,
             /*width_cells*/ 8,
             /*prefix*/ None,
             &mut scratch,
@@ -2137,7 +2618,8 @@ mod tests {
         let placement_cells_in_prev: Vec<(u16, u16)> = (0..area.height)
             .flat_map(|y| (0..area.width).map(move |x| (x, y)))
             .filter(|(x, y)| {
-                buf_prev.cell((*x, *y))
+                buf_prev
+                    .cell((*x, *y))
                     .is_some_and(|c| c.symbol().contains('\u{10EEEE}'))
             })
             .collect();
@@ -2161,7 +2643,12 @@ mod tests {
     fn place_page_after_clear_emits_centered_placement_to_terminal() {
         // Image area is 10 wide; page bitmap is 6 wide → centered with
         // a 2-cell left margin (dst_left_cell = 2).
-        let img_area = Rect { x: 0, y: 0, width: 10, height: 4 };
+        let img_area = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 4,
+        };
         let mut buf = Buffer::empty(img_area);
         let mut scratch = PlaceScratch::default();
 
@@ -2179,7 +2666,12 @@ mod tests {
             "post-clear, cells 1..N have skip=false so transitions emit"
         );
 
-        let placement_area = Rect { x: 2, y: 0, width: 6, height: 4 };
+        let placement_area = Rect {
+            x: 2,
+            y: 0,
+            width: 6,
+            height: 4,
+        };
         place_page(
             &mut buf,
             placement_area,

@@ -118,13 +118,15 @@ pub(crate) fn plan_transmit_deferrals(
     let mut candidates: Vec<usize> = blits
         .iter()
         .enumerate()
-        .filter_map(|(i, (need, _, has_prior))| {
-            if *need && *has_prior {
-                Some(i)
-            } else {
-                None
-            }
-        })
+        .filter_map(
+            |(i, (need, _, has_prior))| {
+                if *need && *has_prior {
+                    Some(i)
+                } else {
+                    None
+                }
+            },
+        )
         .collect();
     let needed = blits.iter().filter(|(n, _, _)| *n).count();
     if needed <= budget {
@@ -135,11 +137,7 @@ pub(crate) fn plan_transmit_deferrals(
     // farthest. Stable secondary sort by index for determinism.
     candidates.sort_by_key(|&i| {
         let p = blits[i].1;
-        let dist = if p >= current_page {
-            p - current_page
-        } else {
-            current_page - p
-        };
+        let dist = p.abs_diff(current_page);
         (dist, i)
     });
     // How many deferrable transmits can we shed? Non-deferrable
@@ -218,11 +216,12 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
         // pixels with `bg` during compose; here we paint a Block
         // across img_area so any cell the placement loop doesn't
         // touch falls back to the right page-background color.
-        let bg = if app.dark { Color::Rgb(20, 20, 20) } else { Color::Rgb(240, 240, 240) };
-        f.render_widget(
-            Block::default().style(Style::default().bg(bg)),
-            img_area,
-        );
+        let bg = if app.dark {
+            Color::Rgb(20, 20, 20)
+        } else {
+            Color::Rgb(240, 240, 240)
+        };
+        f.render_widget(Block::default().style(Style::default().bg(bg)), img_area);
         if let Err(e) = draw_pages_kitty(f, app, img_area) {
             f.render_widget(
                 Paragraph::new(format!("render error: {e:#}"))
@@ -232,8 +231,7 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
         }
     } else if let Err(e) = ensure_image(app, img_area) {
         f.render_widget(
-            Paragraph::new(format!("render error: {e:#}"))
-                .style(Style::default().fg(Color::Red)),
+            Paragraph::new(format!("render error: {e:#}")).style(Style::default().fg(Color::Red)),
             img_area,
         );
     } else if let Some(proto) = app.image_proto.as_mut() {
@@ -241,11 +239,7 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
         // composed image is exactly viewport-sized (we already
         // centered/cropped while painting), so render it across the
         // full image area.
-        f.render_stateful_widget(
-            StatefulImage::<StatefulProtocol>::new(),
-            img_area,
-            proto,
-        );
+        f.render_stateful_widget(StatefulImage::<StatefulProtocol>::new(), img_area, proto);
     }
 
     // The active Visual-mode selection is now baked into the page
@@ -282,8 +276,7 @@ fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
     let viewport_h = (area.height as u32) * (cell_h as u32);
     app.viewport_px = (viewport_w, viewport_h);
 
-    let fit_width_px = (((viewport_w as f32) * app.zoom).max(1.0) as u32)
-        .min(MAX_FIT_WIDTH_PX);
+    let fit_width_px = (((viewport_w as f32) * app.zoom).max(1.0) as u32).min(MAX_FIT_WIDTH_PX);
     app.ensure_layout(fit_width_px, viewport_h);
 
     let layout_key = LayoutKey {
@@ -361,7 +354,8 @@ fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
     //   - Selection-only: only selection_sig changed → re-blit just the
     //     selection's page over the previous canvas.
     let _compose_span = crate::profile::span(crate::profile::Phase::Compose);
-    let canvas = if let Some(c) = try_scroll_shift_canvas(app, &compose_key, viewport_w, viewport_h) {
+    let canvas = if let Some(c) = try_scroll_shift_canvas(app, &compose_key, viewport_w, viewport_h)
+    {
         c
     } else if let Some(c) = try_selection_only_repaint(app, &compose_key, viewport_w, viewport_h) {
         c
@@ -408,10 +402,12 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     let viewport_h = (area.height as u32) * cell_h;
     app.viewport_px = (viewport_w, viewport_h);
 
-    let fit_width_px =
-        (((viewport_w as f32) * app.zoom).max(1.0) as u32).min(MAX_FIT_WIDTH_PX);
+    let fit_width_px = (((viewport_w as f32) * app.zoom).max(1.0) as u32).min(MAX_FIT_WIDTH_PX);
     app.ensure_layout(fit_width_px, viewport_h);
-    let layout_key = LayoutKey { fit_width_px, dark: app.dark };
+    let layout_key = LayoutKey {
+        fit_width_px,
+        dark: app.dark,
+    };
 
     let visible_range = app.layout.visible_pages(app.scroll_y_px, viewport_h);
     // Filter out pages whose visible region rounds to 0 cells. The
@@ -424,7 +420,13 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     let visible: Vec<usize> = visible_range
         .clone()
         .filter(|&pi| {
-            visible_cell_height(&app.layout, app.scroll_y_px, area.height, pi, app.picker.font_size().1 as u32) > 0
+            visible_cell_height(
+                &app.layout,
+                app.scroll_y_px,
+                area.height,
+                pi,
+                app.picker.font_size().1 as u32,
+            ) > 0
         })
         .collect();
     if visible.is_empty() {
@@ -530,7 +532,9 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
         let pixel_dims = if let Some((bm, _)) = app.highlights_baked_cache.get(&page_idx) {
             Some((bm.width(), bm.height()))
         } else {
-            app.page_cache.get(&page_idx).map(|d| (d.width(), d.height()))
+            app.page_cache
+                .get(&page_idx)
+                .map(|d| (d.width(), d.height()))
         };
         let Some((pixel_w, pixel_h)) = pixel_dims else {
             continue;
@@ -580,7 +584,10 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
         }
 
         let revision = compute_page_revision(app, page_idx);
-        let kp = app.kitty_pages.as_ref().expect("kitty_pages should be Some on this draw path");
+        let kp = app
+            .kitty_pages
+            .as_ref()
+            .expect("kitty_pages should be Some on this draw path");
         let need_transmit = !kp.is_fresh(page_idx, layout_key, revision, pixel_w, pixel_h);
         let image_id = kp.image_id(page_idx);
         let sel_sig = app.selection_signature_for_page(page_idx);
@@ -647,7 +654,13 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
         let kp_ref = app.kitty_pages.as_ref().unwrap();
         let triples: Vec<(bool, usize, bool)> = blits
             .iter()
-            .map(|b| (b.need_transmit, b.page_idx, kp_ref.has_prior_transmit(b.page_idx)))
+            .map(|b| {
+                (
+                    b.need_transmit,
+                    b.page_idx,
+                    kp_ref.has_prior_transmit(b.page_idx),
+                )
+            })
             .collect();
         let current_page = app.current_page();
         let to_defer = plan_transmit_deferrals(&triples, current_page, MAX_TRANSMITS_PER_DRAW);
@@ -661,12 +674,15 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
         }
     }
 
-    // Build transmit strings for pages that need them. Source the
-    // bitmap from the highlights-baked tier when present, else fall
-    // back to page_cache.as_rgba8() — a borrowed view of the pdfium-
-    // returned bitmap, no clone. Pages with no highlights / search
-    // hits skip the baked tier entirely so the per-scroll path on a
-    // clean PDF avoids one ~6 MB RGBA copy per cold page.
+    // Build transmit strings for pages that need them. Three-tier
+    // bitmap source:
+    //   1. overlay_cache  — highlights + selection band baked in
+    //      (used when this page has an active selection touching it)
+    //   2. baked_cache    — highlights + search hits baked, no selection
+    //   3. page_cache     — raw pdfium bitmap, no overlays
+    // The selection-bake tier replaced the prior classical-placement
+    // overlay path that bled across tmux panes; see ensure_overlay.
+    let overlay_cache = &app.overlay_cache;
     let baked_cache = &app.highlights_baked_cache;
     let page_cache = &app.page_cache;
     let kp = app.kitty_pages.as_mut().unwrap();
@@ -676,7 +692,9 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
             if !b.need_transmit {
                 return None;
             }
-            let bm: &RgbaImage = if let Some((bm, _)) = baked_cache.get(&b.page_idx) {
+            let bm: &RgbaImage = if let Some((bm, _)) = overlay_cache.get(&b.page_idx) {
+                bm
+            } else if let Some((bm, _)) = baked_cache.get(&b.page_idx) {
                 bm
             } else {
                 page_cache.get(&b.page_idx)?.as_rgba8()?
@@ -685,129 +703,21 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
         })
         .collect();
 
-    // Build selection-overlay transmit + classical placement strings.
-    // For each visible page with active selection, this re-encodes a
-    // (mostly-transparent) RGBA the same dims as the page bitmap with
-    // selection rects painted at α=115. The PNG of an almost-empty
-    // image compresses to single-digit KB, so ~30 selection-drag
-    // keystrokes ship ~150 KB total instead of the ~5 MB the in-bitmap
-    // bake path produced.
-    //
-    // Every frame the page has selection, we re-emit the classical
-    // placement APC. The placement APC includes scroll-dependent X/Y/
-    // w/h source-crop parameters, so when the user scrolls the
-    // overlay's visible region tracks the page's. When the page
-    // doesn't have a selection, we ensure any prior overlay is dropped
-    // via the registry's pending_deletes queue (rides out on the next
-    // transmit, same as page evictions).
+    // Selection bake-into-page replaces the prior classical-placement
+    // overlay. The page bitmap now carries the band (via overlay_cache;
+    // ensure_overlay populates it). Drop any overlay images still
+    // resident in the terminal from before this code change so the
+    // terminal can free their bitmaps. The delete escapes ride out on
+    // the next page transmit via take_pending_deletes below.
     let mut overlay_payloads: Vec<Option<String>> = vec![None; blits.len()];
-    let mut overlay_marks: Vec<Option<(u64, u64, u32, u32)>> = vec![None; blits.len()];
+    let overlay_marks: Vec<Option<(u64, u64, u32, u32)>> = vec![None; blits.len()];
     {
         let kp = app.kitty_pages.as_mut().unwrap();
         for b in blits.iter() {
-            if !b.placement_active || b.height_cells == 0 {
-                // Skipped (e.g. rapid-burst defer); leave any prior
-                // overlay alone — the next non-skipped frame will
-                // refresh it.
-                continue;
-            }
-            if b.sel_sig == 0 && kp.overlay_is_present(b.page_idx) {
-                // No selection on this page but a prior overlay is
-                // resident. Drop it so the terminal frees its bitmap
-                // and the placement disappears. The delete escape
-                // rides out via take_pending_deletes below.
+            if kp.overlay_is_present(b.page_idx) {
                 kp.overlay_drop(b.page_idx);
             }
         }
-    }
-    {
-        // Second pass: build overlay images + transmits. Split from
-        // the first pass so the immutable borrows on app.text_cache /
-        // app.layout / app.text_selection don't fight the mut borrow
-        // on kitty_pages from the first pass.
-        let text_selection = app.text_selection;
-        let selection_color_idx = app.selection_color_idx;
-        let selection_placement = app.selection_placement;
-        // Take the scratch out of the App so the kp/text_cache borrows
-        // below can coexist with us mutating it. We always put it back
-        // at the end of this scope.
-        let mut scratch = app.selection_overlay_scratch.take();
-        let kp = app.kitty_pages.as_mut().unwrap();
-        for (i, b) in blits.iter().enumerate() {
-            if !b.placement_active || b.height_cells == 0 || b.sel_sig == 0 {
-                continue;
-            }
-            let Some(sel) = text_selection else { continue };
-            let Some(pt) = app.text_cache.get(b.page_idx) else { continue };
-
-            let need_overlay_transmit = !kp.overlay_is_fresh(
-                b.page_idx,
-                layout_key,
-                b.revision,
-                b.sel_sig,
-                b.pixel_w,
-                b.pixel_h,
-            );
-
-            let mut payload = String::new();
-            if need_overlay_transmit {
-                // Reuse the scratch RGBA when its dims match the page;
-                // otherwise reallocate (zoom or layout change). The
-                // fill function clears every pixel before painting so
-                // there's no risk of stale-paint bleed-through.
-                let img = match scratch.take() {
-                    Some(img) if img.dimensions() == (b.pixel_w, b.pixel_h) => img,
-                    _ => RgbaImage::new(b.pixel_w, b.pixel_h),
-                };
-                let mut img = img;
-                fill_selection_overlay_image(
-                    &mut img,
-                    b.page_idx,
-                    sel,
-                    pt,
-                    selection_color_idx,
-                    selection_placement,
-                );
-                payload.push_str(&kp.overlay_build_transmit(
-                    &img,
-                    b.page_idx,
-                    layout_key,
-                    b.revision,
-                    b.sel_sig,
-                ));
-                overlay_marks[i] = Some((b.revision, b.sel_sig, b.pixel_w, b.pixel_h));
-                scratch = Some(img);
-            }
-
-            // Classical placement APC. Cursor is at the page's first
-            // cell when this fires (= placement origin); save/restore
-            // brackets keep the page's placement loop using the cursor
-            // as designed. Source crop matches what place_page picks
-            // for the page placement, so the overlay registers exactly.
-            let overlay_id = kp.overlay_image_id(b.page_idx);
-            let src_left_px = (b.src_left_cell as u32) * cell_w;
-            let src_top_px = (b.src_top_cell as u32) * cell_h;
-            let src_w_px = (b.width_cells as u32) * cell_w;
-            let src_h_px = (b.height_cells as u32) * cell_h;
-            payload.push_str("\x1b[s");
-            payload.push_str(&crate::kitty_pages::build_overlay_place_apc(
-                overlay_id,
-                b.width_cells,
-                b.height_cells,
-                src_left_px,
-                src_top_px,
-                src_w_px,
-                src_h_px,
-                app.is_tmux,
-            ));
-            payload.push_str("\x1b[u");
-
-            overlay_payloads[i] = Some(payload);
-        }
-        // Return the scratch to the App for next frame. If no overlays
-        // were built this frame, scratch is whatever take() returned
-        // (Some on subsequent frames, None on first frame).
-        app.selection_overlay_scratch = scratch;
     }
 
     // Drain any pending kitty `a=d,d=I,i=ID` deletes from prior
@@ -951,8 +861,14 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
                 continue;
             }
             paint_loading_indicator(
-                buf, area, app, page_idx, scroll_y,
-                cell_w, cell_h, area_height_cells,
+                buf,
+                area,
+                app,
+                page_idx,
+                scroll_y,
+                cell_w,
+                cell_h,
+                area_height_cells,
             );
         }
     }
@@ -1020,14 +936,15 @@ fn paint_loading_indicator(
     let strip_top_cell = (strip_top_doc / cell_h_safe).min(area_height_cells as i64) as u16;
     // Strip bottom = strip_top + page height, clamped to the area.
     let strip_bot_doc = ((page_doc_y + page_h_px as i64) - scroll_y).max(0);
-    let strip_bot_cell = ((strip_bot_doc + cell_h_safe - 1) / cell_h_safe)
-        .min(area_height_cells as i64) as u16;
+    let strip_bot_cell =
+        ((strip_bot_doc + cell_h_safe - 1) / cell_h_safe).min(area_height_cells as i64) as u16;
     let strip_height = strip_bot_cell.saturating_sub(strip_top_cell);
     if strip_height == 0 {
         return;
     }
     // Vertical center of the strip in absolute buffer coordinates.
-    let mid_row = area.top()
+    let mid_row = area
+        .top()
         .saturating_add(strip_top_cell)
         .saturating_add(strip_height / 2);
     if mid_row >= area.bottom() {
@@ -1110,7 +1027,9 @@ fn draw_link_hints(
         if dy_px < 0 || dy_px >= viewport_h as i64 {
             continue;
         }
-        let cell_y = area.top().saturating_add((dy_px / cell_h as i64).max(0) as u16);
+        let cell_y = area
+            .top()
+            .saturating_add((dy_px / cell_h as i64).max(0) as u16);
 
         // Center horizontally within the page area: the page may
         // have been centered if narrower than viewport.
@@ -1120,7 +1039,8 @@ fn draw_link_hints(
         } else {
             0
         };
-        let cell_x = area.left()
+        let cell_x = area
+            .left()
             .saturating_add(dst_left_cell)
             .saturating_add((link_x_px / cell_w as i64).max(0) as u16);
 
@@ -1192,12 +1112,15 @@ pub(crate) fn compute_page_revision(app: &App<'_>, page_idx: usize) -> u64 {
     // went from 12 transmits per `y` keystroke to 1 once this localised.
     let highlight_sig = app.highlights.page_revision(page_idx);
 
-    // Selection deliberately excluded — it lives in a separate layered
-    // kitty image (classical placement at z=1 above the page) so a
-    // moving selection band doesn't force a re-encode and re-transmit
-    // of the whole page bitmap. The selection_drag_30 scenario went
-    // from ~32 transmits/170 KB each to ~1 page transmit + tiny
-    // overlay PNGs once selection moved off the page revision.
+    // Selection signature is included so a moving selection band
+    // re-bakes the page bitmap. The earlier design split the band
+    // into a separate kitty image at a classical placement (z=1),
+    // which paints in absolute terminal coordinates and bypasses
+    // tmux's per-pane clipping — adjacent panes went blank during
+    // selection. tdf, yazi, and ranger all bake-into-page for the
+    // same reason. Costs ~1 page re-encode per selection step (~2 ms
+    // PNG fast-Up); buys correctness across tmux + Ghostty + kitty.
+    let selection_sig = app.selection_signature_for_page(page_idx);
 
     // FNV-1a-style mix; doesn't need to be cryptographic — just
     // non-degenerate enough that flipping any single field flips the
@@ -1205,6 +1128,7 @@ pub(crate) fn compute_page_revision(app: &App<'_>, page_idx: usize) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for v in [
         highlight_sig,
+        selection_sig,
         search_revision,
         has_search_hits as u64,
         current_hit_on_this_page as u64,
@@ -1491,11 +1415,8 @@ fn drain_worker_results(app: &mut App<'_>) {
     };
     let drained = worker.drain();
     for resp in drained {
-        app.pages_in_flight.remove(&(
-            resp.req.page,
-            resp.req.target_width_px,
-            resp.req.dark,
-        ));
+        app.pages_in_flight
+            .remove(&(resp.req.page, resp.req.target_width_px, resp.req.dark));
         if resp.req.target_width_px != current_layout.fit_width_px
             || resp.req.dark != current_layout.dark
         {
@@ -1686,10 +1607,7 @@ fn page_overlay_key(app: &App<'_>, page_idx: usize, layout: LayoutKey) -> PageOv
     let (search_revision, has_search_hits, current_hit_on_this_page) = match &app.search {
         Some(s) => {
             let any = s.page_has_hits(page_idx);
-            let cur = s
-                .current_hit()
-                .map(|h| h.page == page_idx)
-                .unwrap_or(false);
+            let cur = s.current_hit().map(|h| h.page == page_idx).unwrap_or(false);
             (s.revision, any, cur)
         }
         None => (0, false, false),
@@ -1720,19 +1638,16 @@ fn page_overlay_key(app: &App<'_>, page_idx: usize, layout: LayoutKey) -> PageOv
 /// and paint just the selection band on top. For a heavily
 /// highlighted page the saved-N×fill_rect_blend disappears.
 pub(crate) fn ensure_overlay(app: &mut App<'_>, page_idx: usize, layout: LayoutKey) {
-    // Kitty mode short-circuit: the layered selection overlay (built
-    // by draw_pages_kitty) means the page bitmap on the terminal is
-    // selection-FREE. We only need the highlights-baked tier — the
-    // overlay_cache (= baked + selection painted in) is dead weight
-    // there: never read, but a per-keystroke ~6 MB RGBA copy. Drop
-    // any stale entry to free memory and skip the bake.
-    if app.kitty_pages.is_some() {
-        ensure_highlights_baked(app, page_idx, layout);
-        if app.overlay_cache.contains_key(&page_idx) {
-            app.overlay_cache.remove(&page_idx);
-        }
-        return;
-    }
+    // Both kitty + non-kitty backends now bake the selection band
+    // into the page bitmap. The earlier "kitty short-circuit" used a
+    // separate classical-placement overlay (`a=p,U=0,z=1`) for the
+    // band — but classical placements paint at absolute terminal
+    // coordinates that tmux can't clip per-pane, so dragging a
+    // selection blanked adjacent Ghostty panes (multiple kitty/tmux
+    // discussions confirm this is architecturally unfixable for
+    // U=0 placements). tdf, yazi, ranger all bake-into-page for
+    // the same reason. Cost: ~1 page re-encode per selection step
+    // (~2 ms PNG fast-Up); buys correctness across tmux + multi-pane.
 
     let overlay_key = page_overlay_key(app, page_idx, layout);
     if app
@@ -1863,9 +1778,7 @@ fn ensure_highlights_baked(app: &mut App<'_>, page_idx: usize, layout: LayoutKey
     // exists to keep the function total.
     let prev_buf = app.highlights_baked_cache.remove(&page_idx).map(|(b, _)| b);
     let mut img = match (src.as_rgba8(), prev_buf) {
-        (Some(src_rgba), Some(mut existing))
-            if existing.dimensions() == src_rgba.dimensions() =>
-        {
+        (Some(src_rgba), Some(mut existing)) if existing.dimensions() == src_rgba.dimensions() => {
             let dst: &mut [u8] = existing.as_mut();
             dst.copy_from_slice(src_rgba.as_raw());
             existing
@@ -1876,7 +1789,12 @@ fn ensure_highlights_baked(app: &mut App<'_>, page_idx: usize, layout: LayoutKey
 
     for h in app.highlights.for_page(page_idx) {
         let rect = norm_to_pixels(
-            Rect01 { x: h.x, y: h.y, w: h.w, h: h.h },
+            Rect01 {
+                x: h.x,
+                y: h.y,
+                w: h.w,
+                h: h.h,
+            },
             img.width(),
             img.height(),
         );
@@ -1944,7 +1862,9 @@ fn compose_into_buffer(app: &mut App<'_>, viewport_w: u32, viewport_h: u32) -> R
         let page_h = app.layout.page_h(page_idx) as i64;
         let top = (page_doc_y - scroll_y).max(0);
         let bot = (page_doc_y - scroll_y + page_h).min(viewport_h as i64);
-        if bot > top { covered.push((top, bot)); }
+        if bot > top {
+            covered.push((top, bot));
+        }
     }
 
     {
@@ -2040,8 +1960,9 @@ fn fill_side_margins(
     bg_row: &[u8],
 ) {
     let left_end = page_x_origin.max(0).min(viewport_w as i64) as usize;
-    let right_start =
-        (page_x_origin + fit_width_px as i64).max(0).min(viewport_w as i64) as usize;
+    let right_start = (page_x_origin + fit_width_px as i64)
+        .max(0)
+        .min(viewport_w as i64) as usize;
     let viewport_w_usize = viewport_w as usize;
     let buf = canvas.as_mut();
     let row_bytes = viewport_w_usize * 4;
@@ -2134,10 +2055,14 @@ pub fn bake_selection_into_page(
         };
         if matches!(sel.mode, crate::textlayout::SelMode::Linewise) {
             if let Some(line) = pt.line_of(start) {
-                if let Some(s) = pt.line_start(line) { start = s; }
+                if let Some(s) = pt.line_start(line) {
+                    start = s;
+                }
             }
             if let Some(line) = pt.line_of(end) {
-                if let Some(e) = pt.line_end(line) { end = e; }
+                if let Some(e) = pt.line_end(line) {
+                    end = e;
+                }
             }
         }
         let color = HIGHLIGHT_COLORS[color_idx % HIGHLIGHT_COLORS.len()];
@@ -2149,8 +2074,12 @@ pub fn bake_selection_into_page(
     if page_idx == sel.head.page {
         if let Some(c) = pt.chars.get(sel.head.idx) {
             let mut caret_rect = norm_to_pixels(c.bbox, img.width(), img.height());
-            if caret_rect.2 < 2 { caret_rect.2 = 2; }
-            if caret_rect.3 < 2 { caret_rect.3 = 2; }
+            if caret_rect.2 < 2 {
+                caret_rect.2 = 2;
+            }
+            if caret_rect.3 < 2 {
+                caret_rect.3 = 2;
+            }
             outline_rect(img, caret_rect, (40, 40, 40), 1);
             fill_rect_blend(img, caret_rect, (255, 255, 255), 0.55);
         }
@@ -2205,10 +2134,14 @@ pub(crate) fn fill_selection_overlay_image(
         };
         if matches!(sel.mode, crate::textlayout::SelMode::Linewise) {
             if let Some(line) = pt.line_of(start) {
-                if let Some(s) = pt.line_start(line) { start = s; }
+                if let Some(s) = pt.line_start(line) {
+                    start = s;
+                }
             }
             if let Some(line) = pt.line_of(end) {
-                if let Some(e) = pt.line_end(line) { end = e; }
+                if let Some(e) = pt.line_end(line) {
+                    end = e;
+                }
             }
         }
         let color = HIGHLIGHT_COLORS[color_idx % HIGHLIGHT_COLORS.len()];
@@ -2226,8 +2159,12 @@ pub(crate) fn fill_selection_overlay_image(
     if page_idx == sel.head.page {
         if let Some(c) = pt.chars.get(sel.head.idx) {
             let mut caret_rect = norm_to_pixels(c.bbox, img.width(), img.height());
-            if caret_rect.2 < 2 { caret_rect.2 = 2; }
-            if caret_rect.3 < 2 { caret_rect.3 = 2; }
+            if caret_rect.2 < 2 {
+                caret_rect.2 = 2;
+            }
+            if caret_rect.3 < 2 {
+                caret_rect.3 = 2;
+            }
             // Caret: translucent dark frame + lighter interior fill. We
             // use opaque RGBA writes here (matching the bake path's
             // outline_rect + fill_rect_blend on a solid page) — the
@@ -2236,9 +2173,17 @@ pub(crate) fn fill_selection_overlay_image(
             let (cx, cy, cw, ch) = caret_rect;
             // Top, bottom, left, right border bands — full alpha black.
             fill_rect_rgba(img, (cx, cy, cw, 1), [40, 40, 40, 255]);
-            fill_rect_rgba(img, (cx, cy + ch.saturating_sub(1), cw, 1), [40, 40, 40, 255]);
+            fill_rect_rgba(
+                img,
+                (cx, cy + ch.saturating_sub(1), cw, 1),
+                [40, 40, 40, 255],
+            );
             fill_rect_rgba(img, (cx, cy, 1, ch), [40, 40, 40, 255]);
-            fill_rect_rgba(img, (cx + cw.saturating_sub(1), cy, 1, ch), [40, 40, 40, 255]);
+            fill_rect_rgba(
+                img,
+                (cx + cw.saturating_sub(1), cy, 1, ch),
+                [40, 40, 40, 255],
+            );
             // Interior fill: 0.55 white-blend → α=140 white.
             fill_rect_rgba(img, (cx, cy, cw, ch), [255, 255, 255, 140]);
         }
@@ -2295,14 +2240,16 @@ fn status_line(app: &App<'_>) -> Paragraph<'static> {
         // mid-page nudges it smoothly.
         let pct = reading_percent(app);
         spans.push(Span::styled(
-            format!(" {}/{}  {:>2}%  ", app.current_page() + 1, app.page_count, pct),
+            format!(
+                " {}/{}  {:>2}%  ",
+                app.current_page() + 1,
+                app.page_count,
+                pct
+            ),
             Style::default().fg(Color::White),
         ));
         if app.dark {
-            spans.push(Span::styled(
-                "DARK  ",
-                Style::default().fg(Color::Cyan),
-            ));
+            spans.push(Span::styled("DARK  ", Style::default().fg(Color::Cyan)));
         }
         if (app.zoom - 1.0).abs() > 0.001 {
             spans.push(Span::raw(format!("zoom {:.0}%  ", app.zoom * 100.0)));
@@ -2384,8 +2331,8 @@ fn draw_toc(f: &mut Frame, app: &mut App<'_>, area: Rect) {
     } else {
         " outline (j/k Enter · / filter · Esc close) ".to_string()
     };
-    let para = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(title.bold()));
+    let para =
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title.bold()));
     f.render_widget(para, popup);
 }
 
@@ -2617,11 +2564,7 @@ mod transmit_budget_plan_tests {
         // Every transmit is first-time (no prior). Budget=1 but 3 pages
         // need to ship; deferring any would garble. Helper returns empty;
         // upstream cold-render budget should have prevented this state.
-        let blits = vec![
-            (true, 0, false),
-            (true, 1, false),
-            (true, 2, false),
-        ];
+        let blits = vec![(true, 0, false), (true, 1, false), (true, 2, false)];
         assert!(plan_transmit_deferrals(&blits, 1, 1).is_empty());
     }
 
@@ -2658,10 +2601,10 @@ mod tests {
     //! These catch the class of regression where a refactor silently
     //! changes a color, a glyph, or the help-overlay copy.
     use super::*;
+    use crate::textlayout::{Caret, CharCell, LineSpan, PageText, SelMode, TextSelection};
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
     use ratatui::Terminal;
-    use crate::textlayout::{Caret, CharCell, LineSpan, PageText, SelMode, TextSelection};
 
     // ---- Scroll-shift fast path -------------------------------------
 
@@ -2722,10 +2665,16 @@ mod tests {
         assert_eq!(buf, snapshot, "dy=0 must leave buffer untouched");
 
         shift_canvas_rows(&mut buf, w, h, 4);
-        assert_eq!(buf, snapshot, "dy >= viewport_h must leave buffer untouched");
+        assert_eq!(
+            buf, snapshot,
+            "dy >= viewport_h must leave buffer untouched"
+        );
 
         shift_canvas_rows(&mut buf, w, h, -4);
-        assert_eq!(buf, snapshot, "|dy| >= viewport_h must leave buffer untouched");
+        assert_eq!(
+            buf, snapshot,
+            "|dy| >= viewport_h must leave buffer untouched"
+        );
     }
 
     // ---- Selection bake (the real "is the user seeing it" test) ----
@@ -2745,7 +2694,12 @@ mod tests {
                 chars.push(CharCell {
                     idx: chars.len(),
                     ch: Some(if line == 0 { 'a' } else { 'b' }),
-                    bbox: Rect01 { x, y: y_top, w: 0.08, h: y_bot - y_top },
+                    bbox: Rect01 {
+                        x,
+                        y: y_top,
+                        w: 0.08,
+                        h: y_bot - y_top,
+                    },
                     line,
                     origin_x: x,
                     is_generated: false,
@@ -2753,10 +2707,28 @@ mod tests {
             }
         }
         let lines = vec![
-            LineSpan { y_top: 0.10, y_bot: 0.20, start_idx: 0, end_idx: 4, word_starts: vec![0] },
-            LineSpan { y_top: 0.40, y_bot: 0.50, start_idx: 5, end_idx: 9, word_starts: vec![5] },
+            LineSpan {
+                y_top: 0.10,
+                y_bot: 0.20,
+                start_idx: 0,
+                end_idx: 4,
+                word_starts: vec![0],
+            },
+            LineSpan {
+                y_top: 0.40,
+                y_bot: 0.50,
+                start_idx: 5,
+                end_idx: 9,
+                word_starts: vec![5],
+            },
         ];
-        PageText { page_idx: 0, chars, lines, width_pts: 100.0, height_pts: 100.0 }
+        PageText {
+            page_idx: 0,
+            chars,
+            lines,
+            width_pts: 100.0,
+            height_pts: 100.0,
+        }
     }
 
     /// Pixels at the centre of a normalised rect on a `(w, h)` image.
@@ -2907,14 +2879,7 @@ mod tests {
         };
 
         let mut img = RgbaImage::new(200, 200);
-        fill_selection_overlay_image(
-            &mut img,
-            0,
-            sel,
-            &pt,
-            0, /* yellow */
-            false,
-        );
+        fill_selection_overlay_image(&mut img, 0, sel, &pt, 0 /* yellow */, false);
 
         // Yellow palette colour is (0xff, 0xd5, 0x4f). Inside the band
         // the overlay should be that color at α=115 (round(0.45 × 255)).
@@ -2930,7 +2895,8 @@ mod tests {
         // (potentially darkening or recoloring the page underneath).
         let outside = img.get_pixel(100, 60).0; // y=0.30, between line 0 and 1
         assert_eq!(
-            outside, [0, 0, 0, 0],
+            outside,
+            [0, 0, 0, 0],
             "non-selection pixels must be fully transparent (alpha=0)"
         );
     }
@@ -2954,7 +2920,8 @@ mod tests {
         fill_selection_overlay_image(&mut img, 0, sel, &pt, 0, false);
         for (_, _, p) in img.enumerate_pixels() {
             assert_eq!(
-                p.0, [0, 0, 0, 0],
+                p.0,
+                [0, 0, 0, 0],
                 "off-selection page must be fully transparent — fill must clear stale pixels"
             );
         }
@@ -2968,25 +2935,25 @@ mod tests {
     fn overlay_image_in_placement_mode_paints_caret_but_not_band() {
         let pt = synthetic_page_text();
         let caret = Caret { page: 0, idx: 2 };
-        let sel = TextSelection { anchor: caret, head: caret, mode: SelMode::Charwise };
+        let sel = TextSelection {
+            anchor: caret,
+            head: caret,
+            mode: SelMode::Charwise,
+        };
         let mut img = RgbaImage::new(200, 200);
         fill_selection_overlay_image(
-            &mut img,
-            0,
-            sel,
-            &pt,
-            0, /* yellow */
+            &mut img, 0, sel, &pt, 0,    /* yellow */
             true, /* placement_mode */
         );
 
         // The yellow band-fill signature would be α=115 RGB=(255,213,79).
         // Walk the image; not a single such pixel should exist.
         for (_, _, p) in img.enumerate_pixels() {
-            let band_match = p.0[0] == 0xff
-                && p.0[1] == 0xd5
-                && p.0[2] == 0x4f
-                && p.0[3] == 115;
-            assert!(!band_match, "placement mode must not paint band-fill pixels");
+            let band_match = p.0[0] == 0xff && p.0[1] == 0xd5 && p.0[2] == 0x4f && p.0[3] == 115;
+            assert!(
+                !band_match,
+                "placement mode must not paint band-fill pixels"
+            );
         }
 
         // The caret cell (head bbox) must contain at least some non-
@@ -3024,7 +2991,11 @@ mod tests {
         let pt = synthetic_page_text();
         // anchor == head means placement mode's "caret only" intent.
         let caret = Caret { page: 0, idx: 2 };
-        let sel = TextSelection { anchor: caret, head: caret, mode: SelMode::Charwise };
+        let sel = TextSelection {
+            anchor: caret,
+            head: caret,
+            mode: SelMode::Charwise,
+        };
 
         bake_selection_into_page(&mut img, 0, sel, &pt, 0, /*placement=*/ true);
 
@@ -3073,7 +3044,9 @@ mod tests {
         for y in y0..y1.min(200) {
             for x in x0..x1.min(200) {
                 let p = img.get_pixel(x.min(199), y.min(199)).0;
-                if p[0] != 255 || p[1] != 255 || p[2] != 255 { non_white += 1; }
+                if p[0] != 255 || p[1] != 255 || p[2] != 255 {
+                    non_white += 1;
+                }
             }
         }
         assert!(
@@ -3133,7 +3106,12 @@ mod tests {
         term.draw(|f| {
             draw_help(
                 f,
-                Rect { x: 0, y: 0, width: 50, height: 20 },
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 50,
+                    height: 20,
+                },
             );
         })
         .unwrap();
@@ -3163,15 +3141,23 @@ mod tests {
         // 100 / 16 = 6 source cells per page (last 4 px lost to
         // cell-quantization on purpose).
         let m = vec![
-            PageMetrics { width_pts: 100.0, height_pts: 100.0 },
-            PageMetrics { width_pts: 100.0, height_pts: 100.0 },
+            PageMetrics {
+                width_pts: 100.0,
+                height_pts: 100.0,
+            },
+            PageMetrics {
+                width_pts: 100.0,
+                height_pts: 100.0,
+            },
         ];
         let l = PageLayout::build(&m, 100, 0);
         // Scroll to y=96: src_top_cell=6 ≥ img_h_cells=6, so page 0
         // has no source cells left to draw — function must return 0.
         // (Pixel-wise 4 px of page 0 still intersect the viewport,
         // but cell quantization rounds those away.)
-        let h0 = visible_cell_height(&l, 96, /*viewport_h_cells*/ 50, 0, /*cell_h_px*/ 16);
+        let h0 = visible_cell_height(
+            &l, 96, /*viewport_h_cells*/ 50, 0, /*cell_h_px*/ 16,
+        );
         assert_eq!(h0, 0, "page 0 should have no source cells past row 96");
         let h1 = visible_cell_height(&l, 96, 50, 1, 16);
         assert!(h1 > 0, "page 1 should be visible");
@@ -3181,9 +3167,14 @@ mod tests {
     fn visible_cell_height_positive_for_top_of_doc() {
         use crate::layout::PageLayout;
         use crate::pdf::PageMetrics;
-        let m = vec![PageMetrics { width_pts: 100.0, height_pts: 100.0 }];
+        let m = vec![PageMetrics {
+            width_pts: 100.0,
+            height_pts: 100.0,
+        }];
         let l = PageLayout::build(&m, 100, 0);
-        let h = visible_cell_height(&l, 0, /*viewport_h_cells*/ 10, 0, /*cell_h_px*/ 16);
+        let h = visible_cell_height(
+            &l, 0, /*viewport_h_cells*/ 10, 0, /*cell_h_px*/ 16,
+        );
         // 100 px / 16 px/cell = 6 cells; viewport allows 10, so 6 wins.
         assert_eq!(h, 6);
     }

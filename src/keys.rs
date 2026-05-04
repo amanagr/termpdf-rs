@@ -1,7 +1,5 @@
 use anyhow::Result;
-use crossterm::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::app::{App, Mode};
 use crate::cmd;
@@ -150,27 +148,19 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
 
         // Within-document scroll. Arrows for fine; Ctrl-d/u for
         // half-screen jumps. All throttled.
-        KeyCode::Down => {
-            if app.note_scroll_attempt() {
-                app.scroll_by_screens(SCROLL_LINE);
-            }
+        KeyCode::Down if app.note_scroll_attempt() => {
+            app.scroll_by_screens(SCROLL_LINE);
         }
-        KeyCode::Up => {
-            if app.note_scroll_attempt() {
-                app.scroll_by_screens(-SCROLL_LINE);
-            }
+        KeyCode::Up if app.note_scroll_attempt() => {
+            app.scroll_by_screens(-SCROLL_LINE);
         }
         KeyCode::Left => app.scroll_x_by(-SCROLL_LINE),
         KeyCode::Right => app.scroll_x_by(SCROLL_LINE),
-        KeyCode::Char('d') if ctrl => {
-            if app.note_scroll_attempt() {
-                app.scroll_by_screens(SCROLL_HALF);
-            }
+        KeyCode::Char('d') if ctrl && app.note_scroll_attempt() => {
+            app.scroll_by_screens(SCROLL_HALF);
         }
-        KeyCode::Char('u') if ctrl => {
-            if app.note_scroll_attempt() {
-                app.scroll_by_screens(-SCROLL_HALF);
-            }
+        KeyCode::Char('u') if ctrl && app.note_scroll_attempt() => {
+            app.scroll_by_screens(-SCROLL_HALF);
         }
         // Vim-style jumplist: <C-o> back, <C-i> / Tab forward.
         KeyCode::Char('o') if ctrl => app.jump_back(),
@@ -294,10 +284,8 @@ fn cmd_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
             cmd::execute(app, &buf);
             app.mode = Mode::Normal;
         }
-        KeyCode::Backspace => {
-            if app.cmd_buffer.pop().is_none() {
-                app.mode = Mode::Normal;
-            }
+        KeyCode::Backspace if app.cmd_buffer.pop().is_none() => {
+            app.mode = Mode::Normal;
         }
         KeyCode::Char(c) => app.cmd_buffer.push(c),
         _ => {}
@@ -360,22 +348,55 @@ fn visual_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         KeyCode::Char('c') => app.cycle_color(),
 
         // Char-wise caret motion (vim's `h`/`l`).
-        KeyCode::Char('h') | KeyCode::Left => { app.move_head_chars(-1); moved_head = true; }
-        KeyCode::Char('l') | KeyCode::Right => { app.move_head_chars(1); moved_head = true; }
+        KeyCode::Char('h') | KeyCode::Left => {
+            app.move_head_chars(-1);
+            moved_head = true;
+        }
+        KeyCode::Char('l') | KeyCode::Right => {
+            app.move_head_chars(1);
+            moved_head = true;
+        }
         // Line-wise caret motion (`j`/`k`); column-preserving.
-        KeyCode::Char('j') | KeyCode::Down => { app.move_head_lines(1); moved_head = true; }
-        KeyCode::Char('k') | KeyCode::Up => { app.move_head_lines(-1); moved_head = true; }
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.move_head_lines(1);
+            moved_head = true;
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.move_head_lines(-1);
+            moved_head = true;
+        }
 
         // Word motions.
-        KeyCode::Char('w') => { app.move_head_word_forward(); moved_head = true; }
-        KeyCode::Char('b') => { app.move_head_word_back(); moved_head = true; }
-        KeyCode::Char('e') => { app.move_head_word_end(); moved_head = true; }
+        KeyCode::Char('w') => {
+            app.move_head_word_forward();
+            moved_head = true;
+        }
+        KeyCode::Char('b') => {
+            app.move_head_word_back();
+            moved_head = true;
+        }
+        KeyCode::Char('e') => {
+            app.move_head_word_end();
+            moved_head = true;
+        }
 
         // Line-extreme + page-extreme motions.
-        KeyCode::Char('0') => { app.move_head_line_start(); moved_head = true; }
-        KeyCode::Char('^') => { app.move_head_line_first_nonblank(); moved_head = true; }
-        KeyCode::Char('$') => { app.move_head_line_end(); moved_head = true; }
-        KeyCode::Char('G') => { app.move_head_page_bottom(); moved_head = true; }
+        KeyCode::Char('0') => {
+            app.move_head_line_start();
+            moved_head = true;
+        }
+        KeyCode::Char('^') => {
+            app.move_head_line_first_nonblank();
+            moved_head = true;
+        }
+        KeyCode::Char('$') => {
+            app.move_head_line_end();
+            moved_head = true;
+        }
+        KeyCode::Char('G') => {
+            app.move_head_page_bottom();
+            moved_head = true;
+        }
         KeyCode::Char('g') => app.pending.push('g'),
 
         // f<c>/F<c> — start a one-char wait for the target.

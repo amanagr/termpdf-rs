@@ -38,12 +38,21 @@ fn binary_path() -> Option<PathBuf> {
 fn pdfium_or_skip() -> Option<pdfium_render::prelude::Pdfium> {
     let candidates = [
         std::env::var("TERMPDF_PDFIUM").ok(),
-        Some(format!("{}/vendor/lib/libpdfium.so", env!("CARGO_MANIFEST_DIR"))),
-        Some(format!("{}/vendor/libpdfium.so", env!("CARGO_MANIFEST_DIR"))),
+        Some(format!(
+            "{}/vendor/lib/libpdfium.so",
+            env!("CARGO_MANIFEST_DIR")
+        )),
+        Some(format!(
+            "{}/vendor/libpdfium.so",
+            env!("CARGO_MANIFEST_DIR")
+        )),
         Some("/usr/lib64/libpdfium.so".into()),
         Some("/usr/lib/libpdfium.so".into()),
     ];
-    let lib = candidates.into_iter().flatten().find(|p| std::path::Path::new(p).exists());
+    let lib = candidates
+        .into_iter()
+        .flatten()
+        .find(|p| std::path::Path::new(p).exists());
     let lib = match lib {
         Some(p) => p,
         None => {
@@ -60,7 +69,10 @@ fn pdfium_or_skip() -> Option<pdfium_render::prelude::Pdfium> {
 fn make_test_pdf(pdfium: &pdfium_render::prelude::Pdfium, n_pages: usize) -> PathBuf {
     use pdfium_render::prelude::*;
     let mut path = std::env::temp_dir();
-    path.push(format!("termpdf-perf-regression-{}.pdf", std::process::id()));
+    path.push(format!(
+        "termpdf-perf-regression-{}.pdf",
+        std::process::id()
+    ));
     let mut doc = pdfium.create_new_pdf().expect("create pdf");
     for i in 0..n_pages {
         let mut page = doc
@@ -192,7 +204,9 @@ fn count_kitty_transmit_headers(haystack: &[u8]) -> usize {
 
 fn count_png_files_recursive(root: &Path) -> usize {
     let mut n = 0;
-    let Ok(read) = std::fs::read_dir(root) else { return 0 };
+    let Ok(read) = std::fs::read_dir(root) else {
+        return 0;
+    };
     for entry in read.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -215,11 +229,13 @@ fn count_png_files_recursive(root: &Path) -> usize {
 /// matches the pattern in `render_kitty.rs`.
 #[test]
 fn perf_optimizations_stay_wired_into_binary() {
-    let Some(pdfium) = pdfium_or_skip() else { return };
+    let Some(pdfium) = pdfium_or_skip() else {
+        return;
+    };
     let pdf = make_test_pdf(&pdfium, 5);
 
-    let scratch_cache = std::env::temp_dir()
-        .join(format!("perf-regression-cache-{}", std::process::id()));
+    let scratch_cache =
+        std::env::temp_dir().join(format!("perf-regression-cache-{}", std::process::id()));
     // Best-effort cleanup of any leftover scratch from a prior crashed
     // run — set_var/remove_var won't fail us either way.
     let _ = std::fs::remove_dir_all(&scratch_cache);

@@ -33,12 +33,21 @@ fn binary_path() -> Option<PathBuf> {
 fn pdfium_or_skip() -> Option<pdfium_render::prelude::Pdfium> {
     let candidates = [
         std::env::var("TERMPDF_PDFIUM").ok(),
-        Some(format!("{}/vendor/lib/libpdfium.so", env!("CARGO_MANIFEST_DIR"))),
-        Some(format!("{}/vendor/libpdfium.so", env!("CARGO_MANIFEST_DIR"))),
+        Some(format!(
+            "{}/vendor/lib/libpdfium.so",
+            env!("CARGO_MANIFEST_DIR")
+        )),
+        Some(format!(
+            "{}/vendor/libpdfium.so",
+            env!("CARGO_MANIFEST_DIR")
+        )),
         Some("/usr/lib64/libpdfium.so".into()),
         Some("/usr/lib/libpdfium.so".into()),
     ];
-    let lib = candidates.into_iter().flatten().find(|p| std::path::Path::new(p).exists());
+    let lib = candidates
+        .into_iter()
+        .flatten()
+        .find(|p| std::path::Path::new(p).exists());
     let lib = match lib {
         Some(p) => p,
         None => {
@@ -74,7 +83,13 @@ fn make_test_pdf(pdfium: &pdfium_render::prelude::Pdfium) -> PathBuf {
     path
 }
 
-fn spawn_in_pty(pdf: &std::path::Path) -> (Box<dyn portable_pty::Child + Send + Sync>, Box<dyn Write + Send>, mpsc::Receiver<Vec<u8>>) {
+fn spawn_in_pty(
+    pdf: &std::path::Path,
+) -> (
+    Box<dyn portable_pty::Child + Send + Sync>,
+    Box<dyn Write + Send>,
+    mpsc::Receiver<Vec<u8>>,
+) {
     let bin = binary_path().expect("binary built");
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -102,8 +117,8 @@ fn spawn_in_pty(pdf: &std::path::Path) -> (Box<dyn portable_pty::Child + Send + 
     cmd.env("TERMPDF_CELL_PX", "8x16");
     // Sandbox the disk cache to a per-test temp dir so test runs
     // don't pollute the user's real ~/.cache/termpdf-rs.
-    let tmp_cache = std::env::temp_dir()
-        .join(format!("termpdf-test-cache-kitty-{}", std::process::id()));
+    let tmp_cache =
+        std::env::temp_dir().join(format!("termpdf-test-cache-kitty-{}", std::process::id()));
     cmd.env("XDG_CACHE_HOME", &tmp_cache);
 
     let child = pair.slave.spawn_command(cmd).expect("spawn");
@@ -171,7 +186,13 @@ fn dump_printable(bytes: &[u8], n: usize) -> String {
     let take = bytes.len().min(n);
     bytes[..take]
         .iter()
-        .map(|b| if (0x20..=0x7e).contains(b) || *b == b'\n' { *b as char } else { '.' })
+        .map(|b| {
+            if (0x20..=0x7e).contains(b) || *b == b'\n' {
+                *b as char
+            } else {
+                '.'
+            }
+        })
         .collect()
 }
 
@@ -186,7 +207,9 @@ fn dump_printable(bytes: &[u8], n: usize) -> String {
 ///   * `:q` cleanly exits.
 #[test]
 fn binary_kitty_path_emits_transmit_and_placeholders() {
-    let Some(pdfium) = pdfium_or_skip() else { return };
+    let Some(pdfium) = pdfium_or_skip() else {
+        return;
+    };
     let pdf = make_test_pdf(&pdfium);
 
     let (mut child, mut writer, rx) = spawn_in_pty(&pdf);
@@ -239,5 +262,8 @@ fn binary_kitty_path_emits_transmit_and_placeholders() {
     if !clean_exit {
         let _ = child.kill();
     }
-    assert!(clean_exit, "binary did not exit after `:q\\r` on kitty path");
+    assert!(
+        clean_exit,
+        "binary did not exit after `:q\\r` on kitty path"
+    );
 }

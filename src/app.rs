@@ -6,15 +6,15 @@ use image::{DynamicImage, Rgba, RgbaImage};
 use pdfium_render::prelude::PdfDocument;
 use ratatui::layout::Rect;
 use ratatui_image::picker::{Picker, ProtocolType};
-use ratatui_image::protocol::{ImageSource, StatefulProtocol, StatefulProtocolType};
 use ratatui_image::protocol::kitty::StatefulKitty;
+use ratatui_image::protocol::{ImageSource, StatefulProtocol, StatefulProtocolType};
 
 use crate::highlight::{Highlight, HighlightStore, Rect01, HIGHLIGHT_COLORS};
 use crate::layout::PageLayout;
+use crate::links::LinkAction;
 use crate::outline::{self, OutlineEntry};
 use crate::pdf::{self, PageMetrics};
 use crate::pdfhighlights;
-use crate::links::LinkAction;
 use crate::search::SearchResults;
 use crate::session::Session;
 use crate::textlayout::{Caret, SelMode, TextCache, TextSelection};
@@ -508,10 +508,11 @@ impl<'doc> App<'doc> {
         // App::is_tmux field. (Previously did std::env::var("TMUX") twice
         // — harmless at init, but the duplication invited drift.)
         let is_tmux = std::env::var("TMUX").is_ok();
-        let kitty_pages = matches!(picker.protocol_type(), ratatui_image::picker::ProtocolType::Kitty)
-            .then(|| {
-                crate::kitty_pages::KittyPageRegistry::new(is_tmux, stable_kitty_id())
-            });
+        let kitty_pages = matches!(
+            picker.protocol_type(),
+            ratatui_image::picker::ProtocolType::Kitty
+        )
+        .then(|| crate::kitty_pages::KittyPageRegistry::new(is_tmux, stable_kitty_id()));
         let app = Self {
             document,
             path: path.to_path_buf(),
@@ -621,8 +622,7 @@ impl<'doc> App<'doc> {
             let cur_page = self.layout.page_at(self.scroll_y_px);
             let cur_page_y = self.layout.page_y(cur_page);
             let cur_page_h = self.layout.page_h(cur_page).max(1) as f32;
-            let frac =
-                ((self.scroll_y_px - cur_page_y) as f32 / cur_page_h).clamp(0.0, 1.0);
+            let frac = ((self.scroll_y_px - cur_page_y) as f32 / cur_page_h).clamp(0.0, 1.0);
             Some((cur_page, frac))
         } else {
             None
@@ -667,7 +667,8 @@ impl<'doc> App<'doc> {
         let hi = visible.end.saturating_add(MARGIN);
         self.page_cache.retain(|&k, _| k >= lo && k < hi);
         self.overlay_cache.retain(|&k, _| k >= lo && k < hi);
-        self.highlights_baked_cache.retain(|&k, _| k >= lo && k < hi);
+        self.highlights_baked_cache
+            .retain(|&k, _| k >= lo && k < hi);
         self.page_cache_lru.retain(|&k| k >= lo && k < hi);
         // The text-layout cache holds char bbox + line index per page;
         // a few hundred KB per page in dense documents. Drop any entry
@@ -680,8 +681,7 @@ impl<'doc> App<'doc> {
             a.page..=b.page
         });
         self.text_cache.retain(|page| {
-            (page >= lo && page < hi)
-                || pin_range.as_ref().is_some_and(|r| r.contains(&page))
+            (page >= lo && page < hi) || pin_range.as_ref().is_some_and(|r| r.contains(&page))
         });
     }
 
@@ -696,7 +696,9 @@ impl<'doc> App<'doc> {
         if let Some((img, _)) = self.overlay_cache.get(&page_idx) {
             return Some(img);
         }
-        self.highlights_baked_cache.get(&page_idx).map(|(img, _)| img)
+        self.highlights_baked_cache
+            .get(&page_idx)
+            .map(|(img, _)| img)
     }
 
     /// Mark a page as the most-recently-used. Called every time
@@ -828,7 +830,9 @@ impl<'doc> App<'doc> {
     /// position. Use `leading_page()` for navigation.
     pub fn current_page(&self) -> usize {
         let center = self.scroll_y_px + (self.viewport_px.1 as i64 / 2);
-        self.layout.page_at(center).min(self.page_count.saturating_sub(1))
+        self.layout
+            .page_at(center)
+            .min(self.page_count.saturating_sub(1))
     }
 
     /// Page that contains the *top* of the viewport. This is what
@@ -961,7 +965,9 @@ impl<'doc> App<'doc> {
     /// or doesn't touch this page so a non-baking page hits the cache
     /// regardless of selection state on other pages.
     pub fn selection_signature_for_page(&self, page_idx: usize) -> u64 {
-        let Some(sel) = self.text_selection else { return 0 };
+        let Some(sel) = self.text_selection else {
+            return 0;
+        };
         let (lo, hi) = sel.ordered();
         if page_idx < lo.page || page_idx > hi.page {
             return 0;
@@ -991,7 +997,9 @@ impl<'doc> App<'doc> {
     /// Process-global selection fingerprint for the compose tier.
     /// 0 if there's no active selection.
     pub fn selection_signature_global(&self) -> u64 {
-        let Some(sel) = self.text_selection else { return 0 };
+        let Some(sel) = self.text_selection else {
+            return 0;
+        };
         let (lo, hi) = sel.ordered();
         let mut h: u64 = 0xcbf29ce484222325;
         let mut mix = |v: u64| {
@@ -1046,8 +1054,7 @@ impl<'doc> App<'doc> {
                 self.status = format!("→ references (page {})", p + 1);
             }
             None => {
-                self.status =
-                    "no References / Bibliography section found in outline".into();
+                self.status = "no References / Bibliography section found in outline".into();
             }
         }
     }
@@ -1234,9 +1241,16 @@ impl<'doc> App<'doc> {
         let caret = Caret { page, idx };
         self.text_selection = Some(TextSelection::new(caret));
         self.mode = Mode::Visual;
-        self.selection_placement = true;
+        // Land in selection mode (vim semantics): the next hjkl/wbe
+        // immediately extends the band from the anchor. Earlier this
+        // started in `placement` mode where motions kept the band
+        // collapsed (anchor followed head) and a second `v` was
+        // required to "lock" the anchor — non-vim and surprising.
+        // `v` while in Visual still toggles back to placement for
+        // users who want to reposition the caret first.
+        self.selection_placement = false;
         self.clear_chord_state();
-        self.status = "VISUAL · placement — hjkl moves caret · v starts selection · Esc cancels".into();
+        self.status = "VISUAL · selecting — y save · Y copy · c color · v relocate · Esc".into();
     }
 
     /// Toggle between placement (caret moves freely, anchor follows
@@ -1245,7 +1259,9 @@ impl<'doc> App<'doc> {
     /// Normal starts in placement so the user can position before
     /// committing to a selection.
     pub fn toggle_selection_placement(&mut self) {
-        if self.mode != Mode::Visual { return }
+        if self.mode != Mode::Visual {
+            return;
+        }
         self.selection_placement = !self.selection_placement;
         self.status = if self.selection_placement {
             "VISUAL · placement — hjkl moves caret · v starts selection · Esc cancels".into()
@@ -1259,12 +1275,13 @@ impl<'doc> App<'doc> {
     /// head just landed so motions move both together (i.e. no band
     /// growth). Called after every caret-motion in `keys::visual_keys`.
     pub fn sync_anchor_to_head_if_placing(&mut self) {
-        if !self.selection_placement { return }
+        if !self.selection_placement {
+            return;
+        }
         if let Some(sel) = self.text_selection.as_mut() {
             sel.anchor = sel.head;
         }
     }
-
 
     /// If the head caret is outside the current viewport, scroll just
     /// enough to bring it back into view. Called after every caret-
@@ -1272,9 +1289,15 @@ impl<'doc> App<'doc> {
     /// drags the page along — otherwise the user mashes `j` and the
     /// selection keeps growing offscreen.
     pub fn scroll_to_head_if_offscreen(&mut self) {
-        let Some(sel) = self.text_selection else { return };
-        let Some(pt) = self.text_cache.get(sel.head.page) else { return };
-        let Some(c) = pt.chars.get(sel.head.idx) else { return };
+        let Some(sel) = self.text_selection else {
+            return;
+        };
+        let Some(pt) = self.text_cache.get(sel.head.page) else {
+            return;
+        };
+        let Some(c) = pt.chars.get(sel.head.idx) else {
+            return;
+        };
         let page_top = self.layout.page_y(sel.head.page);
         let page_h = self.layout.page_h(sel.head.page).max(1) as i64;
         let head_top_doc = page_top + (c.bbox.y * page_h as f32) as i64;
@@ -1518,8 +1541,12 @@ impl<'doc> App<'doc> {
         let mut entries: Vec<HintEntry> = Vec::new();
         let pages = self.document.pages();
         for &page_idx in &visible {
-            let Ok(page) = pages.get(page_idx as i32) else { continue };
-            let Some(metrics) = self.page_metrics.get(page_idx) else { continue };
+            let Ok(page) = pages.get(page_idx as i32) else {
+                continue;
+            };
+            let Some(metrics) = self.page_metrics.get(page_idx) else {
+                continue;
+            };
             for link in crate::links::enumerate(&page, metrics) {
                 entries.push(HintEntry {
                     page_idx,
@@ -1632,9 +1659,7 @@ impl<'doc> App<'doc> {
                         .spawn();
                     match r {
                         Ok(_) => self.status = format!("opened: {url}"),
-                        Err(e) => {
-                            self.status = format!("xdg-open failed for {url}: {e}")
-                        }
+                        Err(e) => self.status = format!("xdg-open failed for {url}: {e}"),
                     }
                 }
             }
@@ -1691,9 +1716,7 @@ impl<'doc> App<'doc> {
         let page_h = self.layout.page_h(hit.page) as i64;
         let hit_y_in_page = (hit.rect.y * page_h as f32) as i64;
         let target = page_y + hit_y_in_page - (self.viewport_px.1 as i64 / 3);
-        self.scroll_y_px = self
-            .layout
-            .clamp_scroll(target.max(0), self.viewport_px.1);
+        self.scroll_y_px = self.layout.clamp_scroll(target.max(0), self.viewport_px.1);
     }
 
     /// Open the TOC panel. No-op (with a status message) if the
@@ -2108,12 +2131,7 @@ impl<'doc> App<'doc> {
                 .items
                 .retain(|h| !(h.page == page && h.group_id == Some(g))),
             None => {
-                if let Some(idx) = self
-                    .highlights
-                    .items
-                    .iter()
-                    .rposition(|h| h.page == page)
-                {
+                if let Some(idx) = self.highlights.items.iter().rposition(|h| h.page == page) {
                     self.highlights.items.remove(idx);
                 }
             }
@@ -2237,14 +2255,14 @@ impl<'doc> App<'doc> {
     /// is active or when a page's text load fails (rare; pdfium errors
     /// are logged via the same path as elsewhere).
     fn ensure_selection_text_loaded(&mut self) {
-        let Some(sel) = self.text_selection else { return };
+        let Some(sel) = self.text_selection else {
+            return;
+        };
         let (lo, hi) = sel.ordered();
-        let pages_to_load = pages_needing_text_load(
-            lo.page,
-            hi.page,
-            self.page_metrics.len(),
-            |p| self.text_cache.get(p).is_some(),
-        );
+        let pages_to_load =
+            pages_needing_text_load(lo.page, hi.page, self.page_metrics.len(), |p| {
+                self.text_cache.get(p).is_some()
+            });
         for page_idx in pages_to_load {
             let Some(metrics) = self.page_metrics.get(page_idx).copied() else {
                 continue;
@@ -2321,11 +2339,7 @@ impl<'doc> App<'doc> {
     pub fn build_protocol(&self, canvas: DynamicImage) -> StatefulProtocol {
         match self.picker.protocol_type() {
             ProtocolType::Kitty => {
-                let source = ImageSource::new(
-                    canvas,
-                    self.picker.font_size(),
-                    Rgba([0, 0, 0, 0]),
-                );
+                let source = ImageSource::new(canvas, self.picker.font_size(), Rgba([0, 0, 0, 0]));
                 let kitty = StatefulKitty::new(self.kitty_image_id, self.is_tmux);
                 StatefulProtocol::new(
                     source,
@@ -2348,8 +2362,7 @@ impl<'doc> App<'doc> {
         let cur_page = self.current_page();
         let page_y = self.layout.page_y(cur_page);
         let page_h = self.layout.page_h(cur_page).max(1) as f32;
-        let scroll_in_page =
-            ((self.scroll_y_px - page_y) as f32 / page_h).clamp(0.0, 1.0);
+        let scroll_in_page = ((self.scroll_y_px - page_y) as f32 / page_h).clamp(0.0, 1.0);
         Session {
             page: cur_page,
             dark: self.dark,
@@ -2461,7 +2474,8 @@ impl<'doc> App<'doc> {
     /// then position the cursor at the end. Mirrors vim semantics:
     /// after a fresh jump, `<C-i>` redo is gone.
     pub fn push_jump(&mut self, from: usize) {
-        self.jumplist.truncate(self.jump_idx.min(self.jumplist.len()));
+        self.jumplist
+            .truncate(self.jump_idx.min(self.jumplist.len()));
         self.jumplist.push(from);
         self.jump_idx = self.jumplist.len();
         // Bound the list so a long session doesn't grow without limit.
@@ -2550,7 +2564,13 @@ impl<'doc> App<'doc> {
         }
         let quoted: String = text
             .lines()
-            .map(|l| if l.is_empty() { "> ".into() } else { format!("> {l}") })
+            .map(|l| {
+                if l.is_empty() {
+                    "> ".into()
+                } else {
+                    format!("> {l}")
+                }
+            })
             .collect::<Vec<_>>()
             .join("\n");
         let stem = self
@@ -2569,7 +2589,10 @@ impl<'doc> App<'doc> {
         self.mouse_dragging = false;
         self.mode = Mode::Normal;
         self.status = if outcome.truncated {
-            format!("copied markdown quote ({}, truncated by clipboard)", cite_range)
+            format!(
+                "copied markdown quote ({}, truncated by clipboard)",
+                cite_range
+            )
         } else {
             format!("copied markdown quote ({})", cite_range)
         };
@@ -2606,7 +2629,13 @@ impl<'doc> App<'doc> {
                     .unwrap_or_else(|| "(image region — no extractable text)".to_string());
                 let quoted: String = text
                     .lines()
-                    .map(|l| if l.is_empty() { "> ".into() } else { format!("> {l}") })
+                    .map(|l| {
+                        if l.is_empty() {
+                            "> ".into()
+                        } else {
+                            format!("> {l}")
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join("\n");
                 buf.push_str(&quoted);
@@ -2676,8 +2705,8 @@ impl<'doc> App<'doc> {
 /// substring covers them all.
 pub fn find_references_page(outline: &[OutlineEntry]) -> Option<usize> {
     const REF_KEYWORDS: &[&str] = &[
-        "reference",     // singular and plural
-        "bibliograph",   // bibliography / bibliographies
+        "reference",   // singular and plural
+        "bibliograph", // bibliography / bibliographies
         "works cited",
         "literature cited",
     ];
@@ -2715,7 +2744,11 @@ pub fn next_section_target(
         // For `[[`: from a page mid-section, land on the section's
         // first page. From the section's first page, land on the
         // previous section's first page.
-        outline_pages.iter().copied().rev().find(|p| *p < current_page)
+        outline_pages
+            .iter()
+            .copied()
+            .rev()
+            .find(|p| *p < current_page)
     }
 }
 
@@ -2728,8 +2761,7 @@ pub fn next_section_target(
 /// MIME-handler dispatch.
 pub(crate) fn is_safe_external_url(url: &str) -> bool {
     let lower_prefix = |s: &str| {
-        url.len() >= s.len()
-            && url.as_bytes()[..s.len()].eq_ignore_ascii_case(s.as_bytes())
+        url.len() >= s.len() && url.as_bytes()[..s.len()].eq_ignore_ascii_case(s.as_bytes())
     };
     lower_prefix("http://") || lower_prefix("https://") || lower_prefix("mailto:")
 }
@@ -2987,7 +3019,13 @@ mod tests {
 
     fn metrics(n: usize) -> Vec<PageMetrics> {
         // 100×200pt portrait pages.
-        vec![PageMetrics { width_pts: 100.0, height_pts: 200.0 }; n]
+        vec![
+            PageMetrics {
+                width_pts: 100.0,
+                height_pts: 200.0
+            };
+            n
+        ]
     }
 
     fn layout_for(n: usize, fit_width_px: u32) -> PageLayout {
@@ -3049,20 +3087,38 @@ mod tests {
         // image_area at (5,2)..(85,42); cell (4,1) is before x; cell
         // (90,3) is past width; cell (10,50) is past height.
         let layout = layout_for(3, 100);
-        let area = Rect { x: 5, y: 2, width: 80, height: 40 };
+        let area = Rect {
+            x: 5,
+            y: 2,
+            width: 80,
+            height: 40,
+        };
         let cell = (10u16, 20u16);
-        assert!(cell_to_page_coord_pure(4, 10, area, cell, (800, 800), 0.0, 0, &layout, 3).is_none());
-        assert!(cell_to_page_coord_pure(10, 1, area, cell, (800, 800), 0.0, 0, &layout, 3).is_none());
-        assert!(cell_to_page_coord_pure(90, 3, area, cell, (800, 800), 0.0, 0, &layout, 3).is_none());
-        assert!(cell_to_page_coord_pure(10, 50, area, cell, (800, 800), 0.0, 0, &layout, 3).is_none());
+        assert!(
+            cell_to_page_coord_pure(4, 10, area, cell, (800, 800), 0.0, 0, &layout, 3).is_none()
+        );
+        assert!(
+            cell_to_page_coord_pure(10, 1, area, cell, (800, 800), 0.0, 0, &layout, 3).is_none()
+        );
+        assert!(
+            cell_to_page_coord_pure(90, 3, area, cell, (800, 800), 0.0, 0, &layout, 3).is_none()
+        );
+        assert!(
+            cell_to_page_coord_pure(10, 50, area, cell, (800, 800), 0.0, 0, &layout, 3).is_none()
+        );
     }
 
     #[test]
     fn cell_to_page_coord_centered_page_at_zero_zoom_one() {
         // viewport_w=100, fit_width_px=100 → no centering offset.
         // image area starts at (0,0) for clean math; cell_size 1×1 px.
-        let layout = layout_for(3, 100);  // page 0 height = 200
-        let area = Rect { x: 0, y: 0, width: 100, height: 200 };
+        let layout = layout_for(3, 100); // page 0 height = 200
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 200,
+        };
         let cell_size = (1u16, 1u16);
         let viewport = (100u32, 200u32);
 
@@ -3078,10 +3134,13 @@ mod tests {
     fn cell_to_page_coord_inside_inter_page_gap_is_none() {
         // Page 0 ends at y=200; gap [200,208); page 1 starts at 208.
         let layout = layout_for(3, 100);
-        let area = Rect { x: 0, y: 0, width: 100, height: 250 };
-        let r = cell_to_page_coord_pure(
-            50, 204, area, (1, 1), (100, 250), 0.0, 0, &layout, 3,
-        );
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 250,
+        };
+        let r = cell_to_page_coord_pure(50, 204, area, (1, 1), (100, 250), 0.0, 0, &layout, 3);
         assert!(r.is_none(), "click in gap should be None, got {r:?}");
     }
 
@@ -3090,11 +3149,14 @@ mod tests {
         // 3 pages, scrolled past total — click at top of viewport
         // is past doc end.
         let layout = layout_for(3, 100);
-        let area = Rect { x: 0, y: 0, width: 100, height: 50 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 50,
+        };
         // Total = 200*3 + 8*2 = 616. Scroll well past it.
-        let r = cell_to_page_coord_pure(
-            50, 0, area, (1, 1), (100, 50), 0.0, 9999, &layout, 3,
-        );
+        let r = cell_to_page_coord_pure(50, 0, area, (1, 1), (100, 50), 0.0, 9999, &layout, 3);
         assert!(r.is_none(), "past-end click should be None");
     }
 
@@ -3104,7 +3166,12 @@ mod tests {
         // 25px of bg on each side. A click at viewport_x=10 sits in
         // the left bg → None. Click at viewport_x=50 (center) → nx=0.5.
         let layout = layout_for(3, 50);
-        let area = Rect { x: 0, y: 0, width: 100, height: 100 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
         let viewport = (100u32, 100u32);
         let cell = (1u16, 1u16);
 
@@ -3123,7 +3190,12 @@ mod tests {
         // Click at viewport_x=50 → page_x = 50 - (-50) = 100; fw=200
         // → nx = 0.5.
         let layout = layout_for(3, 200);
-        let area = Rect { x: 0, y: 0, width: 100, height: 200 };
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 200,
+        };
         let viewport = (100u32, 200u32);
         let cell = (1u16, 1u16);
 
@@ -3134,7 +3206,12 @@ mod tests {
 
     #[test]
     fn nudge_rect_slides_within_bounds() {
-        let sel = Rect01 { x: 0.4, y: 0.4, w: 0.2, h: 0.2 };
+        let sel = Rect01 {
+            x: 0.4,
+            y: 0.4,
+            w: 0.2,
+            h: 0.2,
+        };
         let r = nudge_rect(sel, 0.1, 0.0, false);
         assert!((r.x - 0.5).abs() < 1e-4);
         assert_eq!(r.w, 0.2);
@@ -3142,14 +3219,24 @@ mod tests {
 
     #[test]
     fn nudge_rect_clamps_when_sliding_off_edge() {
-        let sel = Rect01 { x: 0.9, y: 0.0, w: 0.2, h: 0.2 };
+        let sel = Rect01 {
+            x: 0.9,
+            y: 0.0,
+            w: 0.2,
+            h: 0.2,
+        };
         let r = nudge_rect(sel, 0.5, 0.0, false);
         assert!((r.x - 0.8).abs() < 1e-4, "x was {}", r.x);
     }
 
     #[test]
     fn nudge_rect_resize_grows_from_bottom_right() {
-        let sel = Rect01 { x: 0.1, y: 0.1, w: 0.2, h: 0.2 };
+        let sel = Rect01 {
+            x: 0.1,
+            y: 0.1,
+            w: 0.2,
+            h: 0.2,
+        };
         let r = nudge_rect(sel, 0.05, -0.05, true);
         assert_eq!((r.x, r.y), (0.1, 0.1));
         assert!((r.w - 0.25).abs() < 1e-4);
@@ -3158,7 +3245,12 @@ mod tests {
 
     #[test]
     fn nudge_rect_resize_floors_at_one_percent() {
-        let mut sel = Rect01 { x: 0.1, y: 0.1, w: 0.2, h: 0.2 };
+        let mut sel = Rect01 {
+            x: 0.1,
+            y: 0.1,
+            w: 0.2,
+            h: 0.2,
+        };
         for _ in 0..50 {
             sel = nudge_rect(sel, -0.1, -0.1, true);
         }
@@ -3179,7 +3271,11 @@ mod tests {
         let in_window = prev_at
             .map(|t| (now - t).as_millis() < super::RAPID_SCROLL_THRESHOLD_MS)
             .unwrap_or(false);
-        let count = if in_window { prev_count.saturating_add(1) } else { 1 };
+        let count = if in_window {
+            prev_count.saturating_add(1)
+        } else {
+            1
+        };
         let rapid = count >= super::RAPID_SCROLL_BURST_MIN;
         (now, count, rapid)
     }
@@ -3189,7 +3285,10 @@ mod tests {
         let now = std::time::Instant::now();
         let (_, count, rapid) = step_burst(None, 0, now);
         assert_eq!(count, 1);
-        assert!(!rapid, "first event after a long pause must not defer the page");
+        assert!(
+            !rapid,
+            "first event after a long pause must not defer the page"
+        );
     }
 
     #[test]
@@ -3217,11 +3316,17 @@ mod tests {
         let t0 = std::time::Instant::now();
         let mut state = (None, 0u32);
         for i in 0..5 {
-            let (a, c, _) = step_burst(state.0, state.1, t0 + std::time::Duration::from_millis(i * 30));
+            let (a, c, _) = step_burst(
+                state.0,
+                state.1,
+                t0 + std::time::Duration::from_millis(i * 30),
+            );
             state = (Some(a), c);
         }
-        assert!(state.1 >= super::RAPID_SCROLL_BURST_MIN,
-            "precondition: we should be in burst mode after 5 fast events");
+        assert!(
+            state.1 >= super::RAPID_SCROLL_BURST_MIN,
+            "precondition: we should be in burst mode after 5 fast events"
+        );
         // Simulate App::clear_input_burst — the count resets but
         // last_input_at stays put (no time has passed).
         let cleared_count = 0u32;
@@ -3229,15 +3334,25 @@ mod tests {
         // both `recent` AND `count >= MIN`. With count=0, rapid=false
         // regardless of recency.
         let rapid_after_clear = cleared_count >= super::RAPID_SCROLL_BURST_MIN;
-        assert!(!rapid_after_clear, "clear_input_burst must drop is_rapid_scrolling");
+        assert!(
+            !rapid_after_clear,
+            "clear_input_burst must drop is_rapid_scrolling"
+        );
         // The next real event arrives — it must rebuild the count
         // from 1, NOT inherit the cleared zero as "fresh".
         let (_, c_after_event, r_after_event) = step_burst(
-            state.0, cleared_count,
+            state.0,
+            cleared_count,
             t0 + std::time::Duration::from_millis(150),
         );
-        assert_eq!(c_after_event, 1, "after clear, the next event re-arms count from 1");
-        assert!(!r_after_event, "single-event count is below the burst threshold");
+        assert_eq!(
+            c_after_event, 1,
+            "after clear, the next event re-arms count from 1"
+        );
+        assert!(
+            !r_after_event,
+            "single-event count is below the burst threshold"
+        );
     }
 
     #[test]
@@ -3246,7 +3361,11 @@ mod tests {
         // Build up a burst of 5.
         let mut state = (None, 0u32);
         for i in 0..5 {
-            let (a, c, _) = step_burst(state.0, state.1, t0 + std::time::Duration::from_millis(i * 30));
+            let (a, c, _) = step_burst(
+                state.0,
+                state.1,
+                t0 + std::time::Duration::from_millis(i * 30),
+            );
             state = (Some(a), c);
         }
         assert_eq!(state.1, 5);
@@ -3270,8 +3389,8 @@ mod tests {
         prev_applied_at: Option<std::time::Instant>,
         now: std::time::Instant,
     ) -> (Option<std::time::Instant>, bool) {
-        let allow = prev_applied_at
-            .is_none_or(|t| (now - t).as_millis() >= super::SCROLL_THROTTLE_MS);
+        let allow =
+            prev_applied_at.is_none_or(|t| (now - t).as_millis() >= super::SCROLL_THROTTLE_MS);
         let new_at = if allow { Some(now) } else { prev_applied_at };
         (new_at, allow)
     }
@@ -3280,7 +3399,10 @@ mod tests {
     fn throttle_first_attempt_always_allowed() {
         let now = std::time::Instant::now();
         let (state, allow) = step_throttle(None, now);
-        assert!(allow, "first scroll after a long pause must always go through");
+        assert!(
+            allow,
+            "first scroll after a long pause must always go through"
+        );
         assert_eq!(state, Some(now), "allowed attempt records the time");
     }
 
@@ -3304,7 +3426,10 @@ mod tests {
         let (state, _) = step_throttle(None, t0);
         let t1 = t0 + std::time::Duration::from_millis(super::SCROLL_THROTTLE_MS as u64);
         let (state2, allow) = step_throttle(state, t1);
-        assert!(allow, "attempt at exactly SCROLL_THROTTLE_MS must be allowed");
+        assert!(
+            allow,
+            "attempt at exactly SCROLL_THROTTLE_MS must be allowed"
+        );
         assert_eq!(state2, Some(t1), "allowed attempt records the new time");
     }
 
@@ -3317,7 +3442,8 @@ mod tests {
         let mut state: Option<std::time::Instant> = None;
         let mut accepted = 0u32;
         for i in 0..30 {
-            let (new_state, allow) = step_throttle(state, t0 + std::time::Duration::from_millis(i * 33));
+            let (new_state, allow) =
+                step_throttle(state, t0 + std::time::Duration::from_millis(i * 33));
             state = new_state;
             if allow {
                 accepted += 1;
@@ -3360,7 +3486,12 @@ mod tests {
     fn fake_hint(label: &str, action: LinkAction) -> HintEntry {
         HintEntry {
             page_idx: 0,
-            rect: Rect01 { x: 0.0, y: 0.0, w: 0.1, h: 0.1 },
+            rect: Rect01 {
+                x: 0.0,
+                y: 0.0,
+                w: 0.1,
+                h: 0.1,
+            },
             action,
             label: label.into(),
         }
@@ -3498,7 +3629,9 @@ mod tests {
         assert_eq!(human_bytes(1024), "1.0 KB");
         assert_eq!(human_bytes(1500), "1.5 KB");
         assert_eq!(human_bytes(1024 * 1024), "1.0 MB");
-        assert_eq!(human_bytes(1024u64 * 1024 * 1024 * 3 + 1024 * 1024 * 512),
-                   "3.5 GB");
+        assert_eq!(
+            human_bytes(1024u64 * 1024 * 1024 * 3 + 1024 * 1024 * 512),
+            "3.5 GB"
+        );
     }
 }

@@ -80,9 +80,7 @@ fn osc52_emit(text: &str) -> std::io::Result<()> {
 
     // Write to /dev/tty so the escape sequence reaches the terminal
     // even while ratatui owns stdout.
-    let mut tty = std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/tty")?;
+    let mut tty = std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
     tty.write_all(payload.as_bytes())?;
     tty.flush()?;
     Ok(())
@@ -172,8 +170,8 @@ mod tests {
     #[test]
     fn trim_to_char_boundary_handles_mixed_ascii_and_utf8() {
         let s = "ab\u{1F600}cd"; // 'ab' + 4-byte emoji + 'cd' = 8 bytes
-        // Request 4 bytes: 'ab' fits at boundary 2; emoji starts at 2
-        // and is 4 bytes long, so 4 is mid-emoji → walk back to 2.
+                                 // Request 4 bytes: 'ab' fits at boundary 2; emoji starts at 2
+                                 // and is 4 bytes long, so 4 is mid-emoji → walk back to 2.
         assert_eq!(trim_to_char_boundary(s, 4), "ab");
     }
 }

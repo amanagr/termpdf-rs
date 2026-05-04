@@ -42,11 +42,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::{CommandFactory, FromArgMatches, Parser};
 use clap::parser::ValueSource;
-use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind,
-};
+use clap::{CommandFactory, FromArgMatches, Parser};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -72,7 +70,7 @@ enum ProtocolChoice {
 #[command(
     version,
     about = "Terminal PDF reader (kitty/sixel/halfblocks)",
-    arg_required_else_help = true,
+    arg_required_else_help = true
 )]
 struct Args {
     /// Path to the PDF file.
@@ -275,7 +273,11 @@ fn main() -> Result<()> {
     // If the user passed `--page` on the CLI, they meant "open at this
     // page (top)" — discard the saved within-page scroll. Otherwise
     // restore the exact pixel position they were at last session.
-    let start_scroll_in_page = if page_explicit { 0.0 } else { saved.scroll_in_page };
+    let start_scroll_in_page = if page_explicit {
+        0.0
+    } else {
+        saved.scroll_in_page
+    };
     let mut app = App::new(
         document,
         &args.path,
@@ -387,7 +389,12 @@ fn probe(
 ) -> Result<()> {
     use ratatui::layout::Rect;
     let picker = Picker::halfblocks();
-    let area = Rect { x: 0, y: 0, width: 80, height: 40 };
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 80,
+        height: 40,
+    };
     let (cell_w, _cell_h) = picker.font_size();
     let target_w = (((area.width as u32) * (cell_w as u32)) as f32 * zoom) as u32;
     let img = pdf::render_page_at_width(document, page, target_w.max(1))?;
@@ -782,7 +789,9 @@ fn warm_next_uncached(app: &mut App<'_>) -> Result<bool> {
         // intentionally NOT baked into either source — in kitty mode
         // it ships as a separate layered overlay, so the page bitmap
         // is selection-stable across selection moves.
-        let bm: Option<&image::RgbaImage> = app.highlights_baked_cache.get(&pi)
+        let bm: Option<&image::RgbaImage> = app
+            .highlights_baked_cache
+            .get(&pi)
             .map(|(bm, _)| bm)
             .or_else(|| app.page_cache.get(&pi).and_then(|d| d.as_rgba8()));
         let pixel_dims = bm.map(|bm| (bm.width(), bm.height()));
@@ -820,14 +829,21 @@ fn warm_next_uncached(app: &mut App<'_>) -> Result<bool> {
 ///    `scroll_by_screens` call.
 fn dispatch_event_coalesced(app: &mut App<'_>, ev: Event) -> Result<()> {
     use crossterm::event::{MouseEvent, MouseEventKind};
-    if let Event::Mouse(MouseEvent { kind: MouseEventKind::Drag(btn), .. }) = ev {
+    if let Event::Mouse(MouseEvent {
+        kind: MouseEventKind::Drag(btn),
+        ..
+    }) = ev
+    {
         // Drain consecutive Drag(btn) events; keep only the last.
         let mut latest = ev;
         while event::poll(Duration::ZERO)? {
             // We can't peek without consuming; read and check.
             let next = event::read()?;
             match &next {
-                Event::Mouse(MouseEvent { kind: MouseEventKind::Drag(b2), .. }) if *b2 == btn => {
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Drag(b2),
+                    ..
+                }) if *b2 == btn => {
                     latest = next;
                 }
                 _ => {
@@ -841,10 +857,15 @@ fn dispatch_event_coalesced(app: &mut App<'_>, ev: Event) -> Result<()> {
         return dispatch_event(app, latest);
     }
     if let Event::Mouse(me0) = ev {
-        if matches!(me0.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
+        if matches!(
+            me0.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) {
             // Sum net vertical scroll across this run. Shifted scroll
             // is horizontal — keep separate so we don't merge h/v.
-            let shifted = me0.modifiers.contains(crossterm::event::KeyModifiers::SHIFT);
+            let shifted = me0
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::SHIFT);
             let mut net = match me0.kind {
                 MouseEventKind::ScrollDown => 1i32,
                 MouseEventKind::ScrollUp => -1i32,
@@ -856,8 +877,14 @@ fn dispatch_event_coalesced(app: &mut App<'_>, ev: Event) -> Result<()> {
                     let m_shift = me.modifiers.contains(crossterm::event::KeyModifiers::SHIFT);
                     if m_shift == shifted {
                         match me.kind {
-                            MouseEventKind::ScrollDown => { net += 1; continue; }
-                            MouseEventKind::ScrollUp => { net -= 1; continue; }
+                            MouseEventKind::ScrollDown => {
+                                net += 1;
+                                continue;
+                            }
+                            MouseEventKind::ScrollUp => {
+                                net -= 1;
+                                continue;
+                            }
                             _ => {}
                         }
                     }

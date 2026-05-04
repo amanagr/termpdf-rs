@@ -53,7 +53,11 @@ pub enum SelMode {
 
 impl TextSelection {
     pub fn new(at: Caret) -> Self {
-        Self { anchor: at, head: at, mode: SelMode::Charwise }
+        Self {
+            anchor: at,
+            head: at,
+            mode: SelMode::Charwise,
+        }
     }
 
     /// Lower (earlier in reading order) and upper carets.
@@ -417,9 +421,8 @@ impl PageText {
             return None;
         }
         let from = from.min(n - 1);
-        let is_terminator = |idx: usize| {
-            matches!(self.chars[idx].ch, Some('.') | Some('!') | Some('?'))
-        };
+        let is_terminator =
+            |idx: usize| matches!(self.chars[idx].ch, Some('.') | Some('!') | Some('?'));
         // Walk back to start: previous terminator (skipping past it
         // and any following whitespace).
         let mut start = from;
@@ -492,7 +495,10 @@ impl PageText {
             }
             end_line += 1;
         }
-        Some((self.lines[start_line].start_idx, self.lines[end_line].end_idx))
+        Some((
+            self.lines[start_line].start_idx,
+            self.lines[end_line].end_idx,
+        ))
     }
 
     /// Per-visual-line rectangles covering the inclusive char range
@@ -503,7 +509,11 @@ impl PageText {
         if self.chars.is_empty() {
             return Vec::new();
         }
-        let (lo, hi) = if start <= end { (start, end) } else { (end, start) };
+        let (lo, hi) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
         let lo = lo.min(self.chars.len() - 1);
         let hi = hi.min(self.chars.len() - 1);
         let line_lo = self.chars[lo].line;
@@ -514,7 +524,9 @@ impl PageText {
         // — pre-sizing avoids a growth realloc on multi-line spans.
         let mut out: Vec<Rect01> = Vec::with_capacity(line_hi.saturating_sub(line_lo) + 1);
         for line_idx in line_lo..=line_hi {
-            let Some(span) = self.lines.get(line_idx) else { continue };
+            let Some(span) = self.lines.get(line_idx) else {
+                continue;
+            };
             // Determine the char range covering THIS line within the
             // selection — the start of the selection on the first
             // line, the end of the selection on the last line, and
@@ -559,7 +571,11 @@ impl PageText {
         if self.chars.is_empty() {
             return String::new();
         }
-        let (lo, hi) = if start <= end { (start, end) } else { (end, start) };
+        let (lo, hi) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
         let lo = lo.min(self.chars.len() - 1);
         let hi = hi.min(self.chars.len() - 1);
         // Upper bound: each char contributes 1-4 UTF-8 bytes plus
@@ -688,10 +704,7 @@ fn cluster_lines(chars: &mut [CharCell]) -> Vec<LineSpan> {
             if c.line != chars[span.start_idx].line {
                 continue;
             }
-            let is_space = c
-                .ch
-                .map(|ch| ch.is_whitespace())
-                .unwrap_or(true);
+            let is_space = c.ch.map(|ch| ch.is_whitespace()).unwrap_or(true);
             if !is_space && prev_was_space {
                 span.word_starts.push(i);
             }
@@ -1043,10 +1056,7 @@ mod tests {
         use crate::app::first_visible_char_idx_pure;
         let mut g = cell(0, 0.10, 0.05, 0.05, 0.04, '\n');
         g.is_generated = true;
-        let pt = page_with(vec![
-            g,
-            cell(1, 0.10, 0.10, 0.05, 0.04, 'a'),
-        ]);
+        let pt = page_with(vec![g, cell(1, 0.10, 0.10, 0.05, 0.04, 'a')]);
         assert_eq!(first_visible_char_idx_pure(0.0, &pt), Some(1));
     }
 

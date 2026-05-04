@@ -215,7 +215,9 @@ impl DocIndex {
             // lowercase form across searches to avoid the multi-tens-
             // of-ms `text.to_lowercase()` per query.
             let needle = query.to_lowercase();
-            let hay = self.lower_text_cache.get_or_init(|| self.text.to_lowercase());
+            let hay = self
+                .lower_text_cache
+                .get_or_init(|| self.text.to_lowercase());
             // Materialise into a Vec because Rust can't express the
             // borrow path "&'a Box<dyn Iterator borrowing &'a String>"
             // through this signature without GATs. The collect cost is
@@ -397,7 +399,11 @@ mod tests {
         idx.add_page(0, "hello".into());
         let before = idx.text_bytes();
         idx.add_page(0, "hello".into()); // dup
-        assert_eq!(idx.text_bytes(), before, "duplicate add_page must be a no-op");
+        assert_eq!(
+            idx.text_bytes(),
+            before,
+            "duplicate add_page must be a no-op"
+        );
     }
 
     #[test]
@@ -508,7 +514,10 @@ mod tests {
         assert_eq!(loaded.indexed_count(), idx.indexed_count());
         assert_eq!(loaded.text(), idx.text());
         // Search results match.
-        assert_eq!(loaded.pages_matching("the", false), idx.pages_matching("the", false));
+        assert_eq!(
+            loaded.pages_matching("the", false),
+            idx.pages_matching("the", false)
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -570,7 +579,7 @@ mod tests {
         bytes.extend_from_slice(&3u64.to_le_bytes()); // total_pages = 3
         bytes.extend_from_slice(&0u64.to_le_bytes()); // indexed_count
         bytes.extend_from_slice(&u64::MAX.to_le_bytes()); // text_len
-        // page_starts table (3 × 8 bytes). Doesn't matter what's here.
+                                                          // page_starts table (3 × 8 bytes). Doesn't matter what's here.
         bytes.extend_from_slice(&[0u8; 24]);
         std::fs::write(&path, &bytes).unwrap();
         assert!(load(&path, 3).is_none(), "load must reject, not panic");

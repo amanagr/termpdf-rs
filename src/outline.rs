@@ -197,7 +197,12 @@ mod tests {
     fn render_line_truncates_long_titles() {
         let e = entry(&"x".repeat(100), 0, Some(9));
         let s = render_line(&e, 30);
-        assert!(s.chars().count() <= 30, "got {} chars: {:?}", s.chars().count(), s);
+        assert!(
+            s.chars().count() <= 30,
+            "got {} chars: {:?}",
+            s.chars().count(),
+            s
+        );
         assert!(s.contains('…'));
         assert!(s.ends_with("p.10"));
     }

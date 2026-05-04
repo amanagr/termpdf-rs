@@ -16,8 +16,7 @@ use image::DynamicImage;
 use pdfium_render::prelude::*;
 
 pub fn bindings(lib_path: &str) -> Result<Box<dyn PdfiumLibraryBindings>> {
-    Pdfium::bind_to_library(lib_path)
-        .with_context(|| format!("dlopen failed for {lib_path}"))
+    Pdfium::bind_to_library(lib_path).with_context(|| format!("dlopen failed for {lib_path}"))
 }
 
 /// Search known locations for `libpdfium.so`:
@@ -249,7 +248,11 @@ fn render_page_at_width_quality(
         return Ok(img);
     }
     let scaled_h = ((img.height() as u64 * target as u64) / render_w as u64) as u32;
-    Ok(img.resize_exact(target, scaled_h.max(1), image::imageops::FilterType::Lanczos3))
+    Ok(img.resize_exact(
+        target,
+        scaled_h.max(1),
+        image::imageops::FilterType::Lanczos3,
+    ))
 }
 
 /// Whether the Fast tier should request LCD subpixel text rendering.

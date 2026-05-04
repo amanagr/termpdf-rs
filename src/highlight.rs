@@ -81,15 +81,14 @@ impl HighlightStore {
             let mut x: u64 = FNV_OFFSET;
             // Coordinates: hashing the bit-pattern preserves "moved by
             // 1 px" precision across reloads.
-            for byte in h
-                .x
-                .to_le_bytes()
-                .iter()
-                .chain(h.y.to_le_bytes().iter())
-                .chain(h.w.to_le_bytes().iter())
-                .chain(h.h.to_le_bytes().iter())
-                .chain(h.color.as_bytes().iter())
-                .chain(h.group_id.unwrap_or(0).to_le_bytes().iter())
+            for byte in
+                h.x.to_le_bytes()
+                    .iter()
+                    .chain(h.y.to_le_bytes().iter())
+                    .chain(h.w.to_le_bytes().iter())
+                    .chain(h.h.to_le_bytes().iter())
+                    .chain(h.color.as_bytes().iter())
+                    .chain(h.group_id.unwrap_or(0).to_le_bytes().iter())
             {
                 x ^= *byte as u64;
                 x = x.wrapping_mul(FNV_PRIME);
@@ -152,11 +151,31 @@ pub struct HighlightColor {
 
 /// Cyclable highlighter palette. Order is the cycle order on `c`.
 pub const HIGHLIGHT_COLORS: &[HighlightColor] = &[
-    HighlightColor { name: "yellow", hex: "#ffd54f", rgb: (0xff, 0xd5, 0x4f) },
-    HighlightColor { name: "green",  hex: "#aed581", rgb: (0xae, 0xd5, 0x81) },
-    HighlightColor { name: "blue",   hex: "#81d4fa", rgb: (0x81, 0xd4, 0xfa) },
-    HighlightColor { name: "pink",   hex: "#f48fb1", rgb: (0xf4, 0x8f, 0xb1) },
-    HighlightColor { name: "orange", hex: "#ffab91", rgb: (0xff, 0xab, 0x91) },
+    HighlightColor {
+        name: "yellow",
+        hex: "#ffd54f",
+        rgb: (0xff, 0xd5, 0x4f),
+    },
+    HighlightColor {
+        name: "green",
+        hex: "#aed581",
+        rgb: (0xae, 0xd5, 0x81),
+    },
+    HighlightColor {
+        name: "blue",
+        hex: "#81d4fa",
+        rgb: (0x81, 0xd4, 0xfa),
+    },
+    HighlightColor {
+        name: "pink",
+        hex: "#f48fb1",
+        rgb: (0xf4, 0x8f, 0xb1),
+    },
+    HighlightColor {
+        name: "orange",
+        hex: "#ffab91",
+        rgb: (0xff, 0xab, 0x91),
+    },
 ];
 
 #[cfg(test)]

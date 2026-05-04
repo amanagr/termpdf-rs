@@ -178,7 +178,9 @@ pub fn run_search(
             continue;
         };
         let Ok(text) = page.text() else { continue };
-        let Ok(search) = text.search(trimmed, &opts) else { continue };
+        let Ok(search) = text.search(trimmed, &opts) else {
+            continue;
+        };
         for match_segments in search.iter(PdfSearchDirection::SearchForward) {
             for seg in match_segments.iter() {
                 if hits.len() >= MAX_SEARCH_HITS {
@@ -261,9 +263,33 @@ mod tests {
     #[test]
     fn advance_wraps_around() {
         let mut r = fake_results(vec![
-            SearchHit { page: 0, rect: Rect01 { x: 0.0, y: 0.0, w: 0.1, h: 0.1 } },
-            SearchHit { page: 1, rect: Rect01 { x: 0.0, y: 0.0, w: 0.1, h: 0.1 } },
-            SearchHit { page: 2, rect: Rect01 { x: 0.0, y: 0.0, w: 0.1, h: 0.1 } },
+            SearchHit {
+                page: 0,
+                rect: Rect01 {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 0.1,
+                    h: 0.1,
+                },
+            },
+            SearchHit {
+                page: 1,
+                rect: Rect01 {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 0.1,
+                    h: 0.1,
+                },
+            },
+            SearchHit {
+                page: 2,
+                rect: Rect01 {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 0.1,
+                    h: 0.1,
+                },
+            },
         ]);
         r.advance(1);
         assert_eq!(r.current, 1);
@@ -288,7 +314,15 @@ mod tests {
     #[test]
     fn advance_bumps_revision_only_when_hits_exist() {
         let mut r = fake_results(vec![
-            SearchHit { page: 0, rect: Rect01 { x: 0.0, y: 0.0, w: 0.1, h: 0.1 } };
+            SearchHit {
+                page: 0,
+                rect: Rect01 {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 0.1,
+                    h: 0.1
+                }
+            };
             2
         ]);
         r.revision = 5;
@@ -304,11 +338,35 @@ mod tests {
     fn page_has_hits_lookup_is_o1() {
         // Distinct hit pages should be recognized; missing pages reject.
         let r = fake_results(vec![
-            SearchHit { page: 3, rect: Rect01 { x: 0.0, y: 0.0, w: 0.1, h: 0.1 } },
-            SearchHit { page: 7, rect: Rect01 { x: 0.0, y: 0.0, w: 0.1, h: 0.1 } },
+            SearchHit {
+                page: 3,
+                rect: Rect01 {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 0.1,
+                    h: 0.1,
+                },
+            },
+            SearchHit {
+                page: 7,
+                rect: Rect01 {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 0.1,
+                    h: 0.1,
+                },
+            },
             // Duplicate page is still just one set entry — exercises
             // the dedup behaviour callers rely on.
-            SearchHit { page: 3, rect: Rect01 { x: 0.5, y: 0.5, w: 0.1, h: 0.1 } },
+            SearchHit {
+                page: 3,
+                rect: Rect01 {
+                    x: 0.5,
+                    y: 0.5,
+                    w: 0.1,
+                    h: 0.1,
+                },
+            },
         ]);
         assert!(r.page_has_hits(3));
         assert!(r.page_has_hits(7));
@@ -326,12 +384,60 @@ mod tests {
     fn page_slice_returns_contiguous_range() {
         // Hits arranged in page order: page 1 has 2 hits, page 4 has 1, page 7 has 3.
         let hits = vec![
-            SearchHit { page: 1, rect: Rect01 { x: 0.0, y: 0.0, w: 0.1, h: 0.1 } },
-            SearchHit { page: 1, rect: Rect01 { x: 0.5, y: 0.5, w: 0.1, h: 0.1 } },
-            SearchHit { page: 4, rect: Rect01 { x: 0.0, y: 0.0, w: 0.1, h: 0.1 } },
-            SearchHit { page: 7, rect: Rect01 { x: 0.0, y: 0.0, w: 0.1, h: 0.1 } },
-            SearchHit { page: 7, rect: Rect01 { x: 0.2, y: 0.2, w: 0.1, h: 0.1 } },
-            SearchHit { page: 7, rect: Rect01 { x: 0.4, y: 0.4, w: 0.1, h: 0.1 } },
+            SearchHit {
+                page: 1,
+                rect: Rect01 {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 0.1,
+                    h: 0.1,
+                },
+            },
+            SearchHit {
+                page: 1,
+                rect: Rect01 {
+                    x: 0.5,
+                    y: 0.5,
+                    w: 0.1,
+                    h: 0.1,
+                },
+            },
+            SearchHit {
+                page: 4,
+                rect: Rect01 {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 0.1,
+                    h: 0.1,
+                },
+            },
+            SearchHit {
+                page: 7,
+                rect: Rect01 {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 0.1,
+                    h: 0.1,
+                },
+            },
+            SearchHit {
+                page: 7,
+                rect: Rect01 {
+                    x: 0.2,
+                    y: 0.2,
+                    w: 0.1,
+                    h: 0.1,
+                },
+            },
+            SearchHit {
+                page: 7,
+                rect: Rect01 {
+                    x: 0.4,
+                    y: 0.4,
+                    w: 0.1,
+                    h: 0.1,
+                },
+            },
         ];
         let r = fake_results(hits);
         // Page 1: 2 hits starting at index 0.
@@ -351,7 +457,10 @@ mod tests {
         // A rect at the top of a 100×200pt page: left=10, right=90,
         // top=200, bottom=180 → normalised x=0.1, w=0.8, y=0.0,
         // h=0.10 (the top 10% of the page).
-        let m = PageMetrics { width_pts: 100.0, height_pts: 200.0 };
+        let m = PageMetrics {
+            width_pts: 100.0,
+            height_pts: 200.0,
+        };
         let r = PdfRect::new(
             PdfPoints::new(180.0),
             PdfPoints::new(10.0),

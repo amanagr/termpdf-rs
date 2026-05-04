@@ -270,7 +270,7 @@ mod tests {
             "goto -1",
             "goto 999999999999999999999",
             "set dark dark dark dark",
-            "naïve",       // multi-byte
+            "naïve", // multi-byte
             "🦀 emoji",
             &"x".repeat(10_000),
         ] {

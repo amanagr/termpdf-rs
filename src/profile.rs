@@ -58,7 +58,10 @@ pub struct Span {
 
 #[must_use]
 pub fn span(phase: Phase) -> Option<Span> {
-    enabled().then(|| Span { phase, start: Instant::now() })
+    enabled().then(|| Span {
+        phase,
+        start: Instant::now(),
+    })
 }
 
 impl Drop for Span {

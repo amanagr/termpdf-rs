@@ -24,10 +24,7 @@ pub fn safe_for_stderr(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         let code = ch as u32;
-        let is_allowed = ch == '\n'
-            || ch == '\t'
-            || (code >= 0x20 && code < 0x7F)
-            || code >= 0xA0;
+        let is_allowed = ch == '\n' || ch == '\t' || (0x20..0x7F).contains(&code) || code >= 0xA0;
         if is_allowed {
             out.push(ch);
         } else {

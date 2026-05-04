@@ -149,8 +149,14 @@ fn make_test_pdf(
 fn pdfium_or_skip() -> Option<pdfium_render::prelude::Pdfium> {
     let candidates = [
         std::env::var("TERMPDF_PDFIUM").ok(),
-        Some(format!("{}/vendor/lib/libpdfium.so", env!("CARGO_MANIFEST_DIR"))),
-        Some(format!("{}/vendor/libpdfium.so", env!("CARGO_MANIFEST_DIR"))),
+        Some(format!(
+            "{}/vendor/lib/libpdfium.so",
+            env!("CARGO_MANIFEST_DIR")
+        )),
+        Some(format!(
+            "{}/vendor/libpdfium.so",
+            env!("CARGO_MANIFEST_DIR")
+        )),
         Some("/usr/lib64/libpdfium.so".into()),
         Some("/usr/lib/libpdfium.so".into()),
     ];
@@ -734,10 +740,7 @@ fn median_metric(samples: &[Metric]) -> Metric {
 
 /// Run a single scenario and return its metric. Panics on internal
 /// pty / spawn failure (test would fail anyway).
-fn run_scenario_once(
-    pdfium: &pdfium_render::prelude::Pdfium,
-    scenario: &Scenario,
-) -> Metric {
+fn run_scenario_once(pdfium: &pdfium_render::prelude::Pdfium, scenario: &Scenario) -> Metric {
     let pdf = make_test_pdf(pdfium, scenario.fixture, scenario.name);
     let scratch_cache = std::env::temp_dir().join(format!(
         "perf-harness-{}-{}",
@@ -896,10 +899,9 @@ fn wait_for_first_paint(pty: &Pty, total_pages: usize) -> u64 {
     let max = Duration::from_secs(8);
     let deadline = Instant::now() + max;
     while Instant::now() < deadline {
-        match pty
-            .rx
-            .recv_timeout(Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())))
-        {
+        match pty.rx.recv_timeout(
+            Duration::from_millis(20).min(deadline.saturating_duration_since(Instant::now())),
+        ) {
             Ok(chunk) => {
                 buf.extend_from_slice(&chunk);
                 if has_page_indicator(&buf, total_pages) {
@@ -1003,8 +1005,16 @@ fn compare(
         };
         for (label, av, bv) in [
             ("wall_ms", a.wall_ms, b.wall_ms),
-            ("per_action_p50_ms", a.per_action_p50_ms, b.per_action_p50_ms),
-            ("per_action_p95_ms", a.per_action_p95_ms, b.per_action_p95_ms),
+            (
+                "per_action_p50_ms",
+                a.per_action_p50_ms,
+                b.per_action_p50_ms,
+            ),
+            (
+                "per_action_p95_ms",
+                a.per_action_p95_ms,
+                b.per_action_p95_ms,
+            ),
             ("bytes_out", a.bytes_out, b.bytes_out),
             ("transmits", a.transmits, b.transmits),
             ("cpu_ms", a.cpu_ms, b.cpu_ms),
@@ -1039,7 +1049,9 @@ fn compare(
 
 #[test]
 fn perf_baseline_or_regression() {
-    let Some(pdfium) = pdfium_or_skip() else { return };
+    let Some(pdfium) = pdfium_or_skip() else {
+        return;
+    };
     let scenarios = scenarios();
     let mut actual = BTreeMap::new();
 

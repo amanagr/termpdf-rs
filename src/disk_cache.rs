@@ -85,12 +85,7 @@ pub fn cache_path(
 /// Same as `cache_path` but takes a precomputed per-PDF directory so
 /// the caller can amortise the `pdf_cache_dir` cost (one stat + one
 /// env-scan per call) across many cold-page renders.
-pub fn cache_path_in_dir(
-    dir: &Path,
-    page_idx: usize,
-    fit_width_px: u32,
-    dark: bool,
-) -> PathBuf {
+pub fn cache_path_in_dir(dir: &Path, page_idx: usize, fit_width_px: u32, dark: bool) -> PathBuf {
     let file = format!(
         "{}_{}_{}_v{}.png",
         page_idx, fit_width_px, dark as u8, RENDER_VERSION
@@ -193,11 +188,7 @@ pub fn store(path: &Path, image: &DynamicImage) -> std::io::Result<bool> {
     {
         use image::codecs::png::{CompressionType, FilterType, PngEncoder};
         use image::ImageEncoder;
-        let encoder = PngEncoder::new_with_quality(
-            &mut buf,
-            CompressionType::Fast,
-            FilterType::Up,
-        );
+        let encoder = PngEncoder::new_with_quality(&mut buf, CompressionType::Fast, FilterType::Up);
         if encoder
             .write_image(
                 rgba.as_raw(),
@@ -348,7 +339,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rt.png");
         let img = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
-            16, 16,
+            16,
+            16,
             image::Rgba([12, 34, 56, 255]),
         ));
         let ok = store(&path, &img).unwrap();
@@ -376,13 +368,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn load_refuses_to_follow_symlink_at_cache_path() {
-        let dir = std::env::temp_dir()
-            .join(format!("disk_cache_symlink_test_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("disk_cache_symlink_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // A real PNG that an attacker would want to redirect us to.
         let target = dir.join("attacker_chosen.png");
         let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
-            8, 8, image::Rgba([1, 2, 3, 255]),
+            8,
+            8,
+            image::Rgba([1, 2, 3, 255]),
         ));
         store(&target, &img).unwrap();
         // The "cache slot" the attacker squatted on with a symlink.
@@ -402,8 +396,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn load_rejects_oversized_cache_file() {
-        let dir = std::env::temp_dir()
-            .join(format!("disk_cache_huge_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("disk_cache_huge_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("huge.png");
         // 32 MiB of zeros — well past the 16 MiB cap.
@@ -431,12 +424,14 @@ mod tests {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         // Stand up a fake cache_root inside a temp dir and point
         // `dirs::cache_dir` at it via XDG_CACHE_HOME.
-        let scratch = std::env::temp_dir()
-            .join(format!("disk_cache_evict_test_{}", std::process::id()));
+        let scratch =
+            std::env::temp_dir().join(format!("disk_cache_evict_test_{}", std::process::id()));
         let prev_xdg = std::env::var("XDG_CACHE_HOME").ok();
         // SAFETY: tests in this binary share process env. We restore
         // before assertions to keep this test self-contained.
-        unsafe { std::env::set_var("XDG_CACHE_HOME", &scratch); }
+        unsafe {
+            std::env::set_var("XDG_CACHE_HOME", &scratch);
+        }
 
         let pdf_dir = scratch.join("termpdf-rs/abcd1234abcd1234");
         std::fs::create_dir_all(&pdf_dir).unwrap();
@@ -475,10 +470,14 @@ mod tests {
     #[test]
     fn evict_to_budget_no_op_when_under_budget() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        let scratch = std::env::temp_dir()
-            .join(format!("disk_cache_under_budget_test_{}", std::process::id()));
+        let scratch = std::env::temp_dir().join(format!(
+            "disk_cache_under_budget_test_{}",
+            std::process::id()
+        ));
         let prev_xdg = std::env::var("XDG_CACHE_HOME").ok();
-        unsafe { std::env::set_var("XDG_CACHE_HOME", &scratch); }
+        unsafe {
+            std::env::set_var("XDG_CACHE_HOME", &scratch);
+        }
 
         let pdf_dir = scratch.join("termpdf-rs/cafebabecafebabe");
         std::fs::create_dir_all(&pdf_dir).unwrap();
@@ -491,7 +490,10 @@ mod tests {
             None => unsafe { std::env::remove_var("XDG_CACHE_HOME") },
         }
 
-        assert!(pdf_dir.join("0_800_0.png").exists(), "file under budget must survive");
+        assert!(
+            pdf_dir.join("0_800_0.png").exists(),
+            "file under budget must survive"
+        );
         let _ = std::fs::remove_dir_all(&scratch);
     }
 }

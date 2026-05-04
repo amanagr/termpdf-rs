@@ -15,7 +15,12 @@ pub fn norm_to_pixels(r: Rect01, w: u32, h: u32) -> (u32, u32, u32, u32) {
     let py = (r.y.clamp(0.0, 1.0) * h as f32) as u32;
     let pw = ((r.w.clamp(0.0, 1.0) * w as f32) as u32).max(1);
     let ph = ((r.h.clamp(0.0, 1.0) * h as f32) as u32).max(1);
-    (px.min(w.saturating_sub(1)), py.min(h.saturating_sub(1)), pw, ph)
+    (
+        px.min(w.saturating_sub(1)),
+        py.min(h.saturating_sub(1)),
+        pw,
+        ph,
+    )
 }
 
 /// Compute the (crop_x, crop_y, crop_w, crop_h) rectangle that cuts
@@ -126,11 +131,7 @@ pub fn fill_rect_blend(
 /// the band over the page beneath. A 0.45 blend in the bake path
 /// becomes `alpha = (0.45 * 255).round() as u8 = 115` here.
 #[allow(dead_code)] // wired up by the selection-overlay-as-separate-image work
-pub fn fill_rect_rgba(
-    img: &mut RgbaImage,
-    rect: (u32, u32, u32, u32),
-    rgba: [u8; 4],
-) {
+pub fn fill_rect_rgba(img: &mut RgbaImage, rect: (u32, u32, u32, u32), rgba: [u8; 4]) {
     let (x, y, w, h) = rect;
     let img_w = img.width() as usize;
     let img_h = img.height() as usize;
@@ -179,7 +180,12 @@ mod tests {
     fn norm_to_pixels_maps_centered_quarter() {
         // Quarter rectangle at (25%, 25%) sized 50%×50% on a 200×100 image
         // → starts at (50, 25), spans 100×50.
-        let r = Rect01 { x: 0.25, y: 0.25, w: 0.5, h: 0.5 };
+        let r = Rect01 {
+            x: 0.25,
+            y: 0.25,
+            w: 0.5,
+            h: 0.5,
+        };
         let (x, y, w, h) = norm_to_pixels(r, 200, 100);
         assert_eq!((x, y, w, h), (50, 25, 100, 50));
     }
@@ -188,7 +194,12 @@ mod tests {
     fn norm_to_pixels_clamps_out_of_range() {
         // A negative-x highlight (legacy data corruption) must not panic
         // and must produce an in-bounds origin.
-        let r = Rect01 { x: -0.2, y: 1.5, w: 2.0, h: 0.1 };
+        let r = Rect01 {
+            x: -0.2,
+            y: 1.5,
+            w: 2.0,
+            h: 0.1,
+        };
         let (x, y, w, _h) = norm_to_pixels(r, 100, 100);
         assert_eq!(x, 0);
         assert!(y < 100);

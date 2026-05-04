@@ -119,11 +119,7 @@ pub fn load_from_pdf(document: &PdfDocument<'_>) -> Result<HighlightStore> {
 /// this wrapper stays around for tests that want to round-trip the
 /// full doc without tracking a candidate set.
 #[allow(dead_code)]
-pub fn save_to_pdf(
-    document: &PdfDocument<'_>,
-    store: &HighlightStore,
-    path: &Path,
-) -> Result<()> {
+pub fn save_to_pdf(document: &PdfDocument<'_>, store: &HighlightStore, path: &Path) -> Result<()> {
     apply_store_to_document(document, store, None)?;
     save_atomic(document, path)
 }
@@ -156,11 +152,7 @@ fn apply_store_to_document(
     // the end of the document (e.g. a session restored from a longer
     // version of the same file).
     let total_usize = total.max(0) as usize;
-    let orphans = store
-        .items
-        .iter()
-        .filter(|h| h.page >= total_usize)
-        .count();
+    let orphans = store.items.iter().filter(|h| h.page >= total_usize).count();
     if orphans > 0 {
         eprintln!(
             "warning: {orphans} highlight(s) reference page(s) past the end of \
@@ -276,10 +268,7 @@ fn save_atomic(document: &PdfDocument<'_>, path: &Path) -> Result<()> {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let stem = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("doc");
+    let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("doc");
     let tmp_path = parent.join(format!(
         ".{stem}.termpdf-tmp.{}.{}",
         std::process::id(),
@@ -303,9 +292,7 @@ fn save_atomic(document: &PdfDocument<'_>, path: &Path) -> Result<()> {
             .custom_flags(O_NOFOLLOW)
             .mode(0o600)
             .open(&tmp_path)
-            .with_context(|| {
-                format!("creating private temp file {}", tmp_path.display())
-            })?;
+            .with_context(|| format!("creating private temp file {}", tmp_path.display()))?;
         document
             .save_to_writer(&mut file)
             .with_context(|| format!("writing temp PDF to {}", tmp_path.display()))?;
@@ -385,7 +372,9 @@ mod tests {
     /// are already painted by pdfium's own renderer).
     #[test]
     fn load_skips_foreign_highlights_without_segfault() {
-        let Some(pdfium) = pdfium_or_skip() else { return };
+        let Some(pdfium) = pdfium_or_skip() else {
+            return;
+        };
         let path = temp_path("foreign");
 
         // Build a one-page PDF with a Highlight annotation that
@@ -414,9 +403,7 @@ mod tests {
             doc.save_to_file(&path).expect("save");
         }
 
-        let doc = pdfium
-            .load_pdf_from_file(&path, None)
-            .expect("reload");
+        let doc = pdfium.load_pdf_from_file(&path, None).expect("reload");
         // The bug was a segfault here; reaching the assert is the win.
         let store = load_from_pdf(&doc).expect("load_from_pdf");
         assert_eq!(
@@ -433,7 +420,9 @@ mod tests {
     /// delete a multi-line highlight as a single unit.
     #[test]
     fn group_id_roundtrips_through_save_and_load() {
-        let Some(pdfium) = pdfium_or_skip() else { return };
+        let Some(pdfium) = pdfium_or_skip() else {
+            return;
+        };
         let path = temp_path("group-id");
         {
             let mut doc = pdfium.create_new_pdf().expect("new pdf");
@@ -446,18 +435,33 @@ mod tests {
         let store = HighlightStore {
             items: vec![
                 Highlight {
-                    page: 0, x: 0.10, y: 0.10, w: 0.20, h: 0.04,
-                    color: "#ffd54f".into(), note: None,
+                    page: 0,
+                    x: 0.10,
+                    y: 0.10,
+                    w: 0.20,
+                    h: 0.04,
+                    color: "#ffd54f".into(),
+                    note: None,
                     group_id: Some(42),
                 },
                 Highlight {
-                    page: 0, x: 0.10, y: 0.15, w: 0.20, h: 0.04,
-                    color: "#ffd54f".into(), note: None,
+                    page: 0,
+                    x: 0.10,
+                    y: 0.15,
+                    w: 0.20,
+                    h: 0.04,
+                    color: "#ffd54f".into(),
+                    note: None,
                     group_id: Some(42),
                 },
                 Highlight {
-                    page: 0, x: 0.10, y: 0.20, w: 0.20, h: 0.04,
-                    color: "#ffd54f".into(), note: None,
+                    page: 0,
+                    x: 0.10,
+                    y: 0.20,
+                    w: 0.20,
+                    h: 0.04,
+                    color: "#ffd54f".into(),
+                    note: None,
                     group_id: Some(42),
                 },
             ],
@@ -484,7 +488,9 @@ mod tests {
     /// stays compact for new entries too).
     #[test]
     fn missing_group_id_in_contents_loads_as_none() {
-        let Some(pdfium) = pdfium_or_skip() else { return };
+        let Some(pdfium) = pdfium_or_skip() else {
+            return;
+        };
         let path = temp_path("legacy-meta");
         {
             let mut doc = pdfium.create_new_pdf().expect("new pdf");
@@ -530,7 +536,9 @@ mod tests {
     /// recreating it (idempotency check).
     #[test]
     fn double_save_is_idempotent() {
-        let Some(pdfium) = pdfium_or_skip() else { return };
+        let Some(pdfium) = pdfium_or_skip() else {
+            return;
+        };
         let path = temp_path("idempotent");
         {
             let mut doc = pdfium.create_new_pdf().expect("new pdf");
@@ -572,7 +580,9 @@ mod tests {
     /// annotations" predicate is what guards this.
     #[test]
     fn save_preserves_foreign_highlights_on_same_page() {
-        let Some(pdfium) = pdfium_or_skip() else { return };
+        let Some(pdfium) = pdfium_or_skip() else {
+            return;
+        };
         let path = temp_path("preserve-foreign");
         // Build a PDF with one foreign Highlight (no Contents tag).
         {
@@ -608,7 +618,7 @@ mod tests {
                     h: 0.05,
                     color: "#ffd54f".into(),
                     note: None,
-                group_id: None,
+                    group_id: None,
                 }],
             };
             save_to_pdf(&doc, &store, &path).expect("save_to_pdf");
@@ -644,7 +654,9 @@ mod tests {
     /// TAG_PREFIX/JSON encoding of color + note metadata.
     #[test]
     fn save_then_load_roundtrips_metadata() {
-        let Some(pdfium) = pdfium_or_skip() else { return };
+        let Some(pdfium) = pdfium_or_skip() else {
+            return;
+        };
         let path = temp_path("roundtrip");
 
         // Start with an empty 1-page PDF.
@@ -699,7 +711,9 @@ mod tests {
     /// caller bug here would silently lose user data.
     #[test]
     fn save_to_pdf_filtered_only_walks_candidate_pages() {
-        let Some(pdfium) = pdfium_or_skip() else { return };
+        let Some(pdfium) = pdfium_or_skip() else {
+            return;
+        };
         let path = temp_path("filtered");
         {
             let mut doc = pdfium.create_new_pdf().expect("new pdf");
@@ -714,12 +728,24 @@ mod tests {
         let store = HighlightStore {
             items: vec![
                 Highlight {
-                    page: 0, x: 0.10, y: 0.10, w: 0.20, h: 0.05,
-                    color: "#ffd54f".into(), note: None, group_id: None,
+                    page: 0,
+                    x: 0.10,
+                    y: 0.10,
+                    w: 0.20,
+                    h: 0.05,
+                    color: "#ffd54f".into(),
+                    note: None,
+                    group_id: None,
                 },
                 Highlight {
-                    page: 1, x: 0.10, y: 0.10, w: 0.20, h: 0.05,
-                    color: "#aed581".into(), note: None, group_id: None,
+                    page: 1,
+                    x: 0.10,
+                    y: 0.10,
+                    w: 0.20,
+                    h: 0.05,
+                    color: "#aed581".into(),
+                    note: None,
+                    group_id: None,
                 },
             ],
         };

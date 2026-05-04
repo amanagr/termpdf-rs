@@ -40,12 +40,21 @@ fn binary_path() -> Option<PathBuf> {
 fn pdfium_or_skip() -> Option<pdfium_render::prelude::Pdfium> {
     let candidates = [
         std::env::var("TERMPDF_PDFIUM").ok(),
-        Some(format!("{}/vendor/lib/libpdfium.so", env!("CARGO_MANIFEST_DIR"))),
-        Some(format!("{}/vendor/libpdfium.so", env!("CARGO_MANIFEST_DIR"))),
+        Some(format!(
+            "{}/vendor/lib/libpdfium.so",
+            env!("CARGO_MANIFEST_DIR")
+        )),
+        Some(format!(
+            "{}/vendor/libpdfium.so",
+            env!("CARGO_MANIFEST_DIR")
+        )),
         Some("/usr/lib64/libpdfium.so".into()),
         Some("/usr/lib/libpdfium.so".into()),
     ];
-    let lib = candidates.into_iter().flatten().find(|p| std::path::Path::new(p).exists());
+    let lib = candidates
+        .into_iter()
+        .flatten()
+        .find(|p| std::path::Path::new(p).exists());
     let lib = match lib {
         Some(p) => p,
         None => {
@@ -87,7 +96,13 @@ fn make_test_pdf(pdfium: &pdfium_render::prelude::Pdfium) -> PathBuf {
 /// rx-of-bytes-from-master). The reader runs on a background thread
 /// so the test loop never blocks on read; everything that arrived is
 /// drainable through the channel without backpressure.
-fn spawn_in_pty(pdf: &std::path::Path) -> (Box<dyn portable_pty::Child + Send + Sync>, Box<dyn Write + Send>, mpsc::Receiver<Vec<u8>>) {
+fn spawn_in_pty(
+    pdf: &std::path::Path,
+) -> (
+    Box<dyn portable_pty::Child + Send + Sync>,
+    Box<dyn Write + Send>,
+    mpsc::Receiver<Vec<u8>>,
+) {
     let bin = binary_path().expect("binary built");
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -123,8 +138,8 @@ fn spawn_in_pty(pdf: &std::path::Path) -> (Box<dyn portable_pty::Child + Send + 
     cmd.env("TERMPDF_CELL_PX", "8x16");
     // Sandbox the disk cache to a per-test temp dir so test runs
     // don't pollute the user's real ~/.cache/termpdf-rs.
-    let tmp_cache = std::env::temp_dir()
-        .join(format!("termpdf-test-cache-pty-{}", std::process::id()));
+    let tmp_cache =
+        std::env::temp_dir().join(format!("termpdf-test-cache-pty-{}", std::process::id()));
     cmd.env("XDG_CACHE_HOME", &tmp_cache);
 
     let child = pair.slave.spawn_command(cmd).expect("spawn");
@@ -154,7 +169,12 @@ fn spawn_in_pty(pdf: &std::path::Path) -> (Box<dyn portable_pty::Child + Send + 
 /// Drain the reader channel for up to `total`, accumulating into
 /// `buf`. Returns early if `predicate(&buf)` becomes true. Returns
 /// whether the predicate fired.
-fn drain_until(rx: &mpsc::Receiver<Vec<u8>>, buf: &mut Vec<u8>, total: Duration, mut predicate: impl FnMut(&[u8]) -> bool) -> bool {
+fn drain_until(
+    rx: &mpsc::Receiver<Vec<u8>>,
+    buf: &mut Vec<u8>,
+    total: Duration,
+    mut predicate: impl FnMut(&[u8]) -> bool,
+) -> bool {
     let deadline = Instant::now() + total;
     if predicate(buf) {
         return true;
@@ -190,7 +210,13 @@ fn dump_tail(buf: &[u8], n: usize) -> String {
     let start = buf.len().saturating_sub(n);
     buf[start..]
         .iter()
-        .map(|b| if (0x20..=0x7e).contains(b) || *b == b'\n' { *b as char } else { '.' })
+        .map(|b| {
+            if (0x20..=0x7e).contains(b) || *b == b'\n' {
+                *b as char
+            } else {
+                '.'
+            }
+        })
         .collect()
 }
 
@@ -216,18 +242,17 @@ fn dump_tail(buf: &[u8], n: usize) -> String {
 ///    selection grows.
 #[test]
 fn binary_renders_visual_mode_and_repaints_after_motion() {
-    let Some(pdfium) = pdfium_or_skip() else { return };
+    let Some(pdfium) = pdfium_or_skip() else {
+        return;
+    };
     let pdf = make_test_pdf(&pdfium);
 
     let (mut child, mut writer, rx) = spawn_in_pty(&pdf);
 
     let mut buf = Vec::new();
-    let painted = drain_until(
-        &rx,
-        &mut buf,
-        Duration::from_secs(8),
-        |b| twoway_contains(b, b"1/1"),
-    );
+    let painted = drain_until(&rx, &mut buf, Duration::from_secs(8), |b| {
+        twoway_contains(b, b"1/1")
+    });
     assert!(
         painted,
         "status line `1/1` never appeared after opening PDF.\nLast 1KB:\n{}",
@@ -238,12 +263,9 @@ fn binary_renders_visual_mode_and_repaints_after_motion() {
     writer.write_all(b"v").expect("write v");
     writer.flush().ok();
 
-    let visual_seen = drain_until(
-        &rx,
-        &mut buf,
-        Duration::from_secs(4),
-        |b| twoway_contains(b, b"VISUAL"),
-    );
+    let visual_seen = drain_until(&rx, &mut buf, Duration::from_secs(4), |b| {
+        twoway_contains(b, b"VISUAL")
+    });
     assert!(
         visual_seen,
         "VISUAL mode label never appeared — `v` did not enter visual mode.\nLast 1KB:\n{}",
@@ -260,12 +282,7 @@ fn binary_renders_visual_mode_and_repaints_after_motion() {
     writer.write_all(b"l").ok();
     writer.write_all(b"l").ok();
     writer.flush().ok();
-    drain_until(
-        &rx,
-        &mut buf,
-        Duration::from_millis(1500),
-        |_| false,
-    );
+    drain_until(&rx, &mut buf, Duration::from_millis(1500), |_| false);
 
     let post_v = &buf[mark_after_visual..];
     let image_area_repainted = looks_like_image_area_repaint(post_v);
@@ -281,10 +298,15 @@ fn binary_renders_visual_mode_and_repaints_after_motion() {
     let exit_deadline = Instant::now() + Duration::from_secs(4);
     let mut clean_exit = false;
     while Instant::now() < exit_deadline {
-        if let Ok(Some(_)) = child.try_wait() { clean_exit = true; break; }
+        if let Ok(Some(_)) = child.try_wait() {
+            clean_exit = true;
+            break;
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
-    if !clean_exit { let _ = child.kill(); }
+    if !clean_exit {
+        let _ = child.kill();
+    }
 
     assert!(
         clean_exit,
@@ -334,6 +356,12 @@ fn dump_printable(bytes: &[u8], n: usize) -> String {
     let take = bytes.len().min(n);
     bytes[..take]
         .iter()
-        .map(|b| if (0x20..=0x7e).contains(b) || *b == b'\n' { *b as char } else { '.' })
+        .map(|b| {
+            if (0x20..=0x7e).contains(b) || *b == b'\n' {
+                *b as char
+            } else {
+                '.'
+            }
+        })
         .collect()
 }

@@ -173,7 +173,10 @@ mod tests {
     fn metrics(sizes: &[(f32, f32)]) -> Vec<PageMetrics> {
         sizes
             .iter()
-            .map(|&(w, h)| PageMetrics { width_pts: w, height_pts: h })
+            .map(|&(w, h)| PageMetrics {
+                width_pts: w,
+                height_pts: h,
+            })
             .collect()
     }
 
@@ -281,7 +284,11 @@ mod tests {
         // two pages mid-doc.
         let viewport_top = 250 * 110 + 50;
         let r = l.visible_pages(viewport_top, 200);
-        assert_eq!(r, 250..253, "expected pages 250..253 visible at y={viewport_top}");
+        assert_eq!(
+            r,
+            250..253,
+            "expected pages 250..253 visible at y={viewport_top}"
+        );
         // Also: viewport pinned to last page should land on it.
         let last_top = (500 - 1) * 110;
         assert_eq!(l.visible_pages(last_top as i64, 100), 499..500);

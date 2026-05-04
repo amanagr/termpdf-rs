@@ -141,7 +141,11 @@ mod tests {
 
     fn temp_pdf_path(tag: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("termpdf-session-{}-{}.pdf", std::process::id(), tag));
+        p.push(format!(
+            "termpdf-session-{}-{}.pdf",
+            std::process::id(),
+            tag
+        ));
         // The path doesn't have to exist; Session uses canonicalize
         // best-effort and falls back to the raw path for hashing.
         let _ = std::fs::write(&p, b"%PDF-1.4\n");
