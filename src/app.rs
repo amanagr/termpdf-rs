@@ -247,6 +247,14 @@ pub struct App<'doc> {
     /// rapid; the user wants their page to show immediately.
     /// Held-j autorepeats fire ~25 events/sec → count climbs fast.
     pub input_burst_count: u32,
+    /// Timestamp of the last *applied* scroll keypress. Used by
+    /// `note_scroll_attempt` to throttle held-key autorepeat: Linux
+    /// keyboard autorepeat fires ~30 Hz, which would flip 30 PDF
+    /// pages/sec, way faster than the user can read or any browser
+    /// scrolls. The throttle accepts at most one scroll per
+    /// `SCROLL_THROTTLE_MS` so a held `j` lands at a human-readable
+    /// cadence.
+    pub last_scroll_applied_at: Option<std::time::Instant>,
     /// Set by the kitty draw path when it deferred cold-page renders
     /// past its per-frame budget. The run-loop reads this, forces an
     /// immediate next-iteration draw, and clears it. Staggering
@@ -399,13 +407,6 @@ pub struct App<'doc> {
     /// page render. `None` when the cache dir can't be determined.
     pub cache_dir: Option<PathBuf>,
 
-    /// In-app process telemetry: CPU%, temperature, RSS. Sampled at
-    /// ~1 Hz from the run-loop and rendered in the status line so the
-    /// user sees a heat / CPU spike at the moment it's caused. Built
-    /// in response to a "scrolling heats CPU 50→74°C" report — the
-    /// HUD is the truth source for diagnosing whether a fix worked.
-    pub sysinfo: crate::sysinfo::SysInfo,
-
     pub should_quit: bool,
 }
 
@@ -419,6 +420,15 @@ pub struct App<'doc> {
 /// skim cadence; single isolated taps stay below the burst minimum
 /// so the page they revealed still renders on the keystroke.
 pub const RAPID_SCROLL_THRESHOLD_MS: u128 = 250;
+/// Minimum gap (ms) between accepted scroll keypresses. Linux
+/// keyboard autorepeat fires ~30 Hz; without throttle a held `j`
+/// flips 30 PDF pages/sec — way faster than the user can read or
+/// any browser scrolls. 150 ms = ~6.7 Hz max, which matches a
+/// brisk reading cadence. Two scrolls inside the throttle window
+/// drop the second one (the user can't visually process them
+/// anyway). Single intentional taps further apart than 150 ms are
+/// always honoured.
+pub const SCROLL_THROTTLE_MS: u128 = 150;
 /// Minimum consecutive inputs in the burst window before we treat the
 /// scroll as rapid. =3 keeps a single isolated keypress from being
 /// flagged as a burst (it would defer the only page the user wanted
@@ -536,6 +546,7 @@ impl<'doc> App<'doc> {
             kitty_pages,
             last_input_at: None,
             input_burst_count: 0,
+            last_scroll_applied_at: None,
             pending_cold_redraw: false,
             canvas_buf: None,
             bg_row_buf: Vec::new(),
@@ -571,7 +582,6 @@ impl<'doc> App<'doc> {
             next_highlight_group_id,
             awaiting_highlight_delete_confirm: false,
             cache_dir,
-            sysinfo: crate::sysinfo::SysInfo::new(),
             should_quit: false,
         };
         Ok(app)
@@ -902,6 +912,25 @@ impl<'doc> App<'doc> {
             1
         };
         self.last_input_at = Some(now);
+    }
+
+    /// Gate for scroll-key handlers (`j`, `k`, Space, `b`, Ctrl-d/u,
+    /// `]]`, `[[`). Returns `true` if the scroll should proceed and
+    /// records the time; returns `false` if the previous accepted
+    /// scroll was within `SCROLL_THROTTLE_MS` ago. Held-key autorepeat
+    /// at 30 Hz would otherwise flip 30 PDF pages/sec; the throttle
+    /// caps that at ~6.7 Hz, which lands at a brisk reading cadence
+    /// without feeling laggy on intentional taps further than 150 ms
+    /// apart.
+    pub fn note_scroll_attempt(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let allow = self
+            .last_scroll_applied_at
+            .is_none_or(|t| (now - t).as_millis() >= SCROLL_THROTTLE_MS);
+        if allow {
+            self.last_scroll_applied_at = Some(now);
+        }
+        allow
     }
 
     /// Derive the active selection's per-page fingerprint for the

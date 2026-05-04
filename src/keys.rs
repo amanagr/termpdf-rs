@@ -109,13 +109,21 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('?') => app.show_help = !app.show_help,
 
-        // Page-boundary jumps.
+        // Page-boundary jumps. Throttled — Linux key autorepeat fires
+        // ~30 Hz, which would flip 30 PDF pages/sec; `note_scroll_attempt`
+        // caps that at ~6.7 Hz (a brisk reading cadence) and silently
+        // drops the over-rate keypresses. Counted forms (e.g. `5j`)
+        // bypass the throttle since they're a single intentional action.
         KeyCode::Char('j') => {
-            app.next_page(count.unwrap_or(1));
+            if count.is_some() || app.note_scroll_attempt() {
+                app.next_page(count.unwrap_or(1));
+            }
             app.pending.clear();
         }
         KeyCode::Char('k') => {
-            app.prev_page(count.unwrap_or(1));
+            if count.is_some() || app.note_scroll_attempt() {
+                app.prev_page(count.unwrap_or(1));
+            }
             app.pending.clear();
         }
         // less-style screen scroll. Space pages forward by ~one
@@ -125,25 +133,45 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         // a duplicate of `k` (prev page boundary); the new binding
         // is what users coming from `less`/`man` expect.
         KeyCode::Char(' ') => {
-            let n = count.unwrap_or(1).max(1);
-            for _ in 0..n {
-                app.scroll_by_screens(SCROLL_SCREEN);
+            if count.is_some() || app.note_scroll_attempt() {
+                let n = count.unwrap_or(1).max(1);
+                for _ in 0..n {
+                    app.scroll_by_screens(SCROLL_SCREEN);
+                }
             }
             app.pending.clear();
         }
         KeyCode::Char('b') => {
-            app.scroll_by_screens(-SCROLL_SCREEN);
+            if app.note_scroll_attempt() {
+                app.scroll_by_screens(-SCROLL_SCREEN);
+            }
             app.pending.clear();
         }
 
         // Within-document scroll. Arrows for fine; Ctrl-d/u for
-        // half-screen jumps.
-        KeyCode::Down => app.scroll_by_screens(SCROLL_LINE),
-        KeyCode::Up => app.scroll_by_screens(-SCROLL_LINE),
+        // half-screen jumps. All throttled.
+        KeyCode::Down => {
+            if app.note_scroll_attempt() {
+                app.scroll_by_screens(SCROLL_LINE);
+            }
+        }
+        KeyCode::Up => {
+            if app.note_scroll_attempt() {
+                app.scroll_by_screens(-SCROLL_LINE);
+            }
+        }
         KeyCode::Left => app.scroll_x_by(-SCROLL_LINE),
         KeyCode::Right => app.scroll_x_by(SCROLL_LINE),
-        KeyCode::Char('d') if ctrl => app.scroll_by_screens(SCROLL_HALF),
-        KeyCode::Char('u') if ctrl => app.scroll_by_screens(-SCROLL_HALF),
+        KeyCode::Char('d') if ctrl => {
+            if app.note_scroll_attempt() {
+                app.scroll_by_screens(SCROLL_HALF);
+            }
+        }
+        KeyCode::Char('u') if ctrl => {
+            if app.note_scroll_attempt() {
+                app.scroll_by_screens(-SCROLL_HALF);
+            }
+        }
         // Vim-style jumplist: <C-o> back, <C-i> / Tab forward.
         KeyCode::Char('o') if ctrl => app.jump_back(),
         KeyCode::Char('i') if ctrl => app.jump_forward(),
