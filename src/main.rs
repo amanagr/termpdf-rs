@@ -644,15 +644,15 @@ fn warm_next_uncached(app: &mut App<'_>) -> Result<bool> {
         // directly to stdout. mark_transmitted afterwards so the next
         // draw's is_fresh check returns true and skips the transmit.
         //
-        // Read from highlights_baked_cache only — the page bitmap on
-        // the terminal is selection-FREE in kitty mode (selection
-        // ships separately as a layered overlay placement; see
-        // draw_pages_kitty). If we sourced from overlay_cache here,
-        // the warm tick would cache a WITH-SELECTION encoded payload
-        // under a key that compute_page_revision (selection-stable)
-        // hands draw_pages_kitty next time, and the page would render
-        // a stale selection burned into its bitmap.
-        let bm = app.highlights_baked_cache.get(&pi).map(|(bm, _)| bm);
+        // Source the transmit bitmap from the highlights-baked tier
+        // when present, else fall back to page_cache.as_rgba8() (a
+        // borrowed view of the pdfium-returned bitmap). Selection is
+        // intentionally NOT baked into either source — in kitty mode
+        // it ships as a separate layered overlay, so the page bitmap
+        // is selection-stable across selection moves.
+        let bm: Option<&image::RgbaImage> = app.highlights_baked_cache.get(&pi)
+            .map(|(bm, _)| bm)
+            .or_else(|| app.page_cache.get(&pi).and_then(|d| d.as_rgba8()));
         let pixel_dims = bm.map(|bm| (bm.width(), bm.height()));
         let kp = app.kitty_pages.as_mut();
         if let (Some(kp), Some(bm), Some((w, h))) = (kp, bm, pixel_dims) {

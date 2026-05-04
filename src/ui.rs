@@ -626,14 +626,19 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
 
     let mut blits: Vec<PageBlit> = Vec::with_capacity(visible.len());
     for &page_idx in &visible {
-        // Read dims from highlights_baked_cache directly. The page
-        // bitmap on the terminal is the highlights-baked tier; the
-        // selection band ships separately as a layered overlay.
-        let Some((bm, _)) = app.highlights_baked_cache.get(&page_idx) else {
+        // Read dims from the highlights-baked tier when present, else
+        // fall back to page_cache. Pages with no highlights / search
+        // hits don't get a baked entry (saves the ~6 MB clone) and
+        // the page_cache image is selection-free already, so it's a
+        // suitable transmit source on its own.
+        let pixel_dims = if let Some((bm, _)) = app.highlights_baked_cache.get(&page_idx) {
+            Some((bm.width(), bm.height()))
+        } else {
+            app.page_cache.get(&page_idx).map(|d| (d.width(), d.height()))
+        };
+        let Some((pixel_w, pixel_h)) = pixel_dims else {
             continue;
         };
-        let pixel_w = bm.width();
-        let pixel_h = bm.height();
 
         let page_doc_y = app.layout.page_y(page_idx);
         let page_h_px = app.layout.page_h(page_idx);
@@ -760,11 +765,14 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
         }
     }
 
-    // Build transmit strings for pages that need them. The page bitmap
-    // is the highlights-baked tier — selection is NOT baked here; it
-    // ships as a separate layered kitty image (classical placement at
-    // z=1) emitted later in this function.
+    // Build transmit strings for pages that need them. Source the
+    // bitmap from the highlights-baked tier when present, else fall
+    // back to page_cache.as_rgba8() — a borrowed view of the pdfium-
+    // returned bitmap, no clone. Pages with no highlights / search
+    // hits skip the baked tier entirely so the per-scroll path on a
+    // clean PDF avoids one ~6 MB RGBA copy per cold page.
     let baked_cache = &app.highlights_baked_cache;
+    let page_cache = &app.page_cache;
     let kp = app.kitty_pages.as_mut().unwrap();
     let mut transmits: Vec<Option<String>> = blits
         .iter()
@@ -772,7 +780,11 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
             if !b.need_transmit {
                 return None;
             }
-            let bm = baked_cache.get(&b.page_idx).map(|(bm, _)| bm)?;
+            let bm: &RgbaImage = if let Some((bm, _)) = baked_cache.get(&b.page_idx) {
+                bm
+            } else {
+                page_cache.get(&b.page_idx)?.as_rgba8()?
+            };
             Some(kp.build_transmit(bm, b.page_idx, layout_key, b.revision))
         })
         .collect();
@@ -1654,6 +1666,20 @@ fn page_overlay_key(app: &App<'_>, page_idx: usize, layout: LayoutKey) -> PageOv
 /// and paint just the selection band on top. For a heavily
 /// highlighted page the saved-N×fill_rect_blend disappears.
 pub(crate) fn ensure_overlay(app: &mut App<'_>, page_idx: usize, layout: LayoutKey) {
+    // Kitty mode short-circuit: the layered selection overlay (built
+    // by draw_pages_kitty) means the page bitmap on the terminal is
+    // selection-FREE. We only need the highlights-baked tier — the
+    // overlay_cache (= baked + selection painted in) is dead weight
+    // there: never read, but a per-keystroke ~6 MB RGBA copy. Drop
+    // any stale entry to free memory and skip the bake.
+    if app.kitty_pages.is_some() {
+        ensure_highlights_baked(app, page_idx, layout);
+        if app.overlay_cache.contains_key(&page_idx) {
+            app.overlay_cache.remove(&page_idx);
+        }
+        return;
+    }
+
     let overlay_key = page_overlay_key(app, page_idx, layout);
     if app
         .overlay_cache
@@ -1730,11 +1756,34 @@ fn ensure_highlights_baked(app: &mut App<'_>, page_idx: usize, layout: LayoutKey
         }
         None => (0, false, false),
     };
+    let highlight_revision = app.highlights.page_revision(page_idx);
+
+    // Cold-page no-overlay fast path: if this page has nothing painted
+    // (no highlights, no search hits, no current-hit outline), the
+    // bake would just clone the page bitmap and return. Skip the
+    // ~6 MB clone and leave the cache empty for this page; consumers
+    // (`draw_pages_kitty`, the warm tick) have a fallback to
+    // `page_cache.as_rgba8()` for pages without a baked entry.
+    //
+    // Net win on `scroll_casual_large`: every cold page hits this
+    // branch (the test PDF has no highlights / search) so the per-
+    // scroll RGBA clone disappears. cpu_ms drops accordingly.
+    let no_overlays = highlight_revision == 0 && !has_search_hits;
+    if no_overlays {
+        // Drop any stale entry (e.g. user just deleted the last
+        // highlight on this page) so consumers fall through to
+        // page_cache. The page_cache is the source of truth in this
+        // state — keeping a cached clone would diverge if the user
+        // re-renders at a different quality (Fast → Sharp upgrade).
+        app.highlights_baked_cache.remove(&page_idx);
+        return;
+    }
+
     let key = HighlightsBakedKey {
         layout,
         // Per-page fingerprint — saved-highlights tier no longer
         // re-bakes for every visible page on a single-page edit.
-        highlight_revision: app.highlights.page_revision(page_idx),
+        highlight_revision,
         search_revision,
         has_search_hits,
         current_hit_on_this_page,
