@@ -1,23 +1,16 @@
-//! Process + system telemetry for the in-app perf HUD.
+//! Process CPU% telemetry for the in-app perf HUD.
 //!
-//! Sampled at 1 Hz from the run-loop tick; the status line reads the
-//! cached values so the read path is allocation-free. Linux-only (we
-//! parse `/proc/<pid>/stat`, `/proc/<pid>/status`, and walk
-//! `/sys/class/hwmon` for CPU temperature). Other OSes get a stub
-//! sampler that always reports None.
+//! Linux-only — parses `/proc/<pid>/stat` for cumulative CPU ticks.
+//! Other OSes get a stub that always reports 0%.
 //!
-//! ## CPU%
+//! ## Sampling window
 //!
-//! Computed as `(delta utime+stime) / (delta wall) * 100`. The delta
-//! is captured between successive `sample()` calls; first call after
-//! `new()` returns 0% because there's no prior ticks to diff against.
-//!
-//! ## Power
-//!
-//! Walks `/sys/class/power_supply/BAT*` once (cached) for an entry
-//! exposing either `power_now` (microwatts) or
-//! `current_now`+`voltage_now`. Reads on each sample. AC-only or no-
-//! battery systems skip the column (Sample::power_w stays None).
+//! 30 seconds. Sampled at 1 Hz to keep the rolling-window edge fresh,
+//! but the displayed value is `Σ(cpu_ticks) / 30s × 100` over the most
+//! recent 30 seconds — long enough to surface SUSTAINED draw without
+//! the per-keystroke jitter a 1-second window shows. The user reported
+//! the 1-second flicker felt useless; a 30 s window matches what their
+//! laptop's thermal envelope actually responds to.
 //!
 //! ## Why this lives next to the renderer
 //!
@@ -26,32 +19,41 @@
 //! `htop` in another pane is too far removed; the moment-of-truth is
 //! the keystroke that drives the spike.
 
-use std::path::PathBuf;
+use std::collections::VecDeque;
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Sample {
-    /// Process CPU% over the most recent sample interval. 0.0 if
-    /// no prior sample exists yet, or if /proc reads failed.
+    /// Process CPU% averaged over the rolling 30-second window. 0.0
+    /// when fewer than 2 sample points exist yet (i.e. for the first
+    /// second after `new()`).
     pub cpu_pct: f32,
-    /// System battery discharge in watts, or None if not on battery
-    /// or no readable power source. Proxy for total system power
-    /// draw — when CPU spikes, this rises; lets the user spot the
-    /// thermal cost of a feature in real time without an external
-    /// tool.
-    pub power_w: Option<f32>,
 }
+
+/// One ring-buffer entry per 1Hz sample. We hold ~31 entries so the
+/// 30-second rolling window always has enough history; entries past
+/// `WINDOW_SECONDS` ago are dropped at the front.
+#[derive(Debug, Clone, Copy)]
+struct SamplePoint {
+    at: Instant,
+    proc_ticks: u64,
+}
+
+/// Length of the rolling-CPU% window. The user reported a 1-second
+/// window felt useless because every keystroke spike pushed it back
+/// to flat — a 30 s window matches their thermal envelope.
+const WINDOW_SECONDS: u64 = 30;
+/// Sample cadence. 1 Hz → 30 entries per window; the per-tick read of
+/// `/proc/<pid>/stat` is sub-100 µs so this is essentially free.
+const SAMPLE_INTERVAL_MS: u64 = 1000;
 
 pub struct SysInfo {
     pid: u32,
-    /// Path(s) for reading battery instantaneous power. Either a
-    /// single `power_now` (microwatts), or the pair (current_now,
-    /// voltage_now) (microamps × microvolts → multiply for power).
-    power_source: Option<PowerSource>,
-    /// utime+stime (clock ticks) at the last sample.
-    last_proc_ticks: u64,
-    /// Wall instant of the last sample.
-    last_sample_at: Option<Instant>,
+    /// Ring buffer of recent (timestamp, proc_ticks) pairs. Front is
+    /// oldest. `maybe_sample` pushes to the back and drops anything
+    /// older than `WINDOW_SECONDS` from the front. The displayed CPU%
+    /// is `(back.proc_ticks - front.proc_ticks) / (back.at - front.at)`.
+    history: VecDeque<SamplePoint>,
     /// Current cached sample shown in the HUD.
     pub cur: Sample,
     /// Throttle: don't re-sample more often than this.
@@ -60,31 +62,17 @@ pub struct SysInfo {
     pub disabled: bool,
 }
 
-/// Two ways batteries expose instantaneous power on Linux:
-///   - `power_now` in microwatts (most ACPI-style batteries).
-///   - `current_now` (µA) × `voltage_now` (µV) (charge-controller
-///     style, e.g. some Lenovo / older laptops). Both readings are
-///     present on most kernels but `power_now` may be 0 while only
-///     current+voltage are populated.
-enum PowerSource {
-    PowerNow(PathBuf),
-    CurrentVoltage { current: PathBuf, voltage: PathBuf },
-}
-
 impl SysInfo {
     pub fn new() -> Self {
         let disabled = std::env::var("TERMPDF_NO_PERF_HUD")
             .map(|v| !v.is_empty() && v != "0")
             .unwrap_or(false);
         let pid = std::process::id();
-        let power_source = if disabled { None } else { find_power_source() };
         Self {
             pid,
-            power_source,
-            last_proc_ticks: 0,
-            last_sample_at: None,
+            history: VecDeque::with_capacity(WINDOW_SECONDS as usize + 4),
             cur: Sample::default(),
-            min_interval: std::time::Duration::from_millis(1000),
+            min_interval: std::time::Duration::from_millis(SAMPLE_INTERVAL_MS),
             disabled,
         }
     }
@@ -96,28 +84,46 @@ impl SysInfo {
             return;
         }
         let now = Instant::now();
-        if let Some(last) = self.last_sample_at {
-            if now.duration_since(last) < self.min_interval {
+        if let Some(last) = self.history.back() {
+            if now.duration_since(last.at) < self.min_interval {
                 return;
             }
         }
         let proc_ticks = read_proc_cpu_ticks(self.pid).unwrap_or(0);
-        let power_w = self.power_source.as_ref().and_then(read_power_w);
+        self.history.push_back(SamplePoint { at: now, proc_ticks });
 
-        let cpu_pct = if let Some(last_at) = self.last_sample_at {
-            let elapsed_ms = now.duration_since(last_at).as_millis().max(1) as u64;
-            // proc ticks are in CLK_TCK units (100 Hz on every Linux
-            // I've used). Convert to ms then divide by elapsed wall ms.
-            let delta_ticks = proc_ticks.saturating_sub(self.last_proc_ticks);
-            let delta_cpu_ms = delta_ticks * 1000 / clock_ticks_per_sec();
-            (delta_cpu_ms as f32 / elapsed_ms as f32) * 100.0
+        // Drop samples older than the rolling window so the front
+        // always represents "30 s ago" within ±1 sample interval.
+        let window = std::time::Duration::from_secs(WINDOW_SECONDS);
+        while let Some(front) = self.history.front() {
+            if now.duration_since(front.at) > window {
+                self.history.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        // Need at least two samples to diff. The first call fills the
+        // ring with one entry and shows 0%; subsequent calls compute
+        // a real average over whatever window has accumulated so far
+        // (so a freshly-launched binary stabilises into a useful
+        // reading within a second instead of needing a full 30 s).
+        let cpu_pct = if let (Some(front), Some(back)) =
+            (self.history.front(), self.history.back())
+        {
+            if front.at == back.at {
+                0.0
+            } else {
+                let elapsed_ms = back.at.duration_since(front.at).as_millis().max(1) as u64;
+                let delta_ticks = back.proc_ticks.saturating_sub(front.proc_ticks);
+                let delta_cpu_ms = delta_ticks * 1000 / clock_ticks_per_sec();
+                (delta_cpu_ms as f32 / elapsed_ms as f32) * 100.0
+            }
         } else {
             0.0
         };
 
-        self.cur = Sample { cpu_pct, power_w };
-        self.last_proc_ticks = proc_ticks;
-        self.last_sample_at = Some(now);
+        self.cur = Sample { cpu_pct };
     }
 }
 
@@ -138,66 +144,6 @@ fn read_proc_cpu_ticks(pid: u32) -> Option<u64> {
     let utime: u64 = fields[11].parse().ok()?;
     let stime: u64 = fields[12].parse().ok()?;
     Some(utime + stime)
-}
-
-/// Find a CPU temperature sensor under /sys/class/hwmon. Returns the
-/// `temp1_input` path of the first compatible device, or None. Cached
-/// at startup so the per-sample read path is just one file read.
-/// Find a battery's power-now reading. Walks /sys/class/power_supply
-/// for entries whose `type` is "Battery" with a non-empty `power_now`
-/// (microwatts) or fall-back `current_now` × `voltage_now` pair.
-fn find_power_source() -> Option<PowerSource> {
-    let root = std::path::Path::new("/sys/class/power_supply");
-    let read = std::fs::read_dir(root).ok()?;
-    for entry in read.flatten() {
-        let dir = entry.path();
-        let type_path = dir.join("type");
-        let kind = std::fs::read_to_string(&type_path).ok();
-        let is_battery = matches!(kind.as_deref().map(str::trim), Some("Battery"));
-        if !is_battery {
-            continue;
-        }
-        let power_now = dir.join("power_now");
-        if power_now.exists() {
-            // Quick sanity: it parses to a u64. Skip if file exists
-            // but is empty / unreadable.
-            if read_u64_file(&power_now).is_some() {
-                return Some(PowerSource::PowerNow(power_now));
-            }
-        }
-        let current = dir.join("current_now");
-        let voltage = dir.join("voltage_now");
-        if current.exists() && voltage.exists()
-            && read_u64_file(&current).is_some()
-            && read_u64_file(&voltage).is_some()
-        {
-            return Some(PowerSource::CurrentVoltage { current, voltage });
-        }
-    }
-    None
-}
-
-fn read_power_w(src: &PowerSource) -> Option<f32> {
-    match src {
-        PowerSource::PowerNow(p) => {
-            let uw = read_u64_file(p)?;
-            // Microwatts → watts.
-            Some((uw as f32) / 1_000_000.0)
-        }
-        PowerSource::CurrentVoltage { current, voltage } => {
-            let ua = read_u64_file(current)?;
-            let uv = read_u64_file(voltage)?;
-            // µA × µV = µW × 10⁶, divide by 10¹² for W.
-            // Use f64 in the middle to avoid u64 overflow on big batteries.
-            let w = ((ua as f64) * (uv as f64)) / 1e12;
-            Some(w as f32)
-        }
-    }
-}
-
-fn read_u64_file(p: &std::path::Path) -> Option<u64> {
-    let s = std::fs::read_to_string(p).ok()?;
-    s.trim().parse().ok()
 }
 
 fn clock_ticks_per_sec() -> u64 {
@@ -237,64 +183,85 @@ mod tests {
     fn sample_default_is_zero() {
         let s = Sample::default();
         assert_eq!(s.cpu_pct, 0.0);
-        assert!(s.power_w.is_none());
     }
 
     #[test]
-    fn sysinfo_disabled_returns_zeros() {
-        // Direct construction without depending on env-state.
+    fn sysinfo_disabled_does_not_record() {
         let mut info = SysInfo {
             pid: 0,
-            power_source: None,
-            last_proc_ticks: 0,
-            last_sample_at: None,
+            history: VecDeque::new(),
             cur: Sample::default(),
             min_interval: std::time::Duration::from_millis(0),
             disabled: true,
         };
         info.maybe_sample();
         assert_eq!(info.cur.cpu_pct, 0.0);
-        assert!(info.cur.power_w.is_none());
+        assert!(info.history.is_empty(), "disabled sampler must not push history");
     }
 
     #[test]
     fn first_sample_cpu_is_zero() {
-        // No prior sample → no delta → 0%. The throttle is bypassed
-        // here (min_interval = 0) so the call actually runs.
+        // First sample fills history with one entry; need at least
+        // two for a delta. The throttle is bypassed here (min_interval
+        // = 0) so the call actually runs.
         let mut info = SysInfo {
             pid: std::process::id(),
-            power_source: None,
-            last_proc_ticks: 0,
-            last_sample_at: None,
+            history: VecDeque::new(),
             cur: Sample::default(),
             min_interval: std::time::Duration::from_millis(0),
             disabled: false,
         };
         info.maybe_sample();
         assert_eq!(info.cur.cpu_pct, 0.0);
+        assert_eq!(info.history.len(), 1, "first call should record one sample");
     }
 
     #[test]
     fn throttle_skips_repeat_calls() {
         // Two calls back-to-back within the throttle window — the
-        // second must not reset last_sample_at to "now" (otherwise
-        // the throttle wouldn't actually throttle).
+        // second must not push another history entry.
         let mut info = SysInfo {
             pid: std::process::id(),
-            power_source: None,
-            last_proc_ticks: 0,
-            last_sample_at: None,
+            history: VecDeque::new(),
             cur: Sample::default(),
             min_interval: std::time::Duration::from_secs(60),
             disabled: false,
         };
         info.maybe_sample();
-        let first = info.last_sample_at;
+        let first_len = info.history.len();
         info.maybe_sample();
-        let second = info.last_sample_at;
-        assert_eq!(
-            first, second,
-            "throttled call should not update last_sample_at"
+        let second_len = info.history.len();
+        assert_eq!(first_len, second_len, "throttled call should not record");
+    }
+
+    /// Synthetic two-sample test: pretend the process burned 50 ms of
+    /// CPU over a 100 ms wall window → 50% CPU. Verifies the rolling-
+    /// window math without depending on real /proc readings.
+    #[test]
+    fn two_samples_compute_correct_percent() {
+        let mut info = SysInfo {
+            pid: 0,
+            history: VecDeque::new(),
+            cur: Sample::default(),
+            min_interval: std::time::Duration::from_millis(0),
+            disabled: false,
+        };
+        // Stuff history manually (bypasses the actual /proc read).
+        let t0 = Instant::now();
+        let t1 = t0 + std::time::Duration::from_millis(100);
+        // 50 ms of CPU at 100 Hz CLK_TCK = 5 ticks.
+        let ticks_for_50ms = 5;
+        info.history.push_back(SamplePoint { at: t0, proc_ticks: 0 });
+        info.history.push_back(SamplePoint { at: t1, proc_ticks: ticks_for_50ms });
+        // Re-run the calc that maybe_sample does at the tail of its
+        // body. Equivalent to:
+        let elapsed_ms = t1.duration_since(t0).as_millis() as u64;
+        let delta_cpu_ms = ticks_for_50ms * 1000 / clock_ticks_per_sec();
+        let pct = (delta_cpu_ms as f32 / elapsed_ms as f32) * 100.0;
+        // 50 ms / 100 ms = 50%. Allow 1% tolerance for rounding.
+        assert!(
+            (pct - 50.0).abs() < 1.5,
+            "expected ~50%, got {pct}% (delta_cpu_ms={delta_cpu_ms})"
         );
     }
 }

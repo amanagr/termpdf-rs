@@ -2302,18 +2302,19 @@ fn status_line(app: &App<'_>) -> Paragraph<'static> {
     Paragraph::new(Line::from(spans))
 }
 
-/// Bottom-right perf HUD: CPU% and instantaneous power draw. Color-
-/// coded so a spike draws the eye without parsing digits — green
-/// (cool) → yellow → red. Returns the rendered Paragraph plus the
-/// width in cells it should consume so the caller can right-align
-/// it without measuring the formatted width separately. Zero-cost
-/// when sysinfo is disabled.
+/// Bottom-right perf HUD: CPU% averaged over the rolling 30-second
+/// window. Color-coded so a sustained spike draws the eye without
+/// parsing digits — green (cool) → yellow → red. Returns the rendered
+/// Paragraph plus the width in cells so the caller can right-align it.
+/// Zero-cost when sysinfo is disabled.
+///
+/// 30s window, not 1s: a 1-second window flickered with every
+/// keystroke; the user wants a stable read of SUSTAINED draw.
 fn perf_hud(app: &App<'_>) -> Option<(Paragraph<'static>, u16)> {
     if app.sysinfo.disabled {
         return None;
     }
     let s = app.sysinfo.cur;
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(4);
     let cpu_color = if s.cpu_pct >= 50.0 {
         Color::Red
     } else if s.cpu_pct >= 25.0 {
@@ -2321,28 +2322,10 @@ fn perf_hud(app: &App<'_>) -> Option<(Paragraph<'static>, u16)> {
     } else {
         Color::Green
     };
-    let cpu_text = format!("cpu {:>3.0}%", s.cpu_pct);
+    let cpu_text = format!("cpu {:>3.0}%·30s", s.cpu_pct);
     let cpu_text_w = cpu_text.chars().count() as u16;
-    spans.push(Span::styled(cpu_text, Style::default().fg(cpu_color)));
-
-    let mut total_w = cpu_text_w;
-    if let Some(p) = s.power_w {
-        // Color thresholds for power: <8 W idle/light, 8–15 W moderate,
-        // ≥15 W heavy. Tuned for laptop-class hardware; AC-only systems
-        // tend to read 0 W and the column color stays green.
-        let p_color = if p >= 15.0 {
-            Color::Red
-        } else if p >= 8.0 {
-            Color::Yellow
-        } else {
-            Color::Green
-        };
-        let pw = format!("  {:>4.1} W", p);
-        let pw_w = pw.chars().count() as u16;
-        spans.push(Span::styled(pw, Style::default().fg(p_color)));
-        total_w = total_w.saturating_add(pw_w);
-    }
-    Some((Paragraph::new(Line::from(spans)), total_w))
+    let span = Span::styled(cpu_text, Style::default().fg(cpu_color));
+    Some((Paragraph::new(Line::from(vec![span])), cpu_text_w))
 }
 
 fn draw_toc(f: &mut Frame, app: &mut App<'_>, area: Rect) {
