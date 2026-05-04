@@ -860,7 +860,14 @@ fn encode_rgb_zlib(bitmap: &RgbaImage) -> std::io::Result<Vec<u8>> {
     // PDF pages typically deflate 5–20× on real content. Reserve a
     // generous lower bound so the inner Vec doesn't grow during the
     // flush (encoder writes in ~32 KB chunks).
-    let mut enc = ZlibEncoder::new(Vec::with_capacity(384 * 1024), Compression::default());
+    //
+    // `Compression::fast()` is zlib level 1 — matches the encode-CPU
+    // profile of the prior PNG `CompressionType::Fast` path. Higher
+    // levels (`default()` = 6) added measurable selection-drag CPU
+    // for a marginal byte-size delta on PDF page content; fast keeps
+    // this swap perf-neutral against the kitty PNG encode it
+    // replaced.
+    let mut enc = ZlibEncoder::new(Vec::with_capacity(384 * 1024), Compression::fast());
     enc.write_all(&rgb)?;
     enc.finish()
 }
