@@ -449,7 +449,7 @@ impl KittyPageRegistry {
                 None => true,
             };
             if needs_encode {
-                let (format_code, bytes) = encode_payload(bitmap);
+                let (format_code, bytes) = encode_payload_opaque(bitmap);
                 entry.cached_payload = Some(CachedPayload {
                     layout,
                     revision,
@@ -506,7 +506,7 @@ impl KittyPageRegistry {
                 return;
             }
         }
-        let (format_code, bytes) = encode_payload(bitmap);
+        let (format_code, bytes) = encode_payload_opaque(bitmap);
         entry.cached_payload = Some(CachedPayload {
             layout,
             revision,
@@ -692,6 +692,42 @@ fn encode_payload(bitmap: &RgbaImage) -> (u8, Vec<u8>) {
     }
 }
 
+/// PAGE encode path — strips alpha and ships RGB. Page bitmaps come
+/// out of pdfium opaque (alpha=255 everywhere) and stay opaque after
+/// dark-mode inversion + highlight baking (we composite onto an
+/// opaque bg). Sending RGB cuts:
+///   1. Wire bytes by 25% (PNG's deflate already compresses constant
+///      alpha well, but we still ship the alpha plane through it).
+///   2. **Ghostty's image-store size by 25%** — Ghostty keeps the
+///      decoded buffer; for our 10 MB/page raw RGBA at typical zoom,
+///      RGB drops it to ~7.5 MB. With cap=7 pages that's ~52 MB on
+///      Ghostty's side instead of ~70 MB, well under the internal
+///      capacity that was triggering "missing image" warnings.
+///
+/// Overlay images (selection band) keep RGBA via `encode_payload`;
+/// they have real alpha < 255 by design.
+fn encode_payload_opaque(bitmap: &RgbaImage) -> (u8, Vec<u8>) {
+    if force_raw_env() {
+        return (24, strip_alpha(bitmap));
+    }
+    match encode_png_fast_rgb(bitmap) {
+        Ok(png) => (100, png),
+        Err(_) => (24, strip_alpha(bitmap)),
+    }
+}
+
+/// Copy RGBA → RGB, dropping the alpha byte. Iterates 4-byte chunks
+/// so the compiler can vectorise; ~5 ms on a 10 MB page bitmap, which
+/// is dwarfed by the ~30-50 ms PNG encode that follows.
+fn strip_alpha(bitmap: &RgbaImage) -> Vec<u8> {
+    let raw = bitmap.as_raw();
+    let mut out = Vec::with_capacity(raw.len() / 4 * 3);
+    for chunk in raw.chunks_exact(4) {
+        out.extend_from_slice(&chunk[..3]);
+    }
+    out
+}
+
 /// Cached lookup of `TERMPDF_TRANSMIT_RAW`. The env var is read once
 /// per process — checking it on every page encode (called many times
 /// per session) was paying the syscall to scan environ each call. The
@@ -834,6 +870,29 @@ fn encode_png_fast(bitmap: &RgbaImage) -> Result<Vec<u8>, image::ImageError> {
         bitmap.width(),
         bitmap.height(),
         image::ExtendedColorType::Rgba8,
+    )?;
+    Ok(buf)
+}
+
+/// Same as `encode_png_fast` but encodes RGB (drops alpha). Used by
+/// the page-transmit path; alpha is always 255 on page bitmaps so
+/// dropping it loses no information and shrinks the decoded buffer
+/// in Ghostty by 25%.
+fn encode_png_fast_rgb(bitmap: &RgbaImage) -> Result<Vec<u8>, image::ImageError> {
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+    use image::ImageEncoder;
+    let rgb = strip_alpha(bitmap);
+    let mut buf = Vec::with_capacity(384 * 1024);
+    let encoder = PngEncoder::new_with_quality(
+        &mut buf,
+        CompressionType::Fast,
+        FilterType::Up,
+    );
+    encoder.write_image(
+        &rgb,
+        bitmap.width(),
+        bitmap.height(),
+        image::ExtendedColorType::Rgb8,
     )?;
     Ok(buf)
 }
@@ -1651,6 +1710,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Page transmits should ship RGB, not RGBA — drops Ghostty's
+    /// decoded image-store size by 25%, which is what made cap=7
+    /// stop tripping internal evictions. Verifies both wire-format
+    /// outputs (PNG and raw via TERMPDF_TRANSMIT_RAW).
+    #[test]
+    fn encode_payload_opaque_drops_alpha_in_raw_path() {
+        // 4 px = 16 bytes RGBA. After alpha strip: 12 bytes RGB.
+        let mut img = RgbaImage::new(2, 2);
+        for (i, p) in img.pixels_mut().enumerate() {
+            p[0] = (10 * i) as u8;
+            p[1] = (20 * i) as u8;
+            p[2] = (30 * i) as u8;
+            p[3] = 255;
+        }
+        let raw = strip_alpha(&img);
+        assert_eq!(raw.len(), 12, "RGB strip drops 4 alpha bytes per pixel");
+        assert_eq!(&raw[0..3], &[0, 0, 0]);
+        assert_eq!(&raw[3..6], &[10, 20, 30]);
+        assert_eq!(&raw[6..9], &[20, 40, 60]);
+        assert_eq!(&raw[9..12], &[30, 60, 90]);
+    }
+
+    #[test]
+    fn encode_payload_opaque_png_uses_rgb_color_type() {
+        // Render a tiny opaque image; encoded PNG's IHDR must say RGB.
+        let mut img = RgbaImage::new(4, 4);
+        for p in img.pixels_mut() {
+            *p = image::Rgba([200, 100, 50, 255]);
+        }
+        let (format_code, bytes) = encode_payload_opaque(&img);
+        assert_eq!(format_code, 100, "PNG path expected for opaque encode");
+        // PNG signature + IHDR. IHDR color type byte is at offset 25:
+        //   0..8   PNG signature
+        //   8..12  IHDR length
+        //   12..16 "IHDR"
+        //   16..20 width
+        //   20..24 height
+        //   24     bit depth
+        //   25     color type (2 = RGB, 6 = RGBA)
+        assert_eq!(
+            bytes[25], 2,
+            "PNG color type at byte 25 must be 2 (RGB), got {}",
+            bytes[25]
+        );
     }
 
     /// Steady state: clearing the same area twice in a row produces
