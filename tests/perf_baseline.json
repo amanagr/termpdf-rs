@@ -1,116 +1,116 @@
 {
   "version": 1,
-  "note": "generated unix=1777855558",
+  "note": "generated unix=1777857951",
   "scenarios": {
     "dark_toggle": {
       "wall_ms": 61,
       "per_action_p50_ms": 61,
       "per_action_p95_ms": 61,
-      "bytes_out": 139924,
+      "bytes_out": 138703,
       "transmits": 0,
       "placements": 1,
       "cpu_ms": 0,
-      "peak_rss_kb": 15140
+      "peak_rss_kb": 15048
     },
     "highlight_add": {
-      "wall_ms": 86,
-      "per_action_p50_ms": 86,
-      "per_action_p95_ms": 86,
-      "bytes_out": 763743,
+      "wall_ms": 87,
+      "per_action_p50_ms": 87,
+      "per_action_p95_ms": 87,
+      "bytes_out": 765740,
       "transmits": 12,
       "placements": 24,
       "cpu_ms": 20,
-      "peak_rss_kb": 22432
+      "peak_rss_kb": 22464
     },
     "idle_after_open_large": {
-      "wall_ms": 259,
-      "per_action_p50_ms": 259,
-      "per_action_p95_ms": 259,
-      "bytes_out": 471899,
-      "transmits": 2,
-      "placements": 2,
+      "wall_ms": 254,
+      "per_action_p50_ms": 254,
+      "per_action_p95_ms": 254,
+      "bytes_out": 254856,
+      "transmits": 1,
+      "placements": 1,
       "cpu_ms": 0,
-      "peak_rss_kb": 32904
+      "peak_rss_kb": 25772
     },
     "jump_to_end_large": {
       "wall_ms": 61,
       "per_action_p50_ms": 61,
       "per_action_p95_ms": 61,
-      "bytes_out": 25840,
+      "bytes_out": 25782,
       "transmits": 0,
       "placements": 0,
       "cpu_ms": 0,
-      "peak_rss_kb": 19352
+      "peak_rss_kb": 19316
     },
     "open_medium": {
-      "wall_ms": 41,
+      "wall_ms": 38,
       "per_action_p50_ms": 10,
       "per_action_p95_ms": 10,
-      "bytes_out": 131329,
+      "bytes_out": 135396,
       "transmits": 0,
       "placements": 1,
       "cpu_ms": 0,
-      "peak_rss_kb": 15044
+      "peak_rss_kb": 15208
     },
     "open_tiny": {
-      "wall_ms": 18,
+      "wall_ms": 17,
       "per_action_p50_ms": 10,
       "per_action_p95_ms": 10,
-      "bytes_out": 98750,
+      "bytes_out": 98809,
       "transmits": 0,
       "placements": 1,
       "cpu_ms": 0,
-      "peak_rss_kb": 13892
+      "peak_rss_kb": 13932
     },
     "scroll_casual_large": {
-      "wall_ms": 2516,
-      "per_action_p50_ms": 44,
-      "per_action_p95_ms": 164,
-      "bytes_out": 7981197,
-      "transmits": 30,
-      "placements": 30,
-      "cpu_ms": 1300,
-      "peak_rss_kb": 55328
+      "wall_ms": 1229,
+      "per_action_p50_ms": 40,
+      "per_action_p95_ms": 41,
+      "bytes_out": 513832,
+      "transmits": 2,
+      "placements": 2,
+      "cpu_ms": 20,
+      "peak_rss_kb": 26064
     },
     "scroll_steady_30": {
-      "wall_ms": 1991,
-      "per_action_p50_ms": 43,
-      "per_action_p95_ms": 162,
-      "bytes_out": 4056793,
-      "transmits": 19,
-      "placements": 20,
-      "cpu_ms": 770,
-      "peak_rss_kb": 46612
+      "wall_ms": 1235,
+      "per_action_p50_ms": 40,
+      "per_action_p95_ms": 45,
+      "bytes_out": 506021,
+      "transmits": 2,
+      "placements": 3,
+      "cpu_ms": 20,
+      "peak_rss_kb": 15000
     },
     "search_advance_5": {
-      "wall_ms": 217,
+      "wall_ms": 216,
       "per_action_p50_ms": 43,
       "per_action_p95_ms": 44,
-      "bytes_out": 1121821,
+      "bytes_out": 1120697,
       "transmits": 6,
       "placements": 7,
       "cpu_ms": 20,
-      "peak_rss_kb": 19856
+      "peak_rss_kb": 19692
     },
     "selection_drag_30": {
-      "wall_ms": 1255,
+      "wall_ms": 1260,
       "per_action_p50_ms": 41,
       "per_action_p95_ms": 42,
-      "bytes_out": 1457692,
+      "bytes_out": 1458790,
       "transmits": 31,
       "placements": 63,
       "cpu_ms": 50,
-      "peak_rss_kb": 18836
+      "peak_rss_kb": 18792
     },
     "zoom_cycle": {
       "wall_ms": 134,
       "per_action_p50_ms": 65,
-      "per_action_p95_ms": 68,
-      "bytes_out": 517082,
+      "per_action_p95_ms": 67,
+      "bytes_out": 519679,
       "transmits": 2,
       "placements": 3,
       "cpu_ms": 10,
-      "peak_rss_kb": 19212
+      "peak_rss_kb": 19020
     }
   }
 }

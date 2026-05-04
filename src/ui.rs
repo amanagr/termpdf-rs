@@ -72,11 +72,18 @@ pub(crate) enum ColdRenderDecision {
     AlreadyCached,
     /// Page is cold but the budget allows a render this frame.
     Render,
-    /// Page is cold and we're skipping it: either a rapid-scroll
-    /// burst is in progress, or the per-frame cold budget is
-    /// exhausted. Caller should set `pending_cold_redraw` so the
-    /// run-loop forces another draw and we catch up next frame.
-    Defer,
+    /// Page is cold and we're skipping it because the per-frame cold
+    /// budget is exhausted (multiple cold pages this frame). The
+    /// caller should set `pending_cold_redraw` so the run-loop forces
+    /// another draw and we catch up next frame at +16 ms.
+    DeferBudget,
+    /// Page is cold and we're skipping it because a rapid-scroll burst
+    /// is in progress. The caller MUST NOT set `pending_cold_redraw`
+    /// — that would force an immediate redraw, which would re-defer
+    /// (rapid is still true), which would set the flag again, looping
+    /// at 60 Hz until the burst ends. Instead, the run-loop's settle
+    /// timer fires a single catch-up draw once input goes idle.
+    DeferRapid,
 }
 
 pub(crate) fn plan_cold_render(
@@ -87,8 +94,11 @@ pub(crate) fn plan_cold_render(
     if is_cached {
         return ColdRenderDecision::AlreadyCached;
     }
-    if rapid || cold_budget_remaining == 0 {
-        return ColdRenderDecision::Defer;
+    if rapid {
+        return ColdRenderDecision::DeferRapid;
+    }
+    if cold_budget_remaining == 0 {
+        return ColdRenderDecision::DeferBudget;
     }
     ColdRenderDecision::Render
 }
@@ -562,7 +572,14 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     // of all at once, which Ghostty handles fine.
     let rapid = app.is_rapid_scrolling();
     let mut cold_budget = MAX_COLD_RENDERS_PER_DRAW;
-    let mut deferred_cold = false;
+    // Only budget-based deferrals trigger a `pending_cold_redraw`:
+    // a budget overflow is resolved by the next frame at +16 ms,
+    // but a rapid-scroll deferral can only resolve when the burst
+    // ends (input goes idle). Force-redrawing while still rapid
+    // would loop at 60 Hz with every draw deferring → flag set →
+    // redraw → defer → ... pegging the CPU until input stops.
+    // Settle redraw (run-loop) handles the rapid case instead.
+    let mut deferred_for_budget = false;
     {
         let _s = crate::profile::span(crate::profile::Phase::EnsureRendered);
         for &pi in &visible {
@@ -570,16 +587,17 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
             match plan_cold_render(is_cached, rapid, cold_budget) {
                 ColdRenderDecision::AlreadyCached => {}
                 ColdRenderDecision::Render => cold_budget -= 1,
-                ColdRenderDecision::Defer => {
-                    deferred_cold = true;
+                ColdRenderDecision::DeferBudget => {
+                    deferred_for_budget = true;
                     continue;
                 }
+                ColdRenderDecision::DeferRapid => continue,
             }
             ensure_page_rendered(app, pi, fit_width_px, /*allow_failure=*/ true)?;
             app.touch_page(pi);
         }
     }
-    app.pending_cold_redraw = deferred_cold;
+    app.pending_cold_redraw = deferred_for_budget;
 
     app.evict_far_pages(visible_range.clone());
     app.enforce_byte_budget(page_cache_budget_bytes(), visible_range);
@@ -2520,29 +2538,32 @@ mod cold_render_plan_tests {
     }
 
     #[test]
-    fn cold_under_rapid_scroll_defers() {
-        // Rapid-scroll defer is older logic that staggers cold work
-        // until input settles. Must stay defer even when budget would
-        // otherwise allow it — held-`j` autorepeat should not punch
-        // through into pdfium calls.
+    fn cold_under_rapid_scroll_defers_as_rapid() {
+        // Rapid-scroll defer staggers cold work until input settles.
+        // Must stay defer even when budget would otherwise allow it
+        // — held-`j` autorepeat should not punch through into pdfium
+        // calls. The `Rapid` flavour is critical: it tells the caller
+        // NOT to set `pending_cold_redraw` (would loop at 60 Hz).
         assert_eq!(
             plan_cold_render(false, true, 1),
-            ColdRenderDecision::Defer
+            ColdRenderDecision::DeferRapid
         );
         assert_eq!(
             plan_cold_render(false, true, MAX_COLD_RENDERS_PER_DRAW),
-            ColdRenderDecision::Defer
+            ColdRenderDecision::DeferRapid
         );
     }
 
     #[test]
-    fn cold_with_zero_budget_defers() {
+    fn cold_with_zero_budget_defers_as_budget() {
         // The crash-bait case: a `100G` jump puts 3+ visible pages all
         // cold at once. After the first one renders, budget hits 0 and
-        // the rest must defer to next-frame catch-up.
+        // the rest must defer to next-frame catch-up. The `Budget`
+        // flavour means the caller SHOULD set `pending_cold_redraw`
+        // so the deferred page renders at +16 ms.
         assert_eq!(
             plan_cold_render(false, false, 0),
-            ColdRenderDecision::Defer
+            ColdRenderDecision::DeferBudget
         );
     }
 
