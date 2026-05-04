@@ -1301,6 +1301,11 @@ impl<'doc> App<'doc> {
     /// surfaced in the status line rather than silently swallowed —
     /// users want to know if their quote didn't actually land.
     pub fn yank_selection(&mut self, save: bool) {
+        // Defensive: a fast mouse-drag may have skipped intermediate
+        // pages (see `mouse_drag_to`'s ensure call). Load any missing
+        // page text up-front so the yank loop below doesn't quietly
+        // omit pages from the saved highlight + clipboard text.
+        self.ensure_selection_text_loaded();
         let Some(sel) = self.text_selection.take() else {
             self.mode = Mode::Normal;
             return;
@@ -2188,6 +2193,47 @@ impl<'doc> App<'doc> {
         if let Some(sel) = self.text_selection.as_mut() {
             sel.head = Caret { page, idx };
         }
+        // Mouse drags fire at 60+ Hz and `dispatch_event_coalesced`
+        // drops every drag but the latest in a burst. A fast page
+        // 2 → page 4 sweep therefore never invokes this function on
+        // the intermediate page 3 — `text_cache` ends up holding
+        // text for pages 2 and 4 only. The render path
+        // (`fill_selection_overlay_image` reachable via ui.rs:732
+        // `app.text_cache.get(b.page_idx)`) silently skips pages
+        // without loaded text, so page 3's selection band never
+        // paints; worse, `yank_selection` (app.rs:1322) skips them
+        // too, so the saved highlight + clipboard text are missing
+        // page 3 entirely. Force-load text for every page in the
+        // current selection span so both the live overlay and the
+        // eventual yank see every page's chars.
+        self.ensure_selection_text_loaded();
+    }
+
+    /// Synchronously load `PageText` for every page touched by the
+    /// active selection (`lo.page..=hi.page`). No-op when no selection
+    /// is active or when a page's text load fails (rare; pdfium errors
+    /// are logged via the same path as elsewhere).
+    fn ensure_selection_text_loaded(&mut self) {
+        let Some(sel) = self.text_selection else { return };
+        let (lo, hi) = sel.ordered();
+        let pages_to_load = pages_needing_text_load(
+            lo.page,
+            hi.page,
+            self.page_metrics.len(),
+            |p| self.text_cache.get(p).is_some(),
+        );
+        for page_idx in pages_to_load {
+            let Some(metrics) = self.page_metrics.get(page_idx).copied() else {
+                continue;
+            };
+            // Discard the &PageText return; we only care that it gets
+            // inserted into the cache. Errors are swallowed — a
+            // missing page in the cache will simply skip rendering /
+            // yanking that page, which is the prior behaviour.
+            let _ = self
+                .text_cache
+                .get_or_load(&self.document, page_idx, &metrics);
+        }
     }
 
     /// Finalise a mouse-drag selection. Treats a click-without-drag
@@ -2741,6 +2787,31 @@ pub fn layout_gap_px() -> u32 {
     8
 }
 
+/// Pure helper used by `App::ensure_selection_text_loaded` to decide
+/// which page indices in the inclusive selection span `[lo_page,
+/// hi_page]` need a synchronous `text_cache.get_or_load`. Filters
+/// out pages already present in the cache and pages past the
+/// document's `page_count`. Extracted so the cross-page-drag fix
+/// has a regression test that doesn't need a loaded `PdfDocument`.
+pub fn pages_needing_text_load(
+    lo_page: usize,
+    hi_page: usize,
+    page_count: usize,
+    has_text: impl Fn(usize) -> bool,
+) -> Vec<usize> {
+    if page_count == 0 || lo_page > hi_page {
+        return Vec::new();
+    }
+    let hi = hi_page.min(page_count.saturating_sub(1));
+    let mut out = Vec::with_capacity(hi - lo_page + 1);
+    for p in lo_page..=hi {
+        if !has_text(p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
 /// Pure version of `App::first_visible_char_idx`. Given the page's
 /// viewport-top in normalised page space (0 = page top, 1 = page
 /// bottom), find the first non-generated char whose top edge sits at
@@ -2898,6 +2969,56 @@ mod tests {
 
     fn layout_for(n: usize, fit_width_px: u32) -> PageLayout {
         PageLayout::build(&metrics(n), fit_width_px, 8)
+    }
+
+    /// Regression test for the cross-page mouse-drag bug: a fast
+    /// drag from page 2 → page 4 only invokes `mouse_drag_to` on the
+    /// final page (the rest are coalesced away in
+    /// `dispatch_event_coalesced`), so `text_cache` is missing the
+    /// intermediate page 3. Without the fix, `yank_selection` (line
+    /// ~1322) silently skips page 3 and the saved highlight +
+    /// clipboard text omit it; with the fix, `pages_needing_text_load`
+    /// returns page 3 so `ensure_selection_text_loaded` will load it.
+    #[test]
+    fn pages_needing_text_load_returns_intermediate_uncached_pages() {
+        // Cache state mirrors a fast page-2 → page-4 drag: only the
+        // start (page 2) and end (page 4) pages have text loaded.
+        let cached: std::collections::HashSet<usize> = [2usize, 4].iter().copied().collect();
+        let need = pages_needing_text_load(2, 4, 10, |p| cached.contains(&p));
+        assert_eq!(need, vec![3], "page 3 must be flagged for load");
+    }
+
+    #[test]
+    fn pages_needing_text_load_skips_already_cached() {
+        let cached: std::collections::HashSet<usize> =
+            [0usize, 1, 2, 3, 4].iter().copied().collect();
+        let need = pages_needing_text_load(0, 4, 10, |p| cached.contains(&p));
+        assert!(need.is_empty(), "all pages cached → no loads needed");
+    }
+
+    #[test]
+    fn pages_needing_text_load_clamps_to_page_count() {
+        // hi_page beyond doc end should not generate out-of-range
+        // load attempts; the App-level loop also guards with
+        // `page_metrics.get`, but the helper clamps too so callers
+        // without that guard can't OOB.
+        let cached: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let need = pages_needing_text_load(2, 99, 5, |p| cached.contains(&p));
+        assert_eq!(need, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn pages_needing_text_load_single_page_uncached_returns_it() {
+        let cached: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let need = pages_needing_text_load(2, 2, 10, |p| cached.contains(&p));
+        assert_eq!(need, vec![2]);
+    }
+
+    #[test]
+    fn pages_needing_text_load_empty_doc_returns_empty() {
+        let cached: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let need = pages_needing_text_load(0, 0, 0, |p| cached.contains(&p));
+        assert!(need.is_empty());
     }
 
     #[test]
