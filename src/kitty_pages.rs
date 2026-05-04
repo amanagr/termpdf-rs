@@ -179,16 +179,6 @@ pub struct PlaceScratch {
     /// area's dims, which change only on terminal resize.
     restore_cursor: String,
     cached_restore_dims: (u16, u16),
-    /// `\x1b[s␠␠…␠\x1b[u\x1b[(W-1)C\x1b[(H-1)B`. The row-clear escape
-    /// `clear_page_area` writes to column 0 of every row of the image
-    /// area (drops Ghostty's stale virtual-placement placeholders).
-    /// Depends only on `(area.width, area.height)`, which only change
-    /// on terminal resize — but `clear_page_area` runs on every
-    /// frame, so without caching we paid a fresh `String` alloc + a
-    /// per-cell `push(' ')` loop on every redraw, including pure-idle
-    /// ones.
-    cached_row_clear: String,
-    cached_row_clear_dims: (u16, u16),
     /// Per-row symbol working buffer. Always cleared at the start of
     /// each row; reuse across calls keeps the underlying allocation
     /// from being freed/realloced every page.
@@ -1128,42 +1118,28 @@ pub fn place_page(
 /// later in the frame never reach the wire because ratatui's diff
 /// compares the buffer's *final* state to the prior frame's, not
 /// intermediate writes.
-pub fn clear_page_area(
-    buf: &mut ratatui::buffer::Buffer,
-    area: ratatui::layout::Rect,
-    scratch: &mut PlaceScratch,
-) {
+pub fn clear_page_area(buf: &mut ratatui::buffer::Buffer, area: ratatui::layout::Rect) {
     use std::fmt::Write;
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let dims = (area.width, area.height);
-    if scratch.cached_row_clear_dims != dims || scratch.cached_row_clear.is_empty() {
-        scratch.cached_row_clear.clear();
-        let needed = (area.width as usize) + 24;
-        if scratch.cached_row_clear.capacity() < needed {
-            scratch
-                .cached_row_clear
-                .reserve(needed - scratch.cached_row_clear.capacity());
-        }
-        scratch.cached_row_clear.push_str("\x1b[s");
-        for _ in 0..area.width {
-            scratch.cached_row_clear.push(' ');
-        }
-        write!(
-            scratch.cached_row_clear,
-            "\x1b[u\x1b[{}C\x1b[{}B",
-            area.width.saturating_sub(1),
-            area.height.saturating_sub(1)
-        )
-        .unwrap();
-        scratch.cached_row_clear_dims = dims;
+    let mut row_clear = String::with_capacity((area.width as usize) + 24);
+    row_clear.push_str("\x1b[s");
+    for _ in 0..area.width {
+        row_clear.push(' ');
     }
+    write!(
+        row_clear,
+        "\x1b[u\x1b[{}C\x1b[{}B",
+        area.width.saturating_sub(1),
+        area.height.saturating_sub(1)
+    )
+    .unwrap();
 
     for y in area.top()..area.bottom() {
         if let Some(cell) = buf.cell_mut((area.left(), y)) {
             cell.reset();
-            cell.set_symbol(&scratch.cached_row_clear);
+            cell.set_symbol(&row_clear);
         }
         for cx in 1..area.width {
             let x = area.left().saturating_add(cx);
@@ -1799,7 +1775,7 @@ mod tests {
         let placement_sym = buf.cell((0, 0)).unwrap().symbol().to_string();
         assert!(placement_sym.contains('\u{10EEEE}'));
 
-        clear_page_area(&mut buf, area, &mut scratch);
+        clear_page_area(&mut buf, area);
 
         // Column 0: now holds the row-clear escape — non-empty, must
         // NOT carry the placeholder char, must contain spaces.
@@ -1895,10 +1871,8 @@ mod tests {
         let area = Rect { x: 0, y: 0, width: 8, height: 4 };
         let mut buf_a = Buffer::empty(area);
         let mut buf_b = Buffer::empty(area);
-        let mut scratch_a = PlaceScratch::default();
-        let mut scratch_b = PlaceScratch::default();
-        clear_page_area(&mut buf_a, area, &mut scratch_a);
-        clear_page_area(&mut buf_b, area, &mut scratch_b);
+        clear_page_area(&mut buf_a, area);
+        clear_page_area(&mut buf_b, area);
         for y in 0..area.height {
             for x in 0..area.width {
                 let a = buf_a.cell((x, y)).unwrap();
@@ -1908,47 +1882,5 @@ mod tests {
                 assert_eq!(a.fg, b.fg, "({x},{y}) fg mismatch");
             }
         }
-    }
-
-    /// `clear_page_area` runs every frame including pure-idle redraws.
-    /// The row-clear escape only depends on `(area.width, area.height)`
-    /// so it must be cached on `PlaceScratch` and rebuilt only when
-    /// dims change. Without the cache we paid a fresh `String` alloc
-    /// + a per-cell `push(' ')` loop on every redraw.
-    #[test]
-    fn clear_page_area_caches_escape_until_dims_change() {
-        let area = Rect { x: 0, y: 0, width: 12, height: 5 };
-        let mut buf = Buffer::empty(area);
-        let mut scratch = PlaceScratch::default();
-        clear_page_area(&mut buf, area, &mut scratch);
-        // Snapshot the cached bytes + capacity so we can detect a
-        // re-build (which would re-allocate or rewrite the string).
-        let cached_first = scratch.cached_row_clear.clone();
-        let cap_first = scratch.cached_row_clear.capacity();
-        let ptr_first = scratch.cached_row_clear.as_ptr() as usize;
-        assert!(!cached_first.is_empty());
-        assert_eq!(scratch.cached_row_clear_dims, (area.width, area.height));
-
-        // Same area on a fresh buffer — must reuse the cached string.
-        let mut buf2 = Buffer::empty(area);
-        clear_page_area(&mut buf2, area, &mut scratch);
-        assert_eq!(scratch.cached_row_clear, cached_first, "string content changed");
-        assert_eq!(scratch.cached_row_clear.capacity(), cap_first, "string was reallocated");
-        assert_eq!(
-            scratch.cached_row_clear.as_ptr() as usize,
-            ptr_first,
-            "backing pointer moved → realloc happened"
-        );
-
-        // Resize — the cache MUST rebuild (different W/H means the
-        // restore-cursor offsets in the escape are different).
-        let resized = Rect { x: 0, y: 0, width: 20, height: 8 };
-        let mut buf3 = Buffer::empty(resized);
-        clear_page_area(&mut buf3, resized, &mut scratch);
-        assert_eq!(scratch.cached_row_clear_dims, (resized.width, resized.height));
-        assert_ne!(
-            scratch.cached_row_clear, cached_first,
-            "cache must rebuild on dim change"
-        );
     }
 }
