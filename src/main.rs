@@ -343,13 +343,10 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
     const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(16);
     /// How long after the last input we wait before firing the
     /// catch-up draw that does the deferred cold-page transmits.
-    /// Should match `app::RAPID_SCROLL_THRESHOLD_MS` so the burst
-    /// counter and the settle timer agree on what counts as a pause:
-    /// any pause >= the threshold trips the catch-up exactly once.
     /// Quick enough that letting up a held key feels instant; long
     /// enough that brief pauses during normal-cadence reading don't
     /// trigger an expensive catch-up draw mid-burst.
-    const SETTLE_MS: u128 = crate::app::RAPID_SCROLL_THRESHOLD_MS;
+    const SETTLE_MS: u128 = 120;
     let mut last_draw = std::time::Instant::now() - MIN_FRAME_INTERVAL;
 
     // After a rapid-input burst settles, we want to schedule one
@@ -447,13 +444,8 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
 }
 
 /// First idle-tier threshold: how long the user must be idle before
-/// we run any background work at all. 500 ms (was 200 ms) — a tap-tap
-/// reading cadence (~4-5 Hz, 200-250 ms gaps) was hitting the lower
-/// threshold every gap and firing a pdfium render + PNG encode + pty
-/// transmit between every keystroke. The user reported sustained
-/// 35 W+ draw and 75-90 °C from this. 500 ms still warms within one
-/// natural pause but doesn't pile up render work between every press.
-pub(crate) const IDLE_BITMAP_WARM_MS: u64 = 500;
+/// we run any background work at all.
+pub(crate) const IDLE_BITMAP_WARM_MS: u64 = 200;
 /// Second idle-tier threshold: doc-text indexing is heavier (a single
 /// `page.text().all()` is 5–50 ms on dense pages) and runs every tick
 /// for the entire doc on first open. 2000 ms (was 1000 ms) — text
@@ -462,13 +454,11 @@ pub(crate) const IDLE_BITMAP_WARM_MS: u64 = 500;
 /// session on a big book; `index.bin` still persists once complete
 /// for the next open.
 pub(crate) const IDLE_TEXT_INDEX_MS: u64 = 2000;
-/// Cap on bitmap warms per idle tick. 1 (was 2) — every warm pays a
-/// pdfium render + PNG encode + pty write; doing 2 of them back-to-
-/// back inside one idle window is a meaningful CPU spike, and 1 is
-/// already enough to keep the page-about-to-come-into-view hot for the
-/// next j press. The PREFETCH_DEPTH of 8 means subsequent idle ticks
-/// fan further out.
-pub(crate) const MAX_WARMS_PER_IDLE: u32 = 1;
+/// Cap on bitmap warms per idle tick. 2 is enough to keep j-press hot
+/// (one for the page about to come into view, one as a buffer) while
+/// halving the per-tick burst of PNG transmits through tmux that
+/// previously locked Ghostty up on big books.
+pub(crate) const MAX_WARMS_PER_IDLE: u32 = 2;
 
 /// What kind of idle-tick work the run-loop should consider doing,
 /// based on how long the user has been idle since their last input.
