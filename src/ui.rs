@@ -28,7 +28,7 @@ use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::StatefulImage;
 
 use crate::app::{App, ComposeKey, HighlightsBakedKey, LayoutKey, Mode, PageOverlayKey};
-use crate::compose::{fill_rect_blend, norm_to_pixels, outline_rect};
+use crate::compose::{fill_rect_blend, fill_rect_rgba, norm_to_pixels, outline_rect};
 use crate::dark;
 use crate::highlight::{rgb_from_hex, Rect01, HIGHLIGHT_COLORS};
 use crate::pdf;
@@ -613,6 +613,10 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
         src_top_cell: u16,
         src_left_cell: u16,
         width_cells: u16,
+        /// Selection signature for this page. Non-zero when there's an
+        /// active selection touching the page; `0` means no overlay
+        /// should be drawn (and any prior overlay should be dropped).
+        sel_sig: u64,
     }
 
     let scroll_y = app.scroll_y_px;
@@ -622,7 +626,10 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
 
     let mut blits: Vec<PageBlit> = Vec::with_capacity(visible.len());
     for &page_idx in &visible {
-        let Some(bm) = app.composed_image(page_idx) else {
+        // Read dims from highlights_baked_cache directly. The page
+        // bitmap on the terminal is the highlights-baked tier; the
+        // selection band ships separately as a layered overlay.
+        let Some((bm, _)) = app.highlights_baked_cache.get(&page_idx) else {
             continue;
         };
         let pixel_w = bm.width();
@@ -675,6 +682,7 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
         let kp = app.kitty_pages.as_ref().expect("kitty_pages should be Some on this draw path");
         let need_transmit = !kp.is_fresh(page_idx, layout_key, revision, pixel_w, pixel_h);
         let image_id = kp.image_id(page_idx);
+        let sel_sig = app.selection_signature_for_page(page_idx);
 
         blits.push(PageBlit {
             page_idx,
@@ -689,6 +697,7 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
             src_top_cell,
             src_left_cell,
             width_cells,
+            sel_sig,
         });
     }
 
@@ -751,13 +760,10 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
         }
     }
 
-    // Build transmit strings for pages that need them. Split-borrow
-    // app.overlay_cache + highlights_baked_cache (read) and
-    // app.kitty_pages (write) — Rust's NLL handles distinct struct
-    // fields separately. Try the overlay first (it carries the live
-    // selection band when present); fall back to baked for pages
-    // without an overlay entry.
-    let overlay_cache = &app.overlay_cache;
+    // Build transmit strings for pages that need them. The page bitmap
+    // is the highlights-baked tier — selection is NOT baked here; it
+    // ships as a separate layered kitty image (classical placement at
+    // z=1) emitted later in this function.
     let baked_cache = &app.highlights_baked_cache;
     let kp = app.kitty_pages.as_mut().unwrap();
     let mut transmits: Vec<Option<String>> = blits
@@ -766,31 +772,170 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
             if !b.need_transmit {
                 return None;
             }
-            let bm = overlay_cache
-                .get(&b.page_idx)
-                .map(|(bm, _)| bm)
-                .or_else(|| baked_cache.get(&b.page_idx).map(|(bm, _)| bm))?;
+            let bm = baked_cache.get(&b.page_idx).map(|(bm, _)| bm)?;
             Some(kp.build_transmit(bm, b.page_idx, layout_key, b.revision))
         })
         .collect();
 
+    // Build selection-overlay transmit + classical placement strings.
+    // For each visible page with active selection, this re-encodes a
+    // (mostly-transparent) RGBA the same dims as the page bitmap with
+    // selection rects painted at α=115. The PNG of an almost-empty
+    // image compresses to single-digit KB, so ~30 selection-drag
+    // keystrokes ship ~150 KB total instead of the ~5 MB the in-bitmap
+    // bake path produced.
+    //
+    // Every frame the page has selection, we re-emit the classical
+    // placement APC. The placement APC includes scroll-dependent X/Y/
+    // w/h source-crop parameters, so when the user scrolls the
+    // overlay's visible region tracks the page's. When the page
+    // doesn't have a selection, we ensure any prior overlay is dropped
+    // via the registry's pending_deletes queue (rides out on the next
+    // transmit, same as page evictions).
+    let mut overlay_payloads: Vec<Option<String>> = vec![None; blits.len()];
+    let mut overlay_marks: Vec<Option<(u64, u64, u32, u32)>> = vec![None; blits.len()];
+    {
+        let kp = app.kitty_pages.as_mut().unwrap();
+        for b in blits.iter() {
+            if b.height_cells == 0 {
+                // Skipped (e.g. cold-defer); leave any prior overlay
+                // alone — the next non-skipped frame will refresh it.
+                continue;
+            }
+            if b.sel_sig == 0 && kp.overlay_is_present(b.page_idx) {
+                // No selection on this page but a prior overlay is
+                // resident. Drop it so the terminal frees its bitmap
+                // and the placement disappears. The delete escape
+                // rides out via take_pending_deletes below.
+                kp.overlay_drop(b.page_idx);
+            }
+        }
+    }
+    {
+        // Second pass: build overlay images + transmits. Split from
+        // the first pass so the immutable borrows on app.text_cache /
+        // app.layout / app.text_selection don't fight the mut borrow
+        // on kitty_pages from the first pass.
+        let text_selection = app.text_selection;
+        let selection_color_idx = app.selection_color_idx;
+        let selection_placement = app.selection_placement;
+        let kp = app.kitty_pages.as_mut().unwrap();
+        for (i, b) in blits.iter().enumerate() {
+            if b.height_cells == 0 || b.sel_sig == 0 {
+                continue;
+            }
+            let Some(sel) = text_selection else { continue };
+            let Some(pt) = app.text_cache.get(b.page_idx) else { continue };
+
+            let need_overlay_transmit = !kp.overlay_is_fresh(
+                b.page_idx,
+                layout_key,
+                b.revision,
+                b.sel_sig,
+                b.pixel_w,
+                b.pixel_h,
+            );
+
+            let mut payload = String::new();
+            if need_overlay_transmit {
+                let img = build_selection_overlay_image(
+                    (b.pixel_w, b.pixel_h),
+                    b.page_idx,
+                    sel,
+                    pt,
+                    selection_color_idx,
+                    selection_placement,
+                );
+                payload.push_str(&kp.overlay_build_transmit(
+                    &img,
+                    b.page_idx,
+                    layout_key,
+                    b.revision,
+                    b.sel_sig,
+                ));
+                overlay_marks[i] = Some((b.revision, b.sel_sig, b.pixel_w, b.pixel_h));
+            }
+
+            // Classical placement APC. Cursor is at the page's first
+            // cell when this fires (= placement origin); save/restore
+            // brackets keep the page's placement loop using the cursor
+            // as designed. Source crop matches what place_page picks
+            // for the page placement, so the overlay registers exactly.
+            let overlay_id = kp.overlay_image_id(b.page_idx);
+            let src_left_px = (b.src_left_cell as u32) * cell_w;
+            let src_top_px = (b.src_top_cell as u32) * cell_h;
+            let src_w_px = (b.width_cells as u32) * cell_w;
+            let src_h_px = (b.height_cells as u32) * cell_h;
+            payload.push_str("\x1b[s");
+            payload.push_str(&crate::kitty_pages::build_overlay_place_apc(
+                overlay_id,
+                b.width_cells,
+                b.height_cells,
+                src_left_px,
+                src_top_px,
+                src_w_px,
+                src_h_px,
+                app.is_tmux,
+            ));
+            payload.push_str("\x1b[u");
+
+            overlay_payloads[i] = Some(payload);
+        }
+    }
+
     // Drain any pending kitty `a=d,d=I,i=ID` deletes from prior
-    // evictions and ride them in on the first transmit of this frame.
-    // Doing it here rather than as a separate write keeps the deletes
-    // inside the `term.draw` window and avoids a second pty round-trip.
+    // evictions (page or overlay) and ride them in on the first
+    // transmit of this frame. Doing it here rather than as a separate
+    // write keeps the deletes inside the `term.draw` window and avoids
+    // a second pty round-trip.
+    let kp = app.kitty_pages.as_mut().unwrap();
     if let Some(deletes) = kp.take_pending_deletes() {
-        if let Some(slot) = transmits.iter_mut().find(|t| t.is_some()) {
-            // Prepend so deletes happen *before* the new image arrives,
-            // freeing terminal-side memory ahead of the new allocation.
-            let mut combined = deletes;
-            combined.push_str(slot.as_ref().unwrap());
-            *slot = Some(combined);
+        // Prefer riding deletes on a slot that already has bytes
+        // (page transmit OR overlay payload); only reject onto the
+        // pending queue if NEITHER exists this frame.
+        let attached = if let Some(i) = transmits.iter().position(|t| t.is_some()) {
+            let mut combined = deletes.clone();
+            combined.push_str(transmits[i].as_ref().unwrap());
+            transmits[i] = Some(combined);
+            true
+        } else if let Some(i) = overlay_payloads.iter().position(|p| p.is_some()) {
+            let mut combined = deletes.clone();
+            combined.push_str(overlay_payloads[i].as_ref().unwrap());
+            overlay_payloads[i] = Some(combined);
+            true
         } else {
-            // No transmits this frame — stash the deletes for next.
-            // Cheap to write back; eviction is rare relative to draws.
+            false
+        };
+        if !attached {
+            // No transmits or overlay APCs this frame — stash the
+            // deletes for next. Cheap to write back; eviction is rare
+            // relative to draws.
             kp.put_back_pending_deletes(deletes);
         }
     }
+
+    // Concatenate page transmit + overlay payload into the per-blit
+    // prefix actually passed to `place_page`. The order matters:
+    //   1. page transmit ships the page bitmap (no placement).
+    //   2. overlay transmit ships the selection-band bitmap.
+    //   3. \x1b[s + overlay classical place + \x1b[u places the
+    //      overlay at the cursor (= page first cell), keeping cursor
+    //      bracketed for the page's placement loop that follows.
+    let combined_prefixes: Vec<Option<String>> = transmits
+        .iter()
+        .zip(overlay_payloads.iter())
+        .map(|(t, ov)| match (t, ov) {
+            (None, None) => None,
+            (Some(t), None) => Some(t.clone()),
+            (None, Some(o)) => Some(o.clone()),
+            (Some(t), Some(o)) => {
+                let mut s = String::with_capacity(t.len() + o.len());
+                s.push_str(t);
+                s.push_str(o);
+                Some(s)
+            }
+        })
+        .collect();
 
     drop(_compose);
 
@@ -801,7 +946,7 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     let img_area_left = area.left();
     let img_area_top = area.top();
 
-    for (b, t) in blits.iter().zip(transmits.iter()) {
+    for (b, t) in blits.iter().zip(combined_prefixes.iter()) {
         let placement_area = Rect {
             x: img_area_left.saturating_add(b.dst_left_cell),
             y: img_area_top,
@@ -826,16 +971,22 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
         );
     }
 
-    // Now that the buffer has the placements, mark each page as
-    // transmitted so the next frame skips the transmit if state is
-    // unchanged. Then bound the registry size: evict LRU non-visible
-    // pages so a 700-page PDF doesn't pile up gigabytes of decoded
-    // RGBA in the terminal. The deletes queued here ride out on the
-    // next frame's first transmit (see take_pending_deletes above).
+    // Now that the buffer has the placements, mark each page (and
+    // overlay) as transmitted so the next frame skips the transmit if
+    // state is unchanged. Then bound the registry size: evict LRU
+    // non-visible pages so a 700-page PDF doesn't pile up gigabytes
+    // of decoded RGBA in the terminal. The deletes queued here ride
+    // out on the next frame's first transmit (see take_pending_deletes
+    // above).
     let kp = app.kitty_pages.as_mut().unwrap();
     for b in &blits {
         if b.need_transmit {
             kp.mark_transmitted(b.page_idx, layout_key, b.revision, b.pixel_w, b.pixel_h);
+        }
+    }
+    for (b, mark) in blits.iter().zip(overlay_marks.iter()) {
+        if let Some((rev, sel_sig, w, h)) = *mark {
+            kp.overlay_mark_transmitted(b.page_idx, layout_key, rev, sel_sig, w, h);
         }
     }
     kp.evict_to_budget(&visible);
@@ -970,15 +1121,17 @@ pub(crate) fn compute_page_revision(app: &App<'_>, page_idx: usize) -> u64 {
         }
         None => (0u64, false, false),
     };
-    let sel = app.selection_signature_for_page(page_idx);
     // Per-page highlight fingerprint: changes only when *this* page's
-    // highlight set changes. Previously this used the global
-    // `app.highlight_revision`, which bumped on any edit anywhere in
-    // the document and forced a re-bake + re-transmit on every visible
-    // page even when their bitmaps were unchanged. The
-    // `highlight_add` perf-harness scenario went from 12 transmits per
-    // `y` keystroke to 1 once this localised.
+    // highlight set changes. The `highlight_add` perf-harness scenario
+    // went from 12 transmits per `y` keystroke to 1 once this localised.
     let highlight_sig = app.highlights.page_revision(page_idx);
+
+    // Selection deliberately excluded — it lives in a separate layered
+    // kitty image (classical placement at z=1 above the page) so a
+    // moving selection band doesn't force a re-encode and re-transmit
+    // of the whole page bitmap. The selection_drag_30 scenario went
+    // from ~32 transmits/170 KB each to ~1 page transmit + tiny
+    // overlay PNGs once selection moved off the page revision.
 
     // FNV-1a-style mix; doesn't need to be cryptographic — just
     // non-degenerate enough that flipping any single field flips the
@@ -987,7 +1140,6 @@ pub(crate) fn compute_page_revision(app: &App<'_>, page_idx: usize) -> u64 {
     for v in [
         highlight_sig,
         search_revision,
-        sel,
         has_search_hits as u64,
         current_hit_on_this_page as u64,
     ] {
@@ -1911,6 +2063,81 @@ pub fn bake_selection_into_page(
 // `ensure_overlay`) so it travels through the same kitty re-upload
 // path that already works for saved highlights.
 
+/// Produce a transparent same-dim-as-page RGBA image with selection
+/// rects painted at translucent alpha. This is the "overlay" half of
+/// the layered-placement scheme: kitty composites it above the page
+/// placement at z=1 so a moving selection re-transmits ONLY this image
+/// (mostly transparent → ~5-15 KB PNG) instead of the full page bitmap
+/// (~170 KB PNG).
+///
+/// `dims` is (width, height) in pixels; matches the page bitmap so the
+/// kitty placement-c/r and source-X/Y/w/h math is identical for both
+/// images. Most pixels stay (0,0,0,0); only selection-band rows take
+/// the highlight color at the same alpha (0.45 → 115 / 255) used by
+/// `bake_selection_into_page`.
+pub(crate) fn build_selection_overlay_image(
+    dims: (u32, u32),
+    page_idx: usize,
+    sel: crate::textlayout::TextSelection,
+    pt: &crate::textlayout::PageText,
+    color_idx: usize,
+    placement_mode: bool,
+) -> RgbaImage {
+    let mut img = RgbaImage::new(dims.0, dims.1);
+    let (lo, hi) = sel.ordered();
+    if !(lo.page..=hi.page).contains(&page_idx) {
+        return img;
+    }
+    if !placement_mode {
+        let mut start = if page_idx == lo.page { lo.idx } else { 0 };
+        let mut end = if page_idx == hi.page {
+            hi.idx
+        } else {
+            pt.chars.len().saturating_sub(1)
+        };
+        if matches!(sel.mode, crate::textlayout::SelMode::Linewise) {
+            if let Some(line) = pt.line_of(start) {
+                if let Some(s) = pt.line_start(line) { start = s; }
+            }
+            if let Some(line) = pt.line_of(end) {
+                if let Some(e) = pt.line_end(line) { end = e; }
+            }
+        }
+        let color = HIGHLIGHT_COLORS[color_idx % HIGHLIGHT_COLORS.len()];
+        // Match the 0.45 blend used by bake_selection_into_page: alpha
+        // byte = round(0.45 × 255) = 115. The kitty terminal composites
+        // this over the page placement, so the visual is identical to
+        // the old in-bitmap-bake path.
+        let alpha: u8 = 115;
+        let rgba = [color.rgb.0, color.rgb.1, color.rgb.2, alpha];
+        for r01 in pt.range_to_rects(start, end) {
+            let rect = norm_to_pixels(r01, img.width(), img.height());
+            fill_rect_rgba(&mut img, rect, rgba);
+        }
+    }
+    if page_idx == sel.head.page {
+        if let Some(c) = pt.chars.get(sel.head.idx) {
+            let mut caret_rect = norm_to_pixels(c.bbox, img.width(), img.height());
+            if caret_rect.2 < 2 { caret_rect.2 = 2; }
+            if caret_rect.3 < 2 { caret_rect.3 = 2; }
+            // Caret: translucent dark frame + lighter interior fill. We
+            // use opaque RGBA writes here (matching the bake path's
+            // outline_rect + fill_rect_blend on a solid page) — the
+            // page underneath is not visible through the caret cell.
+            // 1px black border at full alpha.
+            let (cx, cy, cw, ch) = caret_rect;
+            // Top, bottom, left, right border bands — full alpha black.
+            fill_rect_rgba(&mut img, (cx, cy, cw, 1), [40, 40, 40, 255]);
+            fill_rect_rgba(&mut img, (cx, cy + ch.saturating_sub(1), cw, 1), [40, 40, 40, 255]);
+            fill_rect_rgba(&mut img, (cx, cy, 1, ch), [40, 40, 40, 255]);
+            fill_rect_rgba(&mut img, (cx + cw.saturating_sub(1), cy, 1, ch), [40, 40, 40, 255]);
+            // Interior fill: 0.55 white-blend → α=140 white.
+            fill_rect_rgba(&mut img, (cx, cy, cw, ch), [255, 255, 255, 140]);
+        }
+    }
+    img
+}
+
 /// Percent through the document, based on doc-pixel scroll position.
 /// 0% = top of doc; 100% = bottom of last page in viewport. Pure
 /// helper so it can be unit-tested without an `App` instance.
@@ -2596,6 +2823,116 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `build_selection_overlay_image` must paint selection-band
+    /// pixels with the right color AND alpha=115 (matching the bake
+    /// path's 0.45 blend), and leave non-selection pixels fully
+    /// transparent. Compositing on the kitty side then reproduces the
+    /// same visual as the in-bitmap bake without round-tripping the
+    /// page bitmap on every selection move.
+    #[test]
+    fn overlay_image_paints_band_with_correct_color_and_alpha() {
+        let pt = synthetic_page_text();
+        let sel = TextSelection {
+            anchor: Caret { page: 0, idx: 0 },
+            head: Caret { page: 0, idx: 2 },
+            mode: SelMode::Charwise,
+        };
+
+        let img = build_selection_overlay_image(
+            (200, 200),
+            0,
+            sel,
+            &pt,
+            0, /* yellow */
+            false,
+        );
+
+        // Yellow palette colour is (0xff, 0xd5, 0x4f). Inside the band
+        // the overlay should be that color at α=115 (round(0.45 × 255)).
+        let (px, py) = center_pixel(pt.chars[1].bbox, 200, 200);
+        let p = img.get_pixel(px, py).0;
+        assert_eq!(p[0], 0xff, "R channel mismatch at band centre");
+        assert_eq!(p[1], 0xd5, "G channel mismatch at band centre");
+        assert_eq!(p[2], 0x4f, "B channel mismatch at band centre");
+        assert_eq!(p[3], 115, "alpha must be 115 (0.45 × 255 rounded)");
+
+        // Pixels outside the selection's vertical band must be fully
+        // transparent. If they weren't, kitty would composite them
+        // (potentially darkening or recoloring the page underneath).
+        let outside = img.get_pixel(100, 60).0; // y=0.30, between line 0 and 1
+        assert_eq!(
+            outside, [0, 0, 0, 0],
+            "non-selection pixels must be fully transparent (alpha=0)"
+        );
+    }
+
+    /// Overlay on a non-selected page must be entirely transparent.
+    /// We rely on this so kitty's classical placement at z=1 has no
+    /// visible effect when the user scrolls past the selection.
+    #[test]
+    fn overlay_image_is_fully_transparent_on_non_selected_page() {
+        let pt = synthetic_page_text();
+        let sel = TextSelection {
+            anchor: Caret { page: 5, idx: 0 },
+            head: Caret { page: 5, idx: 2 },
+            mode: SelMode::Charwise,
+        };
+        let img = build_selection_overlay_image((40, 40), 0, sel, &pt, 0, false);
+        for (_, _, p) in img.enumerate_pixels() {
+            assert_eq!(p.0, [0, 0, 0, 0], "off-selection page must be fully transparent");
+        }
+    }
+
+    /// In placement mode the overlay must NOT paint a band fill — the
+    /// user is positioning the caret, not selecting yet. Same rule the
+    /// bake path enforces; verified separately for the overlay so a
+    /// regression in either path is caught locally.
+    #[test]
+    fn overlay_image_in_placement_mode_paints_caret_but_not_band() {
+        let pt = synthetic_page_text();
+        let caret = Caret { page: 0, idx: 2 };
+        let sel = TextSelection { anchor: caret, head: caret, mode: SelMode::Charwise };
+        let img = build_selection_overlay_image(
+            (200, 200),
+            0,
+            sel,
+            &pt,
+            0, /* yellow */
+            true, /* placement_mode */
+        );
+
+        // The yellow band-fill signature would be α=115 RGB=(255,213,79).
+        // Walk the image; not a single such pixel should exist.
+        for (_, _, p) in img.enumerate_pixels() {
+            let band_match = p.0[0] == 0xff
+                && p.0[1] == 0xd5
+                && p.0[2] == 0x4f
+                && p.0[3] == 115;
+            assert!(!band_match, "placement mode must not paint band-fill pixels");
+        }
+
+        // The caret cell (head bbox) must contain at least some non-
+        // transparent pixels (border + interior fill) so the user can
+        // see where the caret is.
+        let head = &pt.chars[2].bbox;
+        let x0 = (head.x * 200.0) as u32;
+        let y0 = (head.y * 200.0) as u32;
+        let x1 = ((head.x + head.w) * 200.0) as u32;
+        let y1 = ((head.y + head.h) * 200.0) as u32;
+        let mut visible = 0;
+        for y in y0..y1.min(200) {
+            for x in x0..x1.min(200) {
+                if img.get_pixel(x.min(199), y.min(199)).0[3] > 0 {
+                    visible += 1;
+                }
+            }
+        }
+        assert!(
+            visible >= 4,
+            "placement-mode caret must paint at least a few visible pixels (got {visible})"
+        );
     }
 
     /// In placement mode the bake must NOT paint a band fill — the

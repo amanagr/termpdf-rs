@@ -644,16 +644,15 @@ fn warm_next_uncached(app: &mut App<'_>) -> Result<bool> {
         // directly to stdout. mark_transmitted afterwards so the next
         // draw's is_fresh check returns true and skips the transmit.
         //
-        // ensure_overlay only inserts into overlay_cache when the
-        // selection touches the page — for any other page we'd find
-        // an empty overlay_cache slot. Fall back to highlights_baked
-        // (which ensure_overlay always populates) so the warm tick
-        // still ships a payload to the terminal.
-        let bm = app
-            .overlay_cache
-            .get(&pi)
-            .map(|(bm, _)| bm)
-            .or_else(|| app.highlights_baked_cache.get(&pi).map(|(bm, _)| bm));
+        // Read from highlights_baked_cache only — the page bitmap on
+        // the terminal is selection-FREE in kitty mode (selection
+        // ships separately as a layered overlay placement; see
+        // draw_pages_kitty). If we sourced from overlay_cache here,
+        // the warm tick would cache a WITH-SELECTION encoded payload
+        // under a key that compute_page_revision (selection-stable)
+        // hands draw_pages_kitty next time, and the page would render
+        // a stale selection burned into its bitmap.
+        let bm = app.highlights_baked_cache.get(&pi).map(|(bm, _)| bm);
         let pixel_dims = bm.map(|bm| (bm.width(), bm.height()));
         let kp = app.kitty_pages.as_mut();
         if let (Some(kp), Some(bm), Some((w, h))) = (kp, bm, pixel_dims) {

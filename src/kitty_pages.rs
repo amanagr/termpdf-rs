@@ -93,6 +93,41 @@ struct CachedPayload {
     bytes: Vec<u8>,
 }
 
+/// Per-page selection-band overlay. Distinct from `PageEntry` because
+/// it tracks a different kind of image (transparent overlay vs full
+/// page bitmap) on a different schedule (changes per Visual-mode
+/// keystroke, vs once per layout/highlight edit).
+///
+/// The overlay is a same-dim bitmap as the page that's mostly
+/// transparent (alpha=0 outside the selection band, alpha=115 inside).
+/// Kitty composites it over the page placement at z=1, so a moving
+/// selection re-transmits ONLY this small mostly-transparent PNG (~5-15
+/// KB) instead of the full page bitmap (~170 KB).
+#[derive(Debug, Clone)]
+struct OverlayEntry {
+    image_id: u32,
+    /// Layout + revision + selection signature at last transmit. Three
+    /// fields together so a caret motion within a stable layout can
+    /// invalidate just the overlay without touching the page entry.
+    transmitted_layout: Option<LayoutKey>,
+    transmitted_revision: u64,
+    transmitted_sel_sig: u64,
+    pixel_w: u32,
+    pixel_h: u32,
+    cached_payload: Option<OverlayCachedPayload>,
+}
+
+#[derive(Debug, Clone)]
+struct OverlayCachedPayload {
+    layout: LayoutKey,
+    revision: u64,
+    sel_sig: u64,
+    pixel_w: u32,
+    pixel_h: u32,
+    format_code: u8,
+    bytes: Vec<u8>,
+}
+
 pub struct KittyPageRegistry {
     is_tmux: bool,
     /// Base for per-page IDs. `id_for(page) = base + 1 + page_idx`.
@@ -100,6 +135,11 @@ pub struct KittyPageRegistry {
     /// for any fallback path that might still want to use it.
     id_base: u32,
     pages: HashMap<usize, PageEntry>,
+    /// Selection-band overlay images per page. Lives parallel to
+    /// `pages`; cleared when the page entry is evicted. ID range is
+    /// `id_base + OVERLAY_ID_OFFSET + page_idx` to keep page and
+    /// overlay IDs disjoint.
+    overlays: HashMap<usize, OverlayEntry>,
     /// LRU order — front = least recently used. `touch` moves a page
     /// to the back; eviction pops from the front. Entries here mirror
     /// keys in `pages`.
@@ -111,12 +151,18 @@ pub struct KittyPageRegistry {
     pending_deletes: String,
 }
 
+/// Distance between a page's image_id and its overlay's image_id. Big
+/// enough that no plausible PDF page count would collide with the
+/// overlay range. (u32 has 4G slots; we never come close.)
+const OVERLAY_ID_OFFSET: u32 = 1 << 20;
+
 impl KittyPageRegistry {
     pub fn new(is_tmux: bool, id_base: u32) -> Self {
         Self {
             is_tmux,
             id_base,
             pages: HashMap::new(),
+            overlays: HashMap::new(),
             lru: VecDeque::new(),
             pending_deletes: String::new(),
         }
@@ -129,6 +175,7 @@ impl KittyPageRegistry {
     #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.pages.clear();
+        self.overlays.clear();
         self.lru.clear();
         self.pending_deletes.clear();
     }
@@ -180,6 +227,9 @@ impl KittyPageRegistry {
             victims.iter().copied().collect();
         for v in &victims {
             if let Some(entry) = self.pages.remove(v) {
+                self.queue_delete(entry.image_id);
+            }
+            if let Some(entry) = self.overlays.remove(v) {
                 self.queue_delete(entry.image_id);
             }
         }
@@ -435,6 +485,146 @@ impl KittyPageRegistry {
     pub fn image_id(&self, page_idx: usize) -> u32 {
         self.id_for(page_idx)
     }
+
+    /// Image ID for this page's selection-band overlay. Disjoint from
+    /// the page ID range so the terminal stores them as independent
+    /// images.
+    pub fn overlay_image_id(&self, page_idx: usize) -> u32 {
+        self.id_base
+            .wrapping_add(OVERLAY_ID_OFFSET)
+            .wrapping_add(page_idx as u32)
+    }
+
+    /// True if the cached overlay transmit for this page matches all of
+    /// (layout, revision, sel_sig, dims). When false, the overlay
+    /// either doesn't exist or its on-terminal pixels don't match what
+    /// we'd send now — caller must transmit.
+    pub fn overlay_is_fresh(
+        &self,
+        page_idx: usize,
+        layout: LayoutKey,
+        revision: u64,
+        sel_sig: u64,
+        pixel_w: u32,
+        pixel_h: u32,
+    ) -> bool {
+        match self.overlays.get(&page_idx) {
+            Some(e) => {
+                e.transmitted_layout == Some(layout)
+                    && e.transmitted_revision == revision
+                    && e.transmitted_sel_sig == sel_sig
+                    && e.pixel_w == pixel_w
+                    && e.pixel_h == pixel_h
+            }
+            None => false,
+        }
+    }
+
+    /// Build the kitty transmit escape for the selection-band overlay
+    /// of this page. Mirrors `build_transmit` for pages, but uses the
+    /// overlay ID range and includes `sel_sig` in the cache key. The
+    /// resulting transmit string carries the bitmap; the caller is
+    /// responsible for emitting a separate classical placement APC at
+    /// the right cursor position to actually put it on screen.
+    pub fn overlay_build_transmit(
+        &mut self,
+        bitmap: &RgbaImage,
+        page_idx: usize,
+        layout: LayoutKey,
+        revision: u64,
+        sel_sig: u64,
+    ) -> String {
+        let id = self.overlay_image_id(page_idx);
+        let pixel_w = bitmap.width();
+        let pixel_h = bitmap.height();
+        let is_tmux = self.is_tmux;
+        let entry = self.overlays.entry(page_idx).or_insert(OverlayEntry {
+            image_id: id,
+            transmitted_layout: None,
+            transmitted_revision: 0,
+            transmitted_sel_sig: 0,
+            pixel_w,
+            pixel_h,
+            cached_payload: None,
+        });
+        let needs_encode = match &entry.cached_payload {
+            Some(c) => {
+                !(c.layout == layout
+                    && c.revision == revision
+                    && c.sel_sig == sel_sig
+                    && c.pixel_w == pixel_w
+                    && c.pixel_h == pixel_h)
+            }
+            None => true,
+        };
+        if needs_encode {
+            let (format_code, bytes) = encode_payload(bitmap);
+            entry.cached_payload = Some(OverlayCachedPayload {
+                layout,
+                revision,
+                sel_sig,
+                pixel_w,
+                pixel_h,
+                format_code,
+                bytes,
+            });
+        }
+        let c = entry
+            .cached_payload
+            .as_ref()
+            .expect("overlay payload populated above");
+        // Use the same transmit-string builder as pages — kitty doesn't
+        // distinguish image kinds, only IDs.
+        build_transmit_string(&c.bytes, c.format_code, id, pixel_w, pixel_h, is_tmux)
+    }
+
+    /// Update overlay registry state to record that the just-built
+    /// transmit has been (or is about to be) flushed to the terminal.
+    pub fn overlay_mark_transmitted(
+        &mut self,
+        page_idx: usize,
+        layout: LayoutKey,
+        revision: u64,
+        sel_sig: u64,
+        pixel_w: u32,
+        pixel_h: u32,
+    ) {
+        let id = self.overlay_image_id(page_idx);
+        let entry = self.overlays.entry(page_idx).or_insert(OverlayEntry {
+            image_id: id,
+            transmitted_layout: None,
+            transmitted_revision: 0,
+            transmitted_sel_sig: 0,
+            pixel_w,
+            pixel_h,
+            cached_payload: None,
+        });
+        entry.image_id = id;
+        entry.transmitted_layout = Some(layout);
+        entry.transmitted_revision = revision;
+        entry.transmitted_sel_sig = sel_sig;
+        entry.pixel_w = pixel_w;
+        entry.pixel_h = pixel_h;
+    }
+
+    /// Drop the overlay entry for `page_idx` and queue an `a=d` for the
+    /// terminal so it frees the corresponding image. Called when the
+    /// selection moves off this page or is cleared.
+    pub fn overlay_drop(&mut self, page_idx: usize) {
+        if let Some(entry) = self.overlays.remove(&page_idx) {
+            self.queue_delete(entry.image_id);
+        }
+    }
+
+    /// True when the terminal is currently holding a placement of this
+    /// page's overlay. Used by the renderer to decide whether to emit a
+    /// `a=d,d=I,i=ID` for a stale overlay even when there's no fresh
+    /// selection on this page.
+    pub fn overlay_is_present(&self, page_idx: usize) -> bool {
+        self.overlays
+            .get(&page_idx)
+            .is_some_and(|e| e.transmitted_layout.is_some())
+    }
 }
 
 /// Encode the bitmap into a (kitty format code, payload bytes) pair.
@@ -540,6 +730,44 @@ fn transmit(bitmap: &RgbaImage, id: u32, is_tmux: bool) -> String {
     let (format_code, payload) = encode_payload(bitmap);
     build_transmit_string(&payload, format_code, id, bitmap.width(), bitmap.height(), is_tmux)
 }
+
+/// Build a classical kitty placement APC for a previously-transmitted
+/// overlay image, positioned at the cursor with z=1 so it composites
+/// above the page placement underneath. Uses `U=0` (cursor-positioned,
+/// not unicode-placeholder); the caller must arrange for the cursor to
+/// be at the overlay's top-left when this APC is processed (in
+/// practice, by embedding the returned string in the same buffer cell
+/// as the page's first placeholder, with the surrounding `\x1b[s` /
+/// `\x1b[u` brackets).
+///
+/// Source-crop parameters (`X, Y, w, h`) crop the overlay bitmap to
+/// match the visible portion of the page when scrolled — otherwise
+/// kitty would render the full overlay with rows clipped at the
+/// viewport boundary, putting the selection band rows out of register
+/// with the page placement. `c` / `r` are the placement size in cells.
+pub fn build_overlay_place_apc(
+    overlay_id: u32,
+    width_cells: u16,
+    height_cells: u16,
+    src_left_px: u32,
+    src_top_px: u32,
+    src_w_px: u32,
+    src_h_px: u32,
+    is_tmux: bool,
+) -> String {
+    let (start, escape, end) = tmux_wrap(is_tmux);
+    let mut s = String::with_capacity(128);
+    s.push_str(start);
+    write!(
+        s,
+        "{escape}_Ga=p,U=0,i={overlay_id},p=1,c={width_cells},r={height_cells},\
+         X={src_left_px},Y={src_top_px},w={src_w_px},h={src_h_px},z=1,q=2;{escape}\\"
+    )
+    .unwrap();
+    s.push_str(end);
+    s
+}
+
 
 /// PNG-encode with `Fast` compression + `Up` filter. Benchmarked on a
 /// 1600×2300 synthetic page: NoFilter = 2.8× compression at 14 ms,
@@ -1041,5 +1269,165 @@ mod tests {
                 "col {c} must not have a placeholder when image runs out at col 4"
             );
         }
+    }
+
+    /// Overlay image IDs MUST stay disjoint from page image IDs so the
+    /// terminal stores them as independent images (otherwise re-uploading
+    /// the page would clobber the overlay or vice versa). The offset is
+    /// large enough that no plausible PDF page count collides with the
+    /// overlay range.
+    #[test]
+    fn overlay_image_id_disjoint_from_page_id() {
+        let r = KittyPageRegistry::new(false, 1000);
+        for page in [0usize, 1, 100, 1024, 9999] {
+            let p = r.image_id(page);
+            let o = r.overlay_image_id(page);
+            assert_ne!(p, o, "page {page}: id collision page={p} overlay={o}");
+            // Distance is at least the offset constant; means even a
+            // 100k-page PDF won't have its last page's id collide with
+            // page 0's overlay id.
+            assert!(o > p + 1000, "page {page}: overlay id should be far from page id");
+        }
+    }
+
+    /// `overlay_is_fresh` must return true ONLY when every key field
+    /// matches the last `mark_transmitted` call. Selection signature is
+    /// the field that changes per Visual-mode keystroke; flipping it
+    /// must invalidate even when layout, revision, and dims are stable.
+    #[test]
+    fn overlay_is_fresh_only_when_all_fields_match() {
+        let mut r = KittyPageRegistry::new(false, 1000);
+        let layout = LayoutKey { fit_width_px: 64, dark: false };
+        r.overlay_mark_transmitted(0, layout, 7, 12345, 100, 50);
+
+        // Exact match → fresh.
+        assert!(r.overlay_is_fresh(0, layout, 7, 12345, 100, 50));
+        // Layout change → stale (e.g. user changed zoom).
+        let layout2 = LayoutKey { fit_width_px: 128, dark: false };
+        assert!(!r.overlay_is_fresh(0, layout2, 7, 12345, 100, 50));
+        // Revision change → stale (a highlight added on this page).
+        assert!(!r.overlay_is_fresh(0, layout, 8, 12345, 100, 50));
+        // Selection signature change → stale (caret moved by `l`).
+        assert!(!r.overlay_is_fresh(0, layout, 7, 99999, 100, 50));
+        // Dim change → stale (re-render at a different pixel size).
+        assert!(!r.overlay_is_fresh(0, layout, 7, 12345, 200, 50));
+        assert!(!r.overlay_is_fresh(0, layout, 7, 12345, 100, 100));
+        // Different page → stale (nothing transmitted yet).
+        assert!(!r.overlay_is_fresh(1, layout, 7, 12345, 100, 50));
+    }
+
+    /// Building an overlay transmit must populate the cache so that a
+    /// subsequent build with the same fingerprint reuses the encoded
+    /// bytes (no re-encode). Mirrors `build_transmit_caches_payload_across_calls`
+    /// for the overlay path.
+    #[test]
+    fn overlay_build_transmit_caches_payload() {
+        let mut r = KittyPageRegistry::new(false, 1000);
+        let layout = LayoutKey { fit_width_px: 64, dark: false };
+        let bm = RgbaImage::new(16, 16);
+
+        let s1 = r.overlay_build_transmit(&bm, 0, layout, 0, 1);
+        let cached_ptr_1 =
+            r.overlays.get(&0).unwrap().cached_payload.as_ref().unwrap().bytes.as_ptr() as usize;
+
+        // Same fingerprint → reuse cache. Returned strings should match
+        // byte-for-byte AND the cached bytes Vec must not have been
+        // reallocated.
+        let s2 = r.overlay_build_transmit(&bm, 0, layout, 0, 1);
+        let cached_ptr_2 =
+            r.overlays.get(&0).unwrap().cached_payload.as_ref().unwrap().bytes.as_ptr() as usize;
+        assert_eq!(s1, s2, "second build with same fingerprint should return identical string");
+        assert_eq!(
+            cached_ptr_1, cached_ptr_2,
+            "cached payload Vec must not have been reallocated"
+        );
+
+        // Different sel_sig → new encode (different bitmap intent).
+        let _ = r.overlay_build_transmit(&bm, 0, layout, 0, 2);
+        let cached_ptr_3 =
+            r.overlays.get(&0).unwrap().cached_payload.as_ref().unwrap().bytes.as_ptr() as usize;
+        // Pointer may or may not match (Vec might reuse the same
+        // backing allocation if grown into the same slot) — what we
+        // *can* assert is that the cached fingerprint flipped.
+        let cached = &r.overlays.get(&0).unwrap().cached_payload.as_ref().unwrap();
+        assert_eq!(cached.sel_sig, 2, "cache must update sel_sig on rebuild");
+        let _ = cached_ptr_3;
+    }
+
+    /// Dropping an overlay queues a kitty `a=d,d=I,i=ID` so the
+    /// terminal frees its decoded bitmap. Without this, scrolling a
+    /// long doc with selections would leak overlay bitmaps in the
+    /// terminal-side cache.
+    #[test]
+    fn overlay_drop_queues_terminal_delete() {
+        let mut r = KittyPageRegistry::new(false, 1000);
+        let layout = LayoutKey { fit_width_px: 64, dark: false };
+        let bm = RgbaImage::new(16, 16);
+        let _ = r.overlay_build_transmit(&bm, 0, layout, 0, 1);
+        r.overlay_mark_transmitted(0, layout, 0, 1, 16, 16);
+
+        r.overlay_drop(0);
+        let deletes = r.take_pending_deletes().expect("overlay_drop should queue a delete");
+        assert!(deletes.contains("_Ga=d,d=I,i="), "expected delete APC, got {deletes:?}");
+    }
+
+    /// `build_overlay_place_apc` must emit a classical placement APC
+    /// (`a=p,U=0`) at z=1 with the given source-crop and cell-size
+    /// parameters. The exact bytes ride into a buffer cell so the
+    /// shape matters.
+    #[test]
+    fn build_overlay_place_apc_format() {
+        let s = build_overlay_place_apc(
+            /*overlay_id*/ 42,
+            /*width_cells*/ 30,
+            /*height_cells*/ 12,
+            /*src_left_px*/ 0,
+            /*src_top_px*/ 16,
+            /*src_w_px*/ 240,
+            /*src_h_px*/ 192,
+            /*is_tmux*/ false,
+        );
+        assert!(s.starts_with("\x1b_G"), "APC must start with \\x1b_G; got {s:?}");
+        assert!(s.contains("a=p"), "must place");
+        assert!(s.contains("U=0"), "classical (cursor-positioned) placement");
+        assert!(s.contains("i=42"), "must reference image id");
+        assert!(s.contains("z=1"), "must be above the page placement");
+        assert!(s.contains("c=30"), "cells width");
+        assert!(s.contains("r=12"), "cells height");
+        assert!(s.contains("X=0"), "source x");
+        assert!(s.contains("Y=16"), "source y");
+        assert!(s.contains("w=240"), "source w");
+        assert!(s.contains("h=192"), "source h");
+        assert!(s.ends_with("\x1b\\"), "APC must end with \\x1b\\\\; got {s:?}");
+    }
+
+    /// The same APC under tmux must be wrapped in the DCS passthrough
+    /// envelope (`\x1bPtmux;...\x1b\\`) with the inner ESCs doubled,
+    /// matching how page transmits are wrapped.
+    #[test]
+    fn build_overlay_place_apc_tmux_wraps() {
+        let s = build_overlay_place_apc(1, 10, 5, 0, 0, 80, 80, /*is_tmux*/ true);
+        assert!(s.starts_with("\x1bPtmux;"), "tmux APC must start with DCS wrap; got {s:?}");
+        assert!(s.contains("\x1b\x1b_G"), "inner ESCs must be doubled inside tmux passthrough");
+    }
+
+    /// Evicting a page that owns both a page image AND an overlay
+    /// image must queue deletes for BOTH ids — otherwise an overlay
+    /// bitmap could outlive its page on the terminal side and leak.
+    #[test]
+    fn evict_drops_overlay_alongside_page() {
+        let mut r = KittyPageRegistry::new(false, 1000);
+        let layout = LayoutKey { fit_width_px: 64, dark: false };
+        let bm = RgbaImage::new(16, 16);
+        // Fill above cap; mark each page with an overlay too.
+        for i in 0..(MAX_CACHED_PAGES + 4) {
+            r.mark_transmitted(i, layout, 0, 16, 16);
+            r.overlay_mark_transmitted(i, layout, 0, 1, 16, 16);
+            r.pre_encode(&bm, i, layout, 0);
+        }
+        r.evict_to_budget(&[]);
+        let deletes = r.take_pending_deletes().expect("evictions queue deletes");
+        // 4 evicted pages × 2 deletes each (page id + overlay id) = 8.
+        assert_eq!(deletes.matches("_Ga=d,d=I,i=").count(), 8);
     }
 }
