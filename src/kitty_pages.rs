@@ -1012,21 +1012,44 @@ pub fn place_page(
             ),
         );
     }
+    let new_rect = ratatui::layout::Rect {
+        x: area.left(),
+        y: area.top().saturating_add(dst_top_cell),
+        width: width_cells,
+        height: height_cells,
+    };
+    // If this page was placed at a different rect last frame, the
+    // cells in (old - new) still carry the previous-frame placeholder
+    // (preserved by `clear_page_area`). Without an explicit clear,
+    // they'd render the page at TWO positions — a "ghost" copy at
+    // the old rect plus the real placement at the new rect. Wipe
+    // those cells now so the buffer ends up with placeholders only
+    // at `new_rect`.
+    if let Some(old_rect) = scratch.last_placed.get(&page_idx).copied() {
+        if old_rect != new_rect {
+            for y in old_rect.top()..old_rect.bottom() {
+                for x in old_rect.left()..old_rect.right() {
+                    if x >= new_rect.left()
+                        && x < new_rect.right()
+                        && y >= new_rect.top()
+                        && y < new_rect.bottom()
+                    {
+                        continue;
+                    }
+                    if let Some(cell) = buf.cell_mut((x, y)) {
+                        cell.reset();
+                    }
+                }
+            }
+        }
+    }
     // Record the placement so future frames' clear_page_area can
     // preserve these cells if the page collapses to 0 visible cells
     // at a sub-cell scroll boundary. The rect is in absolute buffer
     // coordinates; entries linger until the page leaves the registry
     // (pruned by evict_to_budget) so the preservation survives any
     // number of consecutive cell-clipped frames.
-    scratch.last_placed.insert(
-        page_idx,
-        ratatui::layout::Rect {
-            x: area.left(),
-            y: area.top().saturating_add(dst_top_cell),
-            width: width_cells,
-            height: height_cells,
-        },
-    );
+    scratch.last_placed.insert(page_idx, new_rect);
     if width_cells as u32 > MAX_COLS {
         // Source col diacritic capacity exceeded; clamp silently.
     }

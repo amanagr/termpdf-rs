@@ -846,24 +846,18 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     // frame's, not the intermediate writes.
     let kp = app.kitty_pages.as_mut().unwrap();
     let scratch = kp.place_scratch_mut();
-    // Preserve placeholders ONLY for pinned-visible pages that have
-    // NO placement this frame (rapid-deferred, cell-clipped, or no
-    // bitmap yet). If a page IS being placed below, preserving its
-    // prior-frame rect would leave stale placeholder cells at the
-    // OLD position whenever the page's layout rect moves — those
-    // cells reference a still-valid image_id, but at the wrong
-    // location, producing ghost copies of the page.
-    let placed_this_frame: std::collections::HashSet<usize> = blits
-        .iter()
-        .filter(|b| b.placement_active)
-        .map(|b| b.page_idx)
-        .collect();
-    let preserve_pages: Vec<usize> = visible_range_pin
-        .iter()
-        .copied()
-        .filter(|p| !placed_this_frame.contains(p))
-        .collect();
-    crate::kitty_pages::clear_page_area(buf, area, scratch, &preserve_pages);
+    // Preserve placeholders for ALL pinned-visible pages, including
+    // those being re-placed this frame at the same rect. Reason: if
+    // we DO clear those cells, the wire briefly carries spaces (no
+    // placement reference) before place_page restocks them with the
+    // new placement. If a re-transmit lands in that window and
+    // pushes Ghostty over the storage cap, deleteIfUnused can pick
+    // an image whose only placements are in those just-cleared cells
+    // — which freezes a still-visible page (observed 2026-05-05:
+    // click on page 226, page 225 vanishes). When a page's rect
+    // legitimately moves, place_page handles the (old - new) cell
+    // strip explicitly so the OLD position doesn't ghost.
+    crate::kitty_pages::clear_page_area(buf, area, scratch, &visible_range_pin);
     for (b, t) in blits.iter().zip(combined_prefixes.iter()) {
         if !b.placement_active {
             continue;
