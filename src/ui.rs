@@ -2347,7 +2347,6 @@ fn draw_toc(f: &mut Frame, app: &mut App<'_>, area: Rect) {
 
     f.render_widget(Clear, popup);
 
-    let filtered = app.toc_filtered_indices();
     let inner_w = popup.width.saturating_sub(2) as usize;
     let body_h = popup.height.saturating_sub(2) as usize;
 
@@ -2355,8 +2354,23 @@ fn draw_toc(f: &mut Frame, app: &mut App<'_>, area: Rect) {
     let cursor = app.toc_cursor;
     let scroll = cursor.saturating_sub(body_h.saturating_sub(1));
 
+    // Copy ONLY the visible window into a tiny local Vec so the
+    // toc_filtered_indices borrow drops before the per-row loop
+    // re-borrows app.outline. body_h is ≤ 50 in any realistic
+    // terminal — much smaller than cloning the full filtered set
+    // (potentially 50k entries on a long technical book).
+    let filtered_total = app.toc_filtered_indices().len();
+    let window: Vec<(usize, usize)> = app
+        .toc_filtered_indices()
+        .iter()
+        .copied()
+        .enumerate()
+        .skip(scroll)
+        .take(body_h)
+        .collect();
+
     let mut lines: Vec<Line> = Vec::with_capacity(body_h);
-    if filtered.is_empty() {
+    if filtered_total == 0 {
         let msg = if app.toc_filter.is_empty() {
             "(no entries)"
         } else {
@@ -2367,7 +2381,7 @@ fn draw_toc(f: &mut Frame, app: &mut App<'_>, area: Rect) {
             Style::default().fg(Color::DarkGray),
         )));
     } else {
-        for (display_idx, &entry_idx) in filtered.iter().enumerate().skip(scroll).take(body_h) {
+        for (display_idx, entry_idx) in window {
             let entry = &app.outline[entry_idx];
             let text = crate::outline::render_line(entry, inner_w);
             let style = if display_idx == cursor {

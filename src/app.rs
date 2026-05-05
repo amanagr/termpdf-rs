@@ -1758,20 +1758,32 @@ impl<'doc> App<'doc> {
             return None;
         }
         self.hint_filter.push(c);
-        let filter = self.hint_filter.clone();
-        let matches: Vec<&HintEntry> = self
-            .link_hints
-            .iter()
-            .filter(|e| e.label.starts_with(&filter))
-            .collect();
-        match matches.len() {
+        // Walk the iterator once tracking count + first-match index
+        // instead of cloning the filter String and collecting matches
+        // into a Vec<&HintEntry>. The `link_hints.iter()` borrow ends
+        // before we touch &mut self in the match arms.
+        let mut count: usize = 0;
+        let mut first_match: usize = usize::MAX;
+        for (i, e) in self.link_hints.iter().enumerate() {
+            if e.label.starts_with(&self.hint_filter) {
+                if count == 0 {
+                    first_match = i;
+                }
+                count += 1;
+                if count > 1 {
+                    break;
+                }
+            }
+        }
+        match count {
             0 => {
+                let filter_msg = self.hint_filter.clone();
                 self.exit_link_hint_mode();
-                self.status = format!("no hint matches `{filter}`");
+                self.status = format!("no hint matches `{filter_msg}`");
                 None
             }
             1 => {
-                let action = matches[0].action.clone();
+                let action = self.link_hints[first_match].action.clone();
                 self.exit_link_hint_mode();
                 Some(action)
             }
@@ -1934,7 +1946,14 @@ impl<'doc> App<'doc> {
     /// when the filter changes via `toc_filter_*`. For small outlines
     /// the recompute is cheap; for long technical books with deep
     /// outlines it was visible CPU.
-    pub fn toc_filtered_indices(&mut self) -> Vec<usize> {
+    ///
+    /// Returns a slice borrowed from the cache — the previous Vec
+    /// clone per call was up to 50k × 8 bytes for a long technical
+    /// book's outline (~400 KB allocated and freed each frame the
+    /// TOC was open). Borrow-only signature requires `&mut self`
+    /// because the cache populates lazily; once populated, repeat
+    /// callers re-enter the populated branch and read-only-borrow.
+    pub fn toc_filtered_indices(&mut self) -> &[usize] {
         let needs_recompute = match &self.toc_filtered_cache {
             Some((cached_filter, _)) => cached_filter != &self.toc_filter,
             None => true,
@@ -1943,11 +1962,7 @@ impl<'doc> App<'doc> {
             let v = outline::fuzzy_filter(&self.outline, &self.toc_filter);
             self.toc_filtered_cache = Some((self.toc_filter.clone(), v));
         }
-        // The cache owns the canonical Vec; the per-call clone is
-        // ~30 × 8 bytes for a typical outline. The expensive part
-        // (lowercasing the query, walking every entry doing
-        // subsequence-match) is what the cache eliminates.
-        self.toc_filtered_cache.as_ref().unwrap().1.clone()
+        &self.toc_filtered_cache.as_ref().unwrap().1
     }
 
     pub fn toc_move(&mut self, delta: i32) {
@@ -1979,8 +1994,10 @@ impl<'doc> App<'doc> {
     /// resolvable) and close the panel.
     pub fn toc_activate(&mut self) {
         let cursor = self.toc_cursor;
-        let filtered = self.toc_filtered_indices();
-        let Some(&entry_idx) = filtered.get(cursor) else {
+        // Copy the index out of the borrowed slice so the
+        // toc_filtered_indices borrow drops before we re-borrow
+        // self via &self.outline below.
+        let Some(entry_idx) = self.toc_filtered_indices().get(cursor).copied() else {
             return;
         };
         let entry = &self.outline[entry_idx];
@@ -2337,25 +2354,31 @@ impl<'doc> App<'doc> {
     /// to delete on this page (caller surfaces "no highlights here").
     pub fn request_delete_last_highlight(&mut self) -> usize {
         let page = self.current_page();
-        let target_group = self.last_highlight_group_on_page(page);
-        let count = match target_group {
-            // Grouped: count all entries on this page sharing the id.
-            Some(g) => self
-                .highlights
-                .items
-                .iter()
-                .filter(|h| h.page == page && h.group_id == Some(g))
-                .count(),
-            // Legacy: there's still SOMETHING here, but no group id —
-            // we'll fall back to deleting just the last entry.
-            None => {
-                if self.highlights.items.iter().any(|h| h.page == page) {
-                    1
-                } else {
-                    0
+        // Single pass: find the most-recent group_id on this page AND
+        // count its rect siblings. Legacy entries (group_id=None)
+        // collapse to a single-rect delete (count=1). Two earlier
+        // helpers walked highlights.items twice for the same answer
+        // — meaningful for docs with thousands of highlights.
+        let mut target_group: Option<u64> = None;
+        let mut count: usize = 0;
+        let mut found_any: bool = false;
+        for h in self.highlights.items.iter().rev() {
+            if h.page != page {
+                continue;
+            }
+            if !found_any {
+                found_any = true;
+                target_group = h.group_id;
+                if target_group.is_none() {
+                    // Legacy single-rect delete; no need to keep counting.
+                    count = 1;
+                    break;
                 }
             }
-        };
+            if h.group_id == target_group {
+                count += 1;
+            }
+        }
         self.awaiting_highlight_delete_confirm = count != 0;
         count
     }
