@@ -681,9 +681,7 @@ impl KittyPageRegistry {
         // overwrite its dimensions; re-add after. Only entries whose
         // transmitted_layout was Some counted toward the running total.
         let prev_bytes = match self.pages.get(&page_idx) {
-            Some(e) if e.transmitted_layout.is_some() => {
-                Self::entry_bytes(e.pixel_w, e.pixel_h)
-            }
+            Some(e) if e.transmitted_layout.is_some() => Self::entry_bytes(e.pixel_w, e.pixel_h),
             _ => 0,
         };
         let entry = self.pages.entry(page_idx).or_insert(PageEntry {
@@ -2312,10 +2310,7 @@ mod tests {
             let mut seen = std::collections::HashSet::new();
             for p in 0..100_000usize {
                 let id = r.id_for(p);
-                assert!(
-                    seen.insert(id),
-                    "id_for({p}) collided at seed=0x{seed:x}"
-                );
+                assert!(seen.insert(id), "id_for({p}) collided at seed=0x{seed:x}");
             }
         }
     }

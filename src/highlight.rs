@@ -262,7 +262,10 @@ mod tests {
         let r0 = s.page_revision(5);
         s.add(h(5, 0.1, "#ffd54f"));
         let r1 = s.page_revision(5);
-        assert!(r1 > r0, "add must bump page 5's revision (got {r0} -> {r1})");
+        assert!(
+            r1 > r0,
+            "add must bump page 5's revision (got {r0} -> {r1})"
+        );
     }
 
     #[test]
@@ -297,7 +300,11 @@ mod tests {
         // Loaded stores (from PDF annotations) must arrive with
         // revision counters reflecting their items so the very first
         // frame's cache key is stable across re-renders.
-        let items = vec![h(0, 0.1, "#ffd54f"), h(0, 0.5, "#80cbc4"), h(3, 0.1, "#ffd54f")];
+        let items = vec![
+            h(0, 0.1, "#ffd54f"),
+            h(0, 0.5, "#80cbc4"),
+            h(3, 0.1, "#ffd54f"),
+        ];
         let s = HighlightStore::from_items(items);
         assert!(s.page_revision(0) > 0);
         assert!(s.page_revision(3) > 0);

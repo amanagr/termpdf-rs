@@ -513,9 +513,11 @@ fn draw_pages_kitty_inner(
     }));
     if crate::debug_log::enabled() {
         scratch.dropped.clear();
-        scratch
-            .dropped
-            .extend(visible_range.clone().filter(|p| !scratch.visible.contains(p)));
+        scratch.dropped.extend(
+            visible_range
+                .clone()
+                .filter(|p| !scratch.visible.contains(p)),
+        );
         let layout_visible: Vec<usize> = visible_range.clone().collect();
         crate::debug_log::write(
             "visible",
@@ -1234,15 +1236,9 @@ pub(crate) fn compute_page_revision(app: &App<'_>, page_idx: usize) -> u64 {
     // canvas tier unable to distinguish "first hit found" from "no
     // search active" — `n`/`N` near a low search_revision then fails
     // to repaint the new current-hit outline.
-    let bool_bits =
-        ((has_search_hits as u64) << 32) | ((current_hit_on_this_page as u64) << 33);
+    let bool_bits = ((has_search_hits as u64) << 32) | ((current_hit_on_this_page as u64) << 33);
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for v in [
-        highlight_sig,
-        selection_sig,
-        search_revision,
-        bool_bits,
-    ] {
+    for v in [highlight_sig, selection_sig, search_revision, bool_bits] {
         h ^= v;
         h = h.wrapping_mul(0x100_0000_01b3);
     }
@@ -2450,8 +2446,7 @@ fn draw_toc(f: &mut Frame, app: &mut App<'_>, area: Rect) {
         let thumb_y = if max_scroll == 0 {
             0
         } else {
-            ((scroll as u32 * (track_h.saturating_sub(thumb_h)) as u32)
-                / max_scroll as u32) as u16
+            ((scroll as u32 * (track_h.saturating_sub(thumb_h)) as u32) / max_scroll as u32) as u16
         };
         let bar_x = popup.x + popup.width - 1;
         let bar_y0 = popup.y + 1;

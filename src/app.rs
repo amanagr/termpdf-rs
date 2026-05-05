@@ -736,10 +736,8 @@ impl<'doc> App<'doc> {
         // a page no longer in cache, and `request_prefetch`'s
         // `pages_in_flight.contains` gate refuses to re-prefetch a
         // page whose render-worker request was lost mid-flight.
-        self.pages_at_fast_quality
-            .retain(|&k| k >= lo && k < hi);
-        self.pages_in_flight
-            .retain(|key| key.0 >= lo && key.0 < hi);
+        self.pages_at_fast_quality.retain(|&k| k >= lo && k < hi);
+        self.pages_in_flight.retain(|key| key.0 >= lo && key.0 < hi);
         // The text-layout cache holds char bbox + line index per page;
         // a few hundred KB per page in dense documents. Drop any entry
         // outside the visible window unless it's part of the active
@@ -1618,10 +1616,7 @@ impl<'doc> App<'doc> {
             .unwrap_or(false);
         self.status = match (save, copy_outcome) {
             (true, Some(o)) if !any_clip_path => {
-                format!(
-                    "highlight saved (clipboard unavailable; {} bytes)",
-                    o.bytes
-                )
+                format!("highlight saved (clipboard unavailable; {} bytes)", o.bytes)
             }
             (true, Some(o)) if o.truncated => {
                 format!("highlight saved + copied {} bytes (truncated)", o.bytes)
@@ -1861,8 +1856,7 @@ impl<'doc> App<'doc> {
                 // the rendering of the rest of the status line. Run
                 // the URL through `safe_for_stderr` everywhere it's
                 // composed into a status string.
-                let url_safe =
-                    crate::term_safe::safe_for_stderr(&truncate_for_status(&url, 256));
+                let url_safe = crate::term_safe::safe_for_stderr(&truncate_for_status(&url, 256));
                 if !is_safe_external_url(&url) {
                     self.status = format!(
                         "blocked link with unsafe scheme: {}",
@@ -2098,9 +2092,7 @@ impl<'doc> App<'doc> {
     /// regardless of whether the popup has been drawn this frame.
     pub fn toc_hit(&self, col: u16, row: u16) -> bool {
         match self.toc_popup_rect() {
-            Some(r) => {
-                col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
-            }
+            Some(r) => col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height,
             None => false,
         }
     }
@@ -3513,7 +3505,12 @@ pub fn toc_popup_rect_for(img_area: Rect) -> Rect {
 /// rect and current scroll offset. Returns `None` if the row falls
 /// outside the popup body (border, blank rows past the last entry, or
 /// outside the popup entirely). Pure: no App state, easily testable.
-pub fn toc_row_to_display_idx(popup: Rect, scroll: usize, abs_row: u16, total: usize) -> Option<usize> {
+pub fn toc_row_to_display_idx(
+    popup: Rect,
+    scroll: usize,
+    abs_row: u16,
+    total: usize,
+) -> Option<usize> {
     // Body region: skip top border (popup.y) → first data row sits at
     // popup.y + 1, last at popup.y + height - 2.
     let first = popup.y.checked_add(1)?;
@@ -4192,7 +4189,12 @@ mod tests {
     }
 
     fn popup(x: u16, y: u16, w: u16, h: u16) -> Rect {
-        Rect { x, y, width: w, height: h }
+        Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
     }
 
     #[test]
@@ -4252,7 +4254,12 @@ mod tests {
     fn toc_popup_rect_anchored_right_clamped_to_min_40() {
         // Standard 100×30 viewport with status row already removed
         // (img_area passed in). 2/5 of 100 = 40 — exactly the minimum.
-        let img = Rect { x: 0, y: 0, width: 100, height: 29 };
+        let img = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 29,
+        };
         let r = toc_popup_rect_for(img);
         assert_eq!(r.x, 60, "anchored to the right edge");
         assert_eq!(r.y, 0, "shares the image area's y origin");
@@ -4263,7 +4270,12 @@ mod tests {
     #[test]
     fn toc_popup_rect_clamps_max_at_80() {
         // 2/5 of 300 = 120 → clamped down to 80.
-        let img = Rect { x: 0, y: 0, width: 300, height: 50 };
+        let img = Rect {
+            x: 0,
+            y: 0,
+            width: 300,
+            height: 50,
+        };
         let r = toc_popup_rect_for(img);
         assert_eq!(r.width, 80);
         assert_eq!(r.x, 220);
@@ -4274,16 +4286,29 @@ mod tests {
         // Below the minimum: panel_w clamps to 40, but min(image.width)
         // brings it back to image.width so the popup never extends
         // past the image area.
-        let img = Rect { x: 5, y: 0, width: 30, height: 20 };
+        let img = Rect {
+            x: 5,
+            y: 0,
+            width: 30,
+            height: 20,
+        };
         let r = toc_popup_rect_for(img);
         assert_eq!(r.width, 30);
-        assert_eq!(r.x, 5, "saturating_sub keeps origin at image edge when popup == image");
+        assert_eq!(
+            r.x, 5,
+            "saturating_sub keeps origin at image edge when popup == image"
+        );
     }
 
     #[test]
     fn toc_popup_rect_offset_image_area() {
         // Image area not at (0,0) — exercises the +x/+y math.
-        let img = Rect { x: 10, y: 2, width: 100, height: 25 };
+        let img = Rect {
+            x: 10,
+            y: 2,
+            width: 100,
+            height: 25,
+        };
         let r = toc_popup_rect_for(img);
         assert_eq!(r.x, 70, "popup.x = img.x + img.width - panel_w = 10+100-40");
         assert_eq!(r.y, 2);

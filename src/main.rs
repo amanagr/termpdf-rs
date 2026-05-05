@@ -1006,11 +1006,7 @@ fn is_repeat_safe(app: &App<'_>, k: &crossterm::event::KeyEvent) -> bool {
     if in_input_mode {
         return matches!(
             k.code,
-            KeyCode::Backspace
-                | KeyCode::Left
-                | KeyCode::Right
-                | KeyCode::Up
-                | KeyCode::Down
+            KeyCode::Backspace | KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
         ) || matches!(k.code, KeyCode::Char(_)) && !ctrl;
     }
 
@@ -1045,9 +1041,7 @@ fn dispatch_event(app: &mut App<'_>, ev: Event) -> Result<()> {
         // terminals (Kitty, Ghostty, WezTerm, Foot) emit Repeat at
         // ~30 Hz; non-KKP terminals (xterm, GNOME Terminal) only
         // emit Press.
-        Event::Key(k)
-            if k.kind == KeyEventKind::Repeat && is_repeat_safe(app, &k) =>
-        {
+        Event::Key(k) if k.kind == KeyEventKind::Repeat && is_repeat_safe(app, &k) => {
             keys::dispatch(app, k)?
         }
         Event::Resize(w, h) => {
@@ -1058,12 +1052,7 @@ fn dispatch_event(app: &mut App<'_>, ev: Event) -> Result<()> {
             // next paint sets `image_area` again, mis-routing events.
             // The same +/- 1 status row split happens in `ui::draw`
             // around line 219 — keep these two derivations in sync.
-            app.image_area = ratatui::layout::Rect::new(
-                0,
-                0,
-                w,
-                h.saturating_sub(1),
-            );
+            app.image_area = ratatui::layout::Rect::new(0, 0, w, h.saturating_sub(1));
             app.invalidate_compose();
         }
         Event::Mouse(m) => keys::dispatch_mouse(app, m)?,
