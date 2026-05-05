@@ -110,6 +110,23 @@ impl DocIndex {
         if page_idx >= self.total_pages || self.indexed_pages.contains(&page_idx) {
             return;
         }
+        // Enforce monotonic order in debug builds. `page_starts` is
+        // assumed monotonic by `page_for_offset`'s binary search; an
+        // out-of-order insert silently produces wrong page attribution
+        // for search hits. The idle-warm scheduler enforces lowest-
+        // first today, but a future parallel indexer would need this
+        // assertion to catch the violation early.
+        debug_assert!(
+            self.indexed_pages
+                .iter()
+                .max()
+                .copied()
+                .map(|prev| page_idx > prev)
+                .unwrap_or(true),
+            "search_index::add_page must be called in monotonic page order; got {} after {:?}",
+            page_idx,
+            self.indexed_pages.iter().max().copied()
+        );
         let start = self.text.len();
         self.page_starts[page_idx] = start;
         self.text.push_str(&page_text);

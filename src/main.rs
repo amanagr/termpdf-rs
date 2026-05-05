@@ -964,14 +964,64 @@ fn apply_coalesced_scroll(app: &mut App<'_>, net: i32, shifted: bool) {
     }
 }
 
+/// True if the given key is safe to autorepeat (motion / input-buffer
+/// edit). Toggle keys (dark, help, color cycle, refresh, mode entry)
+/// are NOT autorepeat-safe — holding them would flicker state at
+/// ~30 Hz. Mode-aware: in input modes (Command, Search, TOC filter)
+/// printable Char keys are typing — let those through; in Normal /
+/// Visual mode, Char keys are usually commands and we whitelist.
+fn is_repeat_safe(app: &App<'_>, k: &crossterm::event::KeyEvent) -> bool {
+    use crate::app::Mode;
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+
+    // In any input mode, Backspace and printable Chars are typing.
+    let in_input_mode = matches!(app.mode, Mode::Command | Mode::Search)
+        || (app.show_toc && app.toc_filter_editing);
+    if in_input_mode {
+        return matches!(
+            k.code,
+            KeyCode::Backspace
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Up
+                | KeyCode::Down
+        ) || matches!(k.code, KeyCode::Char(_)) && !ctrl;
+    }
+
+    // Outside input modes: only motion keys autorepeat.
+    matches!(
+        k.code,
+        KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Char('h')
+            | KeyCode::Char('j')
+            | KeyCode::Char('k')
+            | KeyCode::Char('l') if !ctrl  // Ctrl-L is the refresh hatch — not motion
+    ) || matches!(k.code, KeyCode::Char('w') | KeyCode::Char('b') | KeyCode::Char('e'))
+        && !ctrl
+        || matches!(k.code, KeyCode::Char(' ')) // less-style page down
+        || (ctrl && matches!(k.code, KeyCode::Char('d') | KeyCode::Char('u')))
+}
+
 fn dispatch_event(app: &mut App<'_>, ev: Event) -> Result<()> {
     match ev {
-        // Accept Press AND Repeat. The Kitty Keyboard Protocol-aware
-        // terminals (Kitty, Ghostty, WezTerm, Foot) emit `Repeat` for
-        // held-key autorepeat — without this branch, holding `j` does
-        // nothing on those terminals. Drop only `Release`.
+        // Press always dispatches.
+        Event::Key(k) if k.kind == KeyEventKind::Press => keys::dispatch(app, k)?,
+        // Repeat dispatches ONLY for keys we want to autorepeat
+        // (motions + input-buffer chars). Without this gate, holding
+        // `d` would flip dark mode 30×/sec, holding `?` would flicker
+        // help, holding `c` in Visual mode would cycle highlight
+        // colors uncontrollably. The Kitty Keyboard Protocol-aware
+        // terminals (Kitty, Ghostty, WezTerm, Foot) emit Repeat at
+        // ~30 Hz; non-KKP terminals (xterm, GNOME Terminal) only
+        // emit Press.
         Event::Key(k)
-            if k.kind == KeyEventKind::Press || k.kind == KeyEventKind::Repeat =>
+            if k.kind == KeyEventKind::Repeat && is_repeat_safe(app, &k) =>
         {
             keys::dispatch(app, k)?
         }
