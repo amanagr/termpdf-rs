@@ -301,15 +301,6 @@ pub struct App<'doc> {
     /// yet."
     pub last_canvas_hash: u64,
 
-    /// Scratch RGBA reused by `build_selection_overlay_image` in
-    /// kitty mode. Holds zeros except where the current selection
-    /// rects are painted; same dims as the underlying page bitmap.
-    /// Without this each Visual-mode keystroke would `RgbaImage::new`
-    /// a fresh ~12 MB zeroed image — 30 keystrokes = 360 MB of
-    /// allocation churn, all immediately encoded then dropped.
-    /// `Option` so first use can pick up the right dims.
-    pub selection_overlay_scratch: Option<RgbaImage>,
-
     pub highlights: HighlightStore,
     /// Bumped on every highlight add/delete so the compose cache
     /// invalidates without re-hashing the store.
@@ -568,7 +559,6 @@ impl<'doc> App<'doc> {
             bg_row_buf: Vec::new(),
             bg_row_key: None,
             last_canvas_hash: 0,
-            selection_overlay_scratch: None,
             last_compose_key: None,
             last_selection_range: None,
             highlights,

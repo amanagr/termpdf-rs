@@ -132,10 +132,7 @@ fn read_rss_kb(pid: u32) -> Option<u64> {
     let s = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
-            return rest
-                .split_whitespace()
-                .next()
-                .and_then(|n| n.parse().ok());
+            return rest.split_whitespace().next().and_then(|n| n.parse().ok());
         }
     }
     None

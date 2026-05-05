@@ -28,7 +28,7 @@ use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::StatefulImage;
 
 use crate::app::{App, ComposeKey, HighlightsBakedKey, LayoutKey, Mode, PageOverlayKey};
-use crate::compose::{fill_rect_blend, fill_rect_rgba, norm_to_pixels, outline_rect};
+use crate::compose::{fill_rect_blend, norm_to_pixels, outline_rect};
 use crate::dark;
 use crate::highlight::{rgb_from_hex, Rect01, HIGHLIGHT_COLORS};
 use crate::pdf;
@@ -519,10 +519,6 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
         src_top_cell: u16,
         src_left_cell: u16,
         width_cells: u16,
-        /// Selection signature for this page. Non-zero when there's an
-        /// active selection touching the page; `0` means no overlay
-        /// should be drawn (and any prior overlay should be dropped).
-        sel_sig: u64,
         /// False when the rapid-burst defer chose to skip this page's
         /// kitty placement. The blit still carries its original geometry
         /// so we can paint a "loading…" indicator over the cleared area.
@@ -602,7 +598,6 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
             .expect("kitty_pages should be Some on this draw path");
         let need_transmit = !kp.is_fresh(page_idx, layout_key, revision, pixel_w, pixel_h);
         let image_id = kp.image_id(page_idx);
-        let sel_sig = app.selection_signature_for_page(page_idx);
 
         blits.push(PageBlit {
             page_idx,
@@ -617,7 +612,6 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
             src_top_cell,
             src_left_cell,
             width_cells,
-            sel_sig,
             placement_active: true,
         });
     }
@@ -2779,7 +2773,6 @@ mod tests {
             }
         }
     }
-
 
     /// In placement mode the bake must NOT paint a band fill — the
     /// user is positioning the caret, not selecting yet. We verify

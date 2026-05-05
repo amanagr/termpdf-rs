@@ -340,7 +340,6 @@ impl Pty {
         for line in status.lines() {
             if let Some(rest) = line.strip_prefix("VmRSS:") {
                 let kb: u64 = rest
-                    .trim()
                     .split_whitespace()
                     .next()
                     .unwrap_or("0")

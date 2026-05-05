@@ -129,23 +129,6 @@ struct OverlayEntry {
     transmitted_sel_sig: u64,
     pixel_w: u32,
     pixel_h: u32,
-    cached_payload: Option<OverlayCachedPayload>,
-}
-
-#[derive(Debug, Clone)]
-struct OverlayCachedPayload {
-    layout: LayoutKey,
-    revision: u64,
-    sel_sig: u64,
-    /// Same kitty compression code as `CachedPayload::compression`.
-    /// Selection-band overlays keep PNG/RGBA (real alpha < 255) and
-    /// stay at 0; the field exists only because the same
-    /// `build_transmit_string` is used for both.
-    compression: u8,
-    pixel_w: u32,
-    pixel_h: u32,
-    format_code: u8,
-    bytes: Vec<u8>,
 }
 
 pub struct KittyPageRegistry {
@@ -631,98 +614,6 @@ impl KittyPageRegistry {
             .wrapping_add(page_idx as u32)
     }
 
-    /// True if the cached overlay transmit for this page matches all of
-    /// (layout, revision, sel_sig, dims). When false, the overlay
-    /// either doesn't exist or its on-terminal pixels don't match what
-    /// we'd send now — caller must transmit.
-    pub fn overlay_is_fresh(
-        &self,
-        page_idx: usize,
-        layout: LayoutKey,
-        revision: u64,
-        sel_sig: u64,
-        pixel_w: u32,
-        pixel_h: u32,
-    ) -> bool {
-        match self.overlays.get(&page_idx) {
-            Some(e) => {
-                e.transmitted_layout == Some(layout)
-                    && e.transmitted_revision == revision
-                    && e.transmitted_sel_sig == sel_sig
-                    && e.pixel_w == pixel_w
-                    && e.pixel_h == pixel_h
-            }
-            None => false,
-        }
-    }
-
-    /// Build the kitty transmit escape for the selection-band overlay
-    /// of this page. Mirrors `build_transmit` for pages, but uses the
-    /// overlay ID range and includes `sel_sig` in the cache key. The
-    /// resulting transmit string carries the bitmap; the caller is
-    /// responsible for emitting a separate classical placement APC at
-    /// the right cursor position to actually put it on screen.
-    pub fn overlay_build_transmit(
-        &mut self,
-        bitmap: &RgbaImage,
-        page_idx: usize,
-        layout: LayoutKey,
-        revision: u64,
-        sel_sig: u64,
-    ) -> String {
-        let id = self.overlay_image_id(page_idx);
-        let pixel_w = bitmap.width();
-        let pixel_h = bitmap.height();
-        let is_tmux = self.is_tmux;
-        let entry = self.overlays.entry(page_idx).or_insert(OverlayEntry {
-            image_id: id,
-            transmitted_layout: None,
-            transmitted_revision: 0,
-            transmitted_sel_sig: 0,
-            pixel_w,
-            pixel_h,
-            cached_payload: None,
-        });
-        let needs_encode = match &entry.cached_payload {
-            Some(c) => {
-                !(c.layout == layout
-                    && c.revision == revision
-                    && c.sel_sig == sel_sig
-                    && c.pixel_w == pixel_w
-                    && c.pixel_h == pixel_h)
-            }
-            None => true,
-        };
-        if needs_encode {
-            let (format_code, compression, bytes) = encode_payload(bitmap);
-            entry.cached_payload = Some(OverlayCachedPayload {
-                layout,
-                revision,
-                sel_sig,
-                compression,
-                pixel_w,
-                pixel_h,
-                format_code,
-                bytes,
-            });
-        }
-        let c = entry
-            .cached_payload
-            .as_ref()
-            .expect("overlay payload populated above");
-        // Use the same transmit-string builder as pages — kitty doesn't
-        // distinguish image kinds, only IDs.
-        build_transmit_string(
-            &c.bytes,
-            c.format_code,
-            c.compression,
-            id,
-            pixel_w,
-            pixel_h,
-            is_tmux,
-        )
-    }
-
     /// Update overlay registry state to record that the just-built
     /// transmit has been (or is about to be) flushed to the terminal.
     pub fn overlay_mark_transmitted(
@@ -742,7 +633,6 @@ impl KittyPageRegistry {
             transmitted_sel_sig: 0,
             pixel_w,
             pixel_h,
-            cached_payload: None,
         });
         entry.image_id = id;
         entry.transmitted_layout = Some(layout);
@@ -769,28 +659,6 @@ impl KittyPageRegistry {
         self.overlays
             .get(&page_idx)
             .is_some_and(|e| e.transmitted_layout.is_some())
-    }
-}
-
-/// Encode the bitmap into a (kitty format code, payload bytes) pair.
-/// 100 = PNG, 32 = raw RGBA.
-///
-/// Format choice: PDF pages are mostly white space with sparse text,
-/// so PNG compresses 5-20× smaller than raw RGBA. We pay a one-shot
-/// encode cost (~2 ms with `Fast` + `Up`) to save 50-150 ms of
-/// pty-write time on the wire. Net win for any page bigger than ~50 KB
-/// raw, which is every real PDF page.
-///
-/// Set `TERMPDF_TRANSMIT_RAW=1` to force the old raw-RGBA path —
-/// useful for A/B testing or if a terminal turns out not to like
-/// PNG transmits in practice.
-fn encode_payload(bitmap: &RgbaImage) -> (u8, u8, Vec<u8>) {
-    if force_raw_env() {
-        return (32, 0, bitmap.as_raw().to_vec());
-    }
-    match encode_png_fast(bitmap) {
-        Ok(png) => (100, 0, png),
-        Err(_) => (32, 0, bitmap.as_raw().to_vec()),
     }
 }
 
@@ -979,7 +847,7 @@ fn build_transmit_string(
 /// which adds the payload cache on top.
 #[cfg(test)]
 fn transmit(bitmap: &RgbaImage, id: u32, is_tmux: bool) -> String {
-    let (format_code, compression, payload) = encode_payload(bitmap);
+    let (format_code, compression, payload) = encode_payload_opaque(bitmap);
     build_transmit_string(
         &payload,
         format_code,
@@ -991,29 +859,7 @@ fn transmit(bitmap: &RgbaImage, id: u32, is_tmux: bool) -> String {
     )
 }
 
-/// PNG-encode with `Fast` compression + `Up` filter. Benchmarked on a
-/// 1600×2300 synthetic page: NoFilter = 2.8× compression at 14 ms,
-/// Up filter = 50× compression at 1.9 ms. The Up predictor (each
-/// pixel = pixel above) is a near-perfect fit for PDF backgrounds,
-/// so it beats NoFilter on both axes. Adaptive (per-row best filter)
-/// is marginally smaller but slower; not worth it.
-fn encode_png_fast(bitmap: &RgbaImage) -> Result<Vec<u8>, image::ImageError> {
-    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
-    use image::ImageEncoder;
-    // Best-case PNG of a typical page is ~250 KB; reserve in that
-    // ballpark to avoid a few growth reallocations during encode.
-    let mut buf = Vec::with_capacity(512 * 1024);
-    let encoder = PngEncoder::new_with_quality(&mut buf, CompressionType::Fast, FilterType::Up);
-    encoder.write_image(
-        bitmap.as_raw(),
-        bitmap.width(),
-        bitmap.height(),
-        image::ExtendedColorType::Rgba8,
-    )?;
-    Ok(buf)
-}
-
-/// Same as `encode_png_fast` but encodes RGB (drops alpha). Used by
+/// PNG-encode with `Fast` compression + `Up` filter, dropping alpha. Used by
 /// the page-transmit path; alpha is always 255 on page bitmaps so
 /// dropping it loses no information and shrinks the decoded buffer
 /// in Ghostty by 25%.
@@ -2161,103 +2007,6 @@ mod tests {
         }
     }
 
-    /// `overlay_is_fresh` must return true ONLY when every key field
-    /// matches the last `mark_transmitted` call. Selection signature is
-    /// the field that changes per Visual-mode keystroke; flipping it
-    /// must invalidate even when layout, revision, and dims are stable.
-    #[test]
-    fn overlay_is_fresh_only_when_all_fields_match() {
-        let mut r = KittyPageRegistry::new(false, 1000);
-        let layout = LayoutKey {
-            fit_width_px: 64,
-            dark: false,
-        };
-        r.overlay_mark_transmitted(0, layout, 7, 12345, 100, 50);
-
-        // Exact match → fresh.
-        assert!(r.overlay_is_fresh(0, layout, 7, 12345, 100, 50));
-        // Layout change → stale (e.g. user changed zoom).
-        let layout2 = LayoutKey {
-            fit_width_px: 128,
-            dark: false,
-        };
-        assert!(!r.overlay_is_fresh(0, layout2, 7, 12345, 100, 50));
-        // Revision change → stale (a highlight added on this page).
-        assert!(!r.overlay_is_fresh(0, layout, 8, 12345, 100, 50));
-        // Selection signature change → stale (caret moved by `l`).
-        assert!(!r.overlay_is_fresh(0, layout, 7, 99999, 100, 50));
-        // Dim change → stale (re-render at a different pixel size).
-        assert!(!r.overlay_is_fresh(0, layout, 7, 12345, 200, 50));
-        assert!(!r.overlay_is_fresh(0, layout, 7, 12345, 100, 100));
-        // Different page → stale (nothing transmitted yet).
-        assert!(!r.overlay_is_fresh(1, layout, 7, 12345, 100, 50));
-    }
-
-    /// Building an overlay transmit must populate the cache so that a
-    /// subsequent build with the same fingerprint reuses the encoded
-    /// bytes (no re-encode). Mirrors `build_transmit_caches_payload_across_calls`
-    /// for the overlay path.
-    #[test]
-    fn overlay_build_transmit_caches_payload() {
-        let mut r = KittyPageRegistry::new(false, 1000);
-        let layout = LayoutKey {
-            fit_width_px: 64,
-            dark: false,
-        };
-        let bm = RgbaImage::new(16, 16);
-
-        let s1 = r.overlay_build_transmit(&bm, 0, layout, 0, 1);
-        let cached_ptr_1 = r
-            .overlays
-            .get(&0)
-            .unwrap()
-            .cached_payload
-            .as_ref()
-            .unwrap()
-            .bytes
-            .as_ptr() as usize;
-
-        // Same fingerprint → reuse cache. Returned strings should match
-        // byte-for-byte AND the cached bytes Vec must not have been
-        // reallocated.
-        let s2 = r.overlay_build_transmit(&bm, 0, layout, 0, 1);
-        let cached_ptr_2 = r
-            .overlays
-            .get(&0)
-            .unwrap()
-            .cached_payload
-            .as_ref()
-            .unwrap()
-            .bytes
-            .as_ptr() as usize;
-        assert_eq!(
-            s1, s2,
-            "second build with same fingerprint should return identical string"
-        );
-        assert_eq!(
-            cached_ptr_1, cached_ptr_2,
-            "cached payload Vec must not have been reallocated"
-        );
-
-        // Different sel_sig → new encode (different bitmap intent).
-        let _ = r.overlay_build_transmit(&bm, 0, layout, 0, 2);
-        let cached_ptr_3 = r
-            .overlays
-            .get(&0)
-            .unwrap()
-            .cached_payload
-            .as_ref()
-            .unwrap()
-            .bytes
-            .as_ptr() as usize;
-        // Pointer may or may not match (Vec might reuse the same
-        // backing allocation if grown into the same slot) — what we
-        // *can* assert is that the cached fingerprint flipped.
-        let cached = &r.overlays.get(&0).unwrap().cached_payload.as_ref().unwrap();
-        assert_eq!(cached.sel_sig, 2, "cache must update sel_sig on rebuild");
-        let _ = cached_ptr_3;
-    }
-
     /// Dropping an overlay queues a kitty `a=d,d=I,i=ID` so the
     /// terminal frees its decoded bitmap. Without this, scrolling a
     /// long doc with selections would leak overlay bitmaps in the
@@ -2269,8 +2018,6 @@ mod tests {
             fit_width_px: 64,
             dark: false,
         };
-        let bm = RgbaImage::new(16, 16);
-        let _ = r.overlay_build_transmit(&bm, 0, layout, 0, 1);
         r.overlay_mark_transmitted(0, layout, 0, 1, 16, 16);
 
         r.overlay_drop(0);
@@ -2283,7 +2030,7 @@ mod tests {
         );
     }
 
-/// queue_deletes must collapse contiguous-id runs into one
+    /// queue_deletes must collapse contiguous-id runs into one
     /// `d=R` and leave singletons as `d=I`. The mixed case (one
     /// range + one isolated id) is the realistic situation when
     /// some evictions are forward-scroll consecutive and one or
@@ -2524,7 +2271,9 @@ mod tests {
         use flate2::read::ZlibDecoder;
         use std::io::Read;
         let mut inflated = Vec::new();
-        ZlibDecoder::new(&bytes[..]).read_to_end(&mut inflated).unwrap();
+        ZlibDecoder::new(&bytes[..])
+            .read_to_end(&mut inflated)
+            .unwrap();
         let expected = strip_alpha(&img);
         assert_eq!(
             inflated, expected,

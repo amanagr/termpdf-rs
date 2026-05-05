@@ -64,7 +64,7 @@ mod tests {
         let cleaned = safe_for_stderr(injected);
         for c in cleaned.chars() {
             let code = c as u32;
-            assert!(c == '\n' || c == '\t' || (code >= 0x20 && code < 0x7F) || code >= 0xA0);
+            assert!(c == '\n' || c == '\t' || (0x20..0x7F).contains(&code) || code >= 0xA0);
         }
     }
 
