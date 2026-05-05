@@ -101,12 +101,31 @@ fn resolve_action(action: &PdfAction<'_>) -> Option<LinkAction> {
 /// PDF point space (origin bottom-left, units = points) → normalised
 /// 0..1 (origin top-left). Same math as search.rs::pdf_rect_to_norm.
 fn pdf_rect_to_norm(r: &PdfRect, m: &PageMetrics) -> Rect01 {
-    let w = m.width_pts.max(1.0);
-    let h = m.height_pts.max(1.0);
+    // Defend against malformed PDFs where rect coords or page metrics
+    // come back NaN/Inf — `f32::clamp` panics if the bound is NaN, and
+    // even when it doesn't, NaN propagates through arithmetic and
+    // produces a hint Rect01 with NaN coords that pixel-mapper code
+    // truncates to 0 (zero-size hint, silently swallowed).
     let raw_left = r.left().value;
     let raw_right = r.right().value;
     let raw_top = r.top().value;
     let raw_bottom = r.bottom().value;
+    if !raw_left.is_finite()
+        || !raw_right.is_finite()
+        || !raw_top.is_finite()
+        || !raw_bottom.is_finite()
+        || !m.width_pts.is_finite()
+        || !m.height_pts.is_finite()
+    {
+        return Rect01 {
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+        };
+    }
+    let w = m.width_pts.max(1.0);
+    let h = m.height_pts.max(1.0);
     let left = raw_left.min(raw_right);
     let right = raw_left.max(raw_right);
     let top = raw_top.max(raw_bottom);

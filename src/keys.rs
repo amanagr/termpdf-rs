@@ -104,6 +104,13 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
 
     match k.code {
+        // Ctrl-C bails out. With raw_mode on, the terminal driver
+        // does not translate Ctrl-C to SIGINT — crossterm delivers
+        // it as Char('c')+CONTROL. Without an explicit arm it falls
+        // through and the user's habitual "kill it" reflex does
+        // nothing. There is no signal-hook crate dep; this in-band
+        // handler is the path.
+        KeyCode::Char('c') if ctrl => app.should_quit = true,
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('?') => app.show_help = !app.show_help,
 
@@ -156,11 +163,22 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         }
         KeyCode::Left => app.scroll_x_by(-SCROLL_LINE),
         KeyCode::Right => app.scroll_x_by(SCROLL_LINE),
-        KeyCode::Char('d') if ctrl && app.note_scroll_attempt() => {
-            app.scroll_by_screens(SCROLL_HALF);
+        // Ctrl-d/u: half-screen jumps. The throttle check moves
+        // INSIDE the body — keeping it on the arm guard means a
+        // throttle-rejected Ctrl-d falls through to the un-ctrl
+        // `'d'` arm below and silently toggles dark mode mid-scroll.
+        // (The compound guard `if ctrl && note_scroll_attempt()` is
+        // misleading: arm-guard failure makes the arm not match,
+        // not the keystroke not handled.)
+        KeyCode::Char('d') if ctrl => {
+            if app.note_scroll_attempt() {
+                app.scroll_by_screens(SCROLL_HALF);
+            }
         }
-        KeyCode::Char('u') if ctrl && app.note_scroll_attempt() => {
-            app.scroll_by_screens(-SCROLL_HALF);
+        KeyCode::Char('u') if ctrl => {
+            if app.note_scroll_attempt() {
+                app.scroll_by_screens(-SCROLL_HALF);
+            }
         }
         // Vim-style jumplist: <C-o> back, <C-i> / Tab forward.
         KeyCode::Char('o') if ctrl => app.jump_back(),
@@ -222,6 +240,11 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
             // either confirms with `y` or cancels with anything else.
             // Prevents the foot-cannon where one stray `x` wipes a
             // multi-line highlight the user just made.
+            //
+            // Drop any leading numeric prefix (`5x`) — we don't honour
+            // a count for delete, but leaving the `5` in `pending`
+            // poisons the next motion (`5x j` jumps 5 pages).
+            app.pending.clear();
             let n = app.request_delete_last_highlight();
             if n == 0 {
                 app.status = "no highlights on this page".into();
@@ -244,11 +267,24 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
             app.cmd_buffer.clear();
             app.status = "Search: (typing — Enter to run, Esc to cancel)".into();
         }
-        KeyCode::Char('v') => app.enter_visual(),
-        KeyCode::Char('o') => app.toggle_toc(),
+        KeyCode::Char('v') => {
+            // Numeric prefix doesn't apply to Visual entry — drop it.
+            app.pending.clear();
+            app.enter_visual();
+        }
+        KeyCode::Char('o') => {
+            // Drop any leading numeric prefix (`5o`); without this the
+            // stale `5` survives the TOC roundtrip and corrupts the
+            // first motion afterwards.
+            app.pending.clear();
+            app.toggle_toc();
+        }
         // `f` enters link-hint mode (vimium-style): every clickable
         // link on visible pages gets a 1-2 char overlay; type to pick.
-        KeyCode::Char('f') => app.enter_link_hint_mode(),
+        KeyCode::Char('f') => {
+            app.pending.clear();
+            app.enter_link_hint_mode();
+        }
         // `]]` / `[[` jump to next / prev outline entry. Both
         // require a doubled keystroke matching vim's section-motion
         // binding. The first ] / [ stays in `pending`; the second
@@ -271,9 +307,18 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         }
 
         // Marks: `m{a-z}` to set, `'{a-z}` to jump. Two-stroke pattern
-        // matched in the awaiting_mark_* prelude above.
-        KeyCode::Char('m') => app.awaiting_mark_set = true,
-        KeyCode::Char('\'') => app.awaiting_mark_jump = true,
+        // matched in the awaiting_mark_* prelude above. Clear the
+        // numeric prefix — `5m` doesn't take a count, and a stale `5`
+        // survives the mark-name keypress (which returns early at the
+        // top of normal_keys) and poisons the next motion.
+        KeyCode::Char('m') => {
+            app.pending.clear();
+            app.awaiting_mark_set = true;
+        }
+        KeyCode::Char('\'') => {
+            app.pending.clear();
+            app.awaiting_mark_jump = true;
+        }
 
         KeyCode::Esc => {
             // Drop pending chord, mark-pending flags, and any other
@@ -289,7 +334,37 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
 }
 
 fn cmd_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = k.modifiers.contains(KeyModifiers::ALT);
     match k.code {
+        // Ctrl-C from the `:` prompt should bail out, NOT push a literal
+        // `c`. Same for Ctrl-W, Ctrl-D, etc — terminal-native conventions
+        // the user expects from a Vim-like prompt.
+        KeyCode::Char('c') if ctrl => {
+            app.mode = Mode::Normal;
+            app.cmd_buffer.clear();
+            app.status.clear();
+        }
+        KeyCode::Char('w') if ctrl => {
+            // Word-wise backspace.
+            while app
+                .cmd_buffer
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_whitespace())
+            {
+                app.cmd_buffer.pop();
+            }
+            while app
+                .cmd_buffer
+                .chars()
+                .next_back()
+                .is_some_and(|c| !c.is_whitespace())
+            {
+                app.cmd_buffer.pop();
+            }
+        }
+        KeyCode::Char('u') if ctrl => app.cmd_buffer.clear(),
         KeyCode::Esc => {
             app.mode = Mode::Normal;
             app.cmd_buffer.clear();
@@ -302,7 +377,11 @@ fn cmd_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         KeyCode::Backspace if app.cmd_buffer.pop().is_none() => {
             app.mode = Mode::Normal;
         }
-        KeyCode::Char(c) => app.cmd_buffer.push(c),
+        // Only accept un-modified printable chars. A modified char
+        // (Ctrl-X, Alt-letter) means the user pressed a control sequence,
+        // not a literal letter — pushing the bare char silently corrupts
+        // the buffer.
+        KeyCode::Char(c) if !ctrl && !alt => app.cmd_buffer.push(c),
         _ => {}
     }
     Ok(())
@@ -311,9 +390,23 @@ fn cmd_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
 fn visual_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
 
+    // Esc inside any chord-pending block: clear the chord and fall
+    // through to the outer match's Esc arm so the user gets the
+    // expected one-keystroke exit. Without this, `g`+`Esc` /
+    // `f`+`Esc` / `i`+`Esc` consume the Esc as a chord-cancel-only
+    // (the inner match's `_ => {}` arm returns silently) and the
+    // user has to press Esc a SECOND time to actually leave Visual
+    // mode.
+    if matches!(k.code, KeyCode::Esc)
+        && !app.pending.is_empty()
+        && (app.pending == "f" || app.pending == "F" || app.pending == "i" || app.pending == "g")
+    {
+        app.pending.clear();
+        // fall through to outer match (Esc -> exit_visual)
+    }
     // f-pending: previous keypress was `f`/`F`, awaiting the target
     // char. Stored as a single `f` or `F` in `pending`.
-    if app.pending == "f" || app.pending == "F" {
+    else if app.pending == "f" || app.pending == "F" {
         let forward = app.pending == "f";
         app.pending.clear();
         if let KeyCode::Char(c) = k.code {
@@ -329,7 +422,7 @@ fn visual_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
     // i-pending: previous keypress was `i`, awaiting text-object
     // (`iw`/`is`/`ip`). Text-objects explicitly set both anchor and
     // head, so no sync_anchor call is needed here.
-    if app.pending == "i" {
+    else if app.pending == "i" {
         app.pending.clear();
         match k.code {
             KeyCode::Char('w') => app.select_inner_word(),
@@ -342,7 +435,7 @@ fn visual_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
     }
     // g-pending: previous was `g`. Awaits `g` (page-top) or `y`
     // (yank-as-markdown). Anything else cancels.
-    if app.pending == "g" {
+    else if app.pending == "g" {
         app.pending.clear();
         match k.code {
             KeyCode::Char('g') => {
@@ -363,6 +456,16 @@ fn visual_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
     let mut moved_head = false;
 
     match k.code {
+        // Ctrl-C bails out of Visual mode AND quits the app — matches
+        // the user's terminal-native expectation. Without this, the
+        // un-ctrl `c` arm below catches `Char('c')` regardless of
+        // modifier (crossterm reports Ctrl-C as Char('c') with
+        // CONTROL after raw_mode), so Ctrl-C silently cycled the
+        // highlight color instead of quitting.
+        KeyCode::Char('c') if ctrl => {
+            app.exit_visual();
+            app.should_quit = true;
+        }
         KeyCode::Esc | KeyCode::Char('q') => app.exit_visual(),
         KeyCode::Char('y') | KeyCode::Enter => app.yank_selection(true),
         KeyCode::Char('Y') => app.yank_selection(false),
@@ -452,17 +555,27 @@ fn visual_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
 }
 
 fn toc_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = k.modifiers.contains(KeyModifiers::ALT);
     // Filter-edit mode: every printable goes into the buffer; Enter
     // commits the filter, Esc cancels.
     if app.toc_filter_editing {
         match k.code {
+            KeyCode::Char('c') if ctrl => {
+                app.toc_filter.clear();
+                app.toc_filter_finish();
+            }
+            KeyCode::Char('u') if ctrl => app.toc_filter.clear(),
             KeyCode::Esc => {
                 app.toc_filter.clear();
                 app.toc_filter_finish();
             }
             KeyCode::Enter => app.toc_filter_finish(),
             KeyCode::Backspace => app.toc_filter_pop(),
-            KeyCode::Char(c) => app.toc_filter_push(c),
+            // Skip Ctrl-/Alt-modified chars: pushing them as literals
+            // corrupts the filter (the user pressed e.g. Ctrl-W expecting
+            // a word delete, we'd insert `w`).
+            KeyCode::Char(c) if !ctrl && !alt => app.toc_filter_push(c),
             _ => {}
         }
         return Ok(());
@@ -483,7 +596,15 @@ fn toc_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
 }
 
 fn search_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = k.modifiers.contains(KeyModifiers::ALT);
     match k.code {
+        KeyCode::Char('c') if ctrl => {
+            app.mode = Mode::Normal;
+            app.cmd_buffer.clear();
+            app.status.clear();
+        }
+        KeyCode::Char('u') if ctrl => app.cmd_buffer.clear(),
         KeyCode::Esc => {
             app.mode = Mode::Normal;
             app.cmd_buffer.clear();
@@ -494,7 +615,7 @@ fn search_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
             app.mode = Mode::Normal;
             app.run_search(&buf);
         }
-        KeyCode::Char(c) => app.cmd_buffer.push(c),
+        KeyCode::Char(c) if !ctrl && !alt => app.cmd_buffer.push(c),
         KeyCode::Backspace => {
             app.cmd_buffer.pop();
         }

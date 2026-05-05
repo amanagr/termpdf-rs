@@ -108,29 +108,6 @@ struct CachedPayload {
     bytes: Vec<u8>,
 }
 
-/// Per-page selection-band overlay. Distinct from `PageEntry` because
-/// it tracks a different kind of image (transparent overlay vs full
-/// page bitmap) on a different schedule (changes per Visual-mode
-/// keystroke, vs once per layout/highlight edit).
-///
-/// The overlay is a same-dim bitmap as the page that's mostly
-/// transparent (alpha=0 outside the selection band, alpha=115 inside).
-/// Kitty composites it over the page placement at z=1, so a moving
-/// selection re-transmits ONLY this small mostly-transparent PNG (~5-15
-/// KB) instead of the full page bitmap (~170 KB).
-#[derive(Debug, Clone)]
-struct OverlayEntry {
-    image_id: u32,
-    /// Layout + revision + selection signature at last transmit. Three
-    /// fields together so a caret motion within a stable layout can
-    /// invalidate just the overlay without touching the page entry.
-    transmitted_layout: Option<LayoutKey>,
-    transmitted_revision: u64,
-    transmitted_sel_sig: u64,
-    pixel_w: u32,
-    pixel_h: u32,
-}
-
 pub struct KittyPageRegistry {
     is_tmux: bool,
     /// Base for per-page IDs. `id_for(page) = base + 1 + page_idx`.
@@ -138,11 +115,6 @@ pub struct KittyPageRegistry {
     /// for any fallback path that might still want to use it.
     id_base: u32,
     pages: HashMap<usize, PageEntry>,
-    /// Selection-band overlay images per page. Lives parallel to
-    /// `pages`; cleared when the page entry is evicted. ID range is
-    /// `id_base + OVERLAY_ID_OFFSET + page_idx` to keep page and
-    /// overlay IDs disjoint.
-    overlays: HashMap<usize, OverlayEntry>,
     /// LRU order — front = least recently used. `touch` moves a page
     /// to the back; eviction pops from the front. Entries here mirror
     /// keys in `pages`.
@@ -221,18 +193,12 @@ pub struct PlaceScratch {
     last_placed: std::collections::HashMap<usize, ratatui::layout::Rect>,
 }
 
-/// Distance between a page's image_id and its overlay's image_id. Big
-/// enough that no plausible PDF page count would collide with the
-/// overlay range. (u32 has 4G slots; we never come close.)
-const OVERLAY_ID_OFFSET: u32 = 1 << 20;
-
 impl KittyPageRegistry {
     pub fn new(is_tmux: bool, id_base: u32) -> Self {
         Self {
             is_tmux,
             id_base,
             pages: HashMap::new(),
-            overlays: HashMap::new(),
             lru: VecDeque::new(),
             pending_deletes: Vec::new(),
             place_scratch: PlaceScratch::default(),
@@ -254,7 +220,6 @@ impl KittyPageRegistry {
     #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.pages.clear();
-        self.overlays.clear();
         self.lru.clear();
         self.pending_deletes.clear();
     }
@@ -264,8 +229,7 @@ impl KittyPageRegistry {
     /// was evicted, then re-rendered + re-marked before the queued
     /// delete had ridden out) doesn't get clobbered by its own stale
     /// delete on the next ride-along. The cost is O(n) on the queued
-    /// vec, but `n <= MAX_CACHED_PAGES + a couple of overlays` so the
-    /// scan is trivial.
+    /// vec, but `n <= MAX_CACHED_PAGES` so the scan is trivial.
     fn drop_pending_delete(&mut self, image_id: u32) {
         self.pending_deletes.retain(|&id| id != image_id);
     }
@@ -320,12 +284,9 @@ impl KittyPageRegistry {
         // first; their image_ids — assigned `seed + page_idx` at
         // first reference — naturally cluster, so most evictions
         // collapse to one range escape instead of N per-id ones.
-        let mut freed_ids: Vec<u32> = Vec::with_capacity(victims.len() * 2);
+        let mut freed_ids: Vec<u32> = Vec::with_capacity(victims.len());
         for v in &victims {
             if let Some(entry) = self.pages.remove(v) {
-                freed_ids.push(entry.image_id);
-            }
-            if let Some(entry) = self.overlays.remove(v) {
                 freed_ids.push(entry.image_id);
             }
             // Drop the cached placement rect for evicted pages so
@@ -378,7 +339,20 @@ impl KittyPageRegistry {
     /// (`d=I,i=ID` and `d=R,x=LO,y=HI`); anything else is silently
     /// dropped (defensive — should never happen in practice).
     pub fn put_back_pending_deletes(&mut self, s: String) {
-        let ids = parse_pending_delete_blob(&s);
+        let mut ids = parse_pending_delete_blob(&s);
+        if ids.is_empty() {
+            return;
+        }
+        // Filter out ids that have since been re-allocated to a now-
+        // resident page. Without this, a page evicted between
+        // `take_pending_deletes` and `put_back_pending_deletes` whose
+        // image_id was then reused by a newly-loaded page would have
+        // its delete re-queued — and the next ride-along would emit
+        // `d=I,i=ID` against a LIVE image, violating the I4 invariant
+        // that delete must precede transmit for a given id.
+        let live_ids: std::collections::HashSet<u32> =
+            self.pages.values().map(|e| e.image_id).collect();
+        ids.retain(|id| !live_ids.contains(id));
         if ids.is_empty() {
             return;
         }
@@ -642,6 +616,13 @@ impl KittyPageRegistry {
                 && c.pixel_w == pixel_w
                 && c.pixel_h == pixel_h
             {
+                // Touch even on cache-hit. Without this, an idle-warm
+                // page that gets `pre_encode`d every prefetch tick sits
+                // at LRU front *only on the first encode* — every
+                // subsequent cache-hit short-circuits before the touch
+                // below, so the page slowly migrates to the LRU tail
+                // and is first to evict despite being actively warm.
+                self.touch(page_idx);
                 return;
             }
         }
@@ -667,62 +648,6 @@ impl KittyPageRegistry {
     /// Image ID assigned to this page (regardless of transmit state).
     pub fn image_id(&self, page_idx: usize) -> u32 {
         self.id_for(page_idx)
-    }
-
-    /// Image ID for this page's selection-band overlay. Disjoint from
-    /// the page ID range so the terminal stores them as independent
-    /// images.
-    pub fn overlay_image_id(&self, page_idx: usize) -> u32 {
-        self.id_base
-            .wrapping_add(OVERLAY_ID_OFFSET)
-            .wrapping_add(page_idx as u32)
-    }
-
-    /// Update overlay registry state to record that the just-built
-    /// transmit has been (or is about to be) flushed to the terminal.
-    pub fn overlay_mark_transmitted(
-        &mut self,
-        page_idx: usize,
-        layout: LayoutKey,
-        revision: u64,
-        sel_sig: u64,
-        pixel_w: u32,
-        pixel_h: u32,
-    ) {
-        let id = self.overlay_image_id(page_idx);
-        let entry = self.overlays.entry(page_idx).or_insert(OverlayEntry {
-            image_id: id,
-            transmitted_layout: None,
-            transmitted_revision: 0,
-            transmitted_sel_sig: 0,
-            pixel_w,
-            pixel_h,
-        });
-        entry.image_id = id;
-        entry.transmitted_layout = Some(layout);
-        entry.transmitted_revision = revision;
-        entry.transmitted_sel_sig = sel_sig;
-        entry.pixel_w = pixel_w;
-        entry.pixel_h = pixel_h;
-    }
-
-    /// Drop the overlay entry for `page_idx` and queue an `a=d` for the
-    /// terminal so it frees the corresponding image. Called when the
-    /// selection moves off this page or is cleared.
-    pub fn overlay_drop(&mut self, page_idx: usize) {
-        if let Some(entry) = self.overlays.remove(&page_idx) {
-            self.pending_deletes.push(entry.image_id);
-        }
-    }
-
-    /// True when the terminal is currently holding a placement of this
-    /// page's overlay. Used by the renderer to decide whether to emit a
-    /// `a=d,d=I,i=ID` for a stale overlay even when there's no fresh
-    /// selection on this page.
-    pub fn overlay_is_present(&self, page_idx: usize) -> bool {
-        self.overlays
-            .get(&page_idx)
-            .is_some_and(|e| e.transmitted_layout.is_some())
     }
 }
 
@@ -768,11 +693,8 @@ fn encode_payload_opaque(bitmap: &RgbaImage) -> (u8, u8, Vec<u8>) {
 }
 
 /// Strip alpha, then zlib-deflate the RGB bytes. Returns the `o=z`
-/// payload for kitty `f=24,o=z` transmit. Uses `flate2` at the default
-/// compression level (6) — slower than `Fast` would be but yields
-/// noticeably smaller output for PDF page content (text, large flat
-/// regions); the wire savings dominate the encode delta on a typical
-/// SSH or even local terminal session.
+/// payload for kitty `f=24,o=z` transmit. Uses `flate2::Compression::fast()`
+/// (zlib level 1) — see body comment for why level 1 is the sweet spot.
 fn encode_rgb_zlib(bitmap: &RgbaImage) -> std::io::Result<Vec<u8>> {
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
@@ -846,6 +768,18 @@ fn build_transmit_string(
     is_tmux: bool,
 ) -> String {
     let (start, escape, end) = tmux_wrap(is_tmux);
+
+    // Empty payloads — possible if a 0×0 bitmap arrived from a layout
+    // glitch — would skip the chunk loop entirely (no transmit on the
+    // wire) but still emit the `a=p,U=1,i={id}` virtual-placement
+    // anchor below. Ghostty would then log "missing image for virtual
+    // placement, ignoring image_id={id}" for every placeholder cell
+    // pointing at the never-transmitted id. Bail out before the wire
+    // sees anything; the caller's placement loop will paint nothing
+    // for this page (handled by the loading-indicator pass).
+    if payload.is_empty() {
+        return String::new();
+    }
 
     // Chunk size matches kitty's own canonical reference
     // (kittens/tools/tui/graphics/command.go: const chunk_size = 128 * 1024).
@@ -975,17 +909,41 @@ pub fn place_page(
 ) -> u16 {
     let _ = page_idx; // reserved for future per-page debug; placement is purely id-driven
 
-    let max_src_rows = (pixel_h / cell_h_px.max(1)) as u16;
-    let max_src_cols = (pixel_w / cell_w_px.max(1)) as u16;
+    // Saturating u32 → u16: at extreme zoom (cell_h_px=4, page=300_000)
+    // the quotient can exceed 65535 and the silent wrap previously
+    // produced a small `max_src_rows`, which made `height_cells = 0`
+    // and the early-return painted a blank page instead of showing
+    // what fits in the viewport.
+    let max_src_rows = (pixel_h / cell_h_px.max(1)).min(u16::MAX as u32) as u16;
+    let max_src_cols = (pixel_w / cell_w_px.max(1)).min(u16::MAX as u32) as u16;
     let max_dst_rows_in_area = area.height.saturating_sub(dst_top_cell);
+    // Diacritic-table addressability cap. The kitty unicode-placeholder
+    // protocol has a fixed 297-entry row/column diacritic table. A
+    // src cell index > 296 must be quantised somewhere; without
+    // guardrails, `diacritic(n)` silently returns DIACRITICS[0]
+    // (= row/col 0), so the BOTTOM rows of a tall page render as the
+    // TOP rows. Reachable at small cell heights + max zoom: e.g.
+    // 4096 px / 12 px cell = 341 cells, exceeds 296. Clamp the source
+    // origin so it never references a diacritic past the table; the
+    // bottom/right of the image is then unreachable but the visible
+    // window stays correct.
+    let src_top_cell = src_top_cell.min((MAX_COLS as u16).saturating_sub(1));
+    let src_left_cell = src_left_cell.min((MAX_COLS as u16).saturating_sub(1));
     // Source rows we have; destination rows we have; whichever is fewer.
+    // Bound by MAX_COLS so img_row inside the loop stays addressable
+    // (img_row = src_top_cell + dy, dy < height_cells).
     let height_cells = dst_height_cells
         .min(max_dst_rows_in_area)
-        .min(max_src_rows.saturating_sub(src_top_cell));
+        .min(max_src_rows.saturating_sub(src_top_cell))
+        .min((MAX_COLS as u16).saturating_sub(src_top_cell));
     // Clamp width to the image columns we actually have past src_left_cell
     // — the user may have scrolled scroll_x to the rightmost edge where
-    // fewer image cols remain than the placement area can show.
-    let width_cells = width_cells.min(max_src_cols.saturating_sub(src_left_cell));
+    // fewer image cols remain than the placement area can show. Also
+    // bounded by the diacritic table so the auto-incremented per-cell
+    // column references stay addressable.
+    let width_cells = width_cells
+        .min(max_src_cols.saturating_sub(src_left_cell))
+        .min((MAX_COLS as u16).saturating_sub(src_left_cell));
     if height_cells == 0 || width_cells == 0 {
         if crate::debug_log::enabled() {
             crate::debug_log::write(
@@ -1027,6 +985,25 @@ pub fn place_page(
     // at `new_rect`.
     if let Some(old_rect) = scratch.last_placed.get(&page_idx).copied() {
         if old_rect != new_rect {
+            // Snapshot OTHER pages' rects in `last_placed` BEFORE touching
+            // any cells. Without this, a cell row at pageA.new.bottom that
+            // overlaps pageB.old.top gets wiped by pageB's cleanup *after*
+            // pageA's placement wrote a placeholder there — pageA's bottom
+            // row blanks during cell-step scrolls. Pages process in
+            // ascending page-idx order, so once pageA has written its NEW
+            // rect into last_placed (line below), pageB's cleanup sees it
+            // and skips. The own-page entry is still the OLD rect at this
+            // point — exclude it explicitly so we don't mistakenly skip
+            // (old - new) cells that genuinely need wiping.
+            let occupied = |x: u16, y: u16| -> bool {
+                scratch.last_placed.iter().any(|(&p, &r)| {
+                    p != page_idx
+                        && x >= r.left()
+                        && x < r.right()
+                        && y >= r.top()
+                        && y < r.bottom()
+                })
+            };
             for y in old_rect.top()..old_rect.bottom() {
                 for x in old_rect.left()..old_rect.right() {
                     if x >= new_rect.left()
@@ -1034,6 +1011,9 @@ pub fn place_page(
                         && y >= new_rect.top()
                         && y < new_rect.bottom()
                     {
+                        continue;
+                    }
+                    if occupied(x, y) {
                         continue;
                     }
                     if let Some(cell) = buf.cell_mut((x, y)) {
@@ -1050,9 +1030,6 @@ pub fn place_page(
     // (pruned by evict_to_budget) so the preservation survives any
     // number of consecutive cell-clipped frames.
     scratch.last_placed.insert(page_idx, new_rect);
-    if width_cells as u32 > MAX_COLS {
-        // Source col diacritic capacity exceeded; clamp silently.
-    }
 
     // Encode image ID in foreground color (24-bit). The high byte goes
     // into a third diacritic on each placeholder.
@@ -1397,7 +1374,7 @@ fn parse_pending_delete_blob(blob: &str) -> Vec<u32> {
     let bytes = blob.as_bytes();
     let mut ids = Vec::new();
     let mut i = 0;
-    while i + 6 < bytes.len() {
+    while i + 6 <= bytes.len() {
         if &bytes[i..i + 6] == b"d=I,i=" {
             let start = i + 6;
             let mut end = start;
@@ -1417,7 +1394,7 @@ fn parse_pending_delete_blob(blob: &str) -> Vec<u32> {
             while lo_end < bytes.len() && bytes[lo_end].is_ascii_digit() {
                 lo_end += 1;
             }
-            if lo_end + 3 < bytes.len() && &bytes[lo_end..lo_end + 3] == b",y=" {
+            if lo_end + 3 <= bytes.len() && &bytes[lo_end..lo_end + 3] == b",y=" {
                 let hi_start = lo_end + 3;
                 let mut hi_end = hi_start;
                 while hi_end < bytes.len() && bytes[hi_end].is_ascii_digit() {
@@ -2155,51 +2132,6 @@ mod tests {
         }
     }
 
-    /// Overlay image IDs MUST stay disjoint from page image IDs so the
-    /// terminal stores them as independent images (otherwise re-uploading
-    /// the page would clobber the overlay or vice versa). The offset is
-    /// large enough that no plausible PDF page count collides with the
-    /// overlay range.
-    #[test]
-    fn overlay_image_id_disjoint_from_page_id() {
-        let r = KittyPageRegistry::new(false, 1000);
-        for page in [0usize, 1, 100, 1024, 9999] {
-            let p = r.image_id(page);
-            let o = r.overlay_image_id(page);
-            assert_ne!(p, o, "page {page}: id collision page={p} overlay={o}");
-            // Distance is at least the offset constant; means even a
-            // 100k-page PDF won't have its last page's id collide with
-            // page 0's overlay id.
-            assert!(
-                o > p + 1000,
-                "page {page}: overlay id should be far from page id"
-            );
-        }
-    }
-
-    /// Dropping an overlay queues a kitty `a=d,d=I,i=ID` so the
-    /// terminal frees its decoded bitmap. Without this, scrolling a
-    /// long doc with selections would leak overlay bitmaps in the
-    /// terminal-side cache.
-    #[test]
-    fn overlay_drop_queues_terminal_delete() {
-        let mut r = KittyPageRegistry::new(false, 1000);
-        let layout = LayoutKey {
-            fit_width_px: 64,
-            dark: false,
-        };
-        r.overlay_mark_transmitted(0, layout, 0, 1, 16, 16);
-
-        r.overlay_drop(0);
-        let deletes = r
-            .take_pending_deletes()
-            .expect("overlay_drop should queue a delete");
-        assert!(
-            deletes.contains("_Ga=d,d=I,i="),
-            "expected delete APC, got {deletes:?}"
-        );
-    }
-
     /// queue_deletes must collapse contiguous-id runs into one
     /// `d=R` and leave singletons as `d=I`. The mixed case (one
     /// range + one isolated id) is the realistic situation when
@@ -2312,41 +2244,6 @@ mod tests {
         assert!(
             !r.pending_deletes.contains(&evicted_id),
             "I4: resurrected image_id must be removed from pending_deletes"
-        );
-    }
-
-    /// Evicting a page that owns both a page image AND an overlay
-    /// image must queue deletes for BOTH ids — otherwise an overlay
-    /// bitmap could outlive its page on the terminal side and leak.
-    #[test]
-    fn evict_drops_overlay_alongside_page() {
-        let mut r = KittyPageRegistry::new(false, 1000);
-        let layout = LayoutKey {
-            fit_width_px: 64,
-            dark: false,
-        };
-        let bm = RgbaImage::new(16, 16);
-        // Fill above cap; mark each page with an overlay too.
-        for i in 0..(MAX_CACHED_PAGES + 4) {
-            r.mark_transmitted(i, layout, 0, 16, 16);
-            r.overlay_mark_transmitted(i, layout, 0, 1, 16, 16);
-            r.pre_encode(&bm, i, layout, 0);
-        }
-        r.evict_to_budget(&[]);
-        let deletes = r.take_pending_deletes().expect("evictions queue deletes");
-        // 4 evicted pages → 8 freed image_ids: page IDs (4 contiguous
-        // around id_base+1) and overlay IDs (4 contiguous starting at
-        // id_base+OVERLAY_ID_OFFSET). With d=R coalescing this is two
-        // separate ranges (page band and overlay band are far apart).
-        assert_eq!(
-            deletes.matches("_Ga=d,d=R,").count(),
-            2,
-            "page-id band and overlay-id band → 2 ranges; got {deletes:?}"
-        );
-        assert_eq!(
-            deletes.matches("_Ga=d,d=I,").count(),
-            0,
-            "no per-id escapes when all evictions are contiguous"
         );
     }
 

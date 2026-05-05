@@ -113,6 +113,15 @@ pub struct ComposeKey {
     pub scroll_x_milli: u32,
     pub highlight_revision: u64,
     pub selection_sig: u64,
+    /// Search-results revision (bumped by `n`/`N`/`/`-edit/clear).
+    /// Without this field the canvas-mode tier would only invalidate
+    /// via the explicit `invalidate_compose()` calls in `advance_search`
+    /// and friends — load-bearing. Any future code path that mutates
+    /// `app.search` directly would silently leave the canvas tier
+    /// painting the prior current-hit outline. Per-page kitty
+    /// revision (`compute_page_revision`) already mixes search; this
+    /// brings the compose tier in line.
+    pub search_revision: u64,
 }
 
 pub struct App<'doc> {
@@ -471,13 +480,22 @@ impl<'doc> App<'doc> {
             highlights.items.iter().map(|h| h.page).collect();
         // Seed the group-id counter past any existing id so a reopen
         // of a document we previously wrote can't reuse a value.
+        // `checked_add` here so a hostile/corrupted PDF carrying a
+        // `group_id == u64::MAX` in its `AnnotMeta` doesn't panic on
+        // open. In that pathological case we fall back to 1, NOT 0:
+        // if the original document also has a group_id == 0
+        // highlight (likely, since 0 is the first id assigned in any
+        // session that's ever yanked), the next-yank merge of new=0
+        // and old=0 would let a single delete-confirm sweep both
+        // groups in one keystroke. Starting fresh ids at 1 leaves
+        // the existing 0-group alone.
         let next_highlight_group_id = highlights
             .items
             .iter()
             .filter_map(|h| h.group_id)
             .max()
-            .map(|m| m + 1)
-            .unwrap_or(0);
+            .and_then(|m| m.checked_add(1))
+            .unwrap_or(1);
         // Empty layout — first `ensure_image` call builds a real one
         // once the viewport size is known.
         let layout = PageLayout::build(&[], 0, 0);
@@ -499,11 +517,21 @@ impl<'doc> App<'doc> {
         // App::is_tmux field. (Previously did std::env::var("TMUX") twice
         // — harmless at init, but the duplication invited drift.)
         let is_tmux = std::env::var("TMUX").is_ok();
+        // Mint the stable id once and reuse for BOTH the registry's
+        // id_base AND the standalone `kitty_image_id` (canvas-mode
+        // path). Each `stable_kitty_id()` call mixes
+        // `SystemTime::now()` so calling it twice would produce two
+        // different ids — and a future code change that mixes the
+        // canvas and registry paths could collide on the registry's
+        // page-id range. Today they're mutually exclusive but the
+        // contract `stable_kitty_id` claims is "process-stable id";
+        // honour it.
+        let kitty_id_seed = stable_kitty_id();
         let kitty_pages = matches!(
             picker.protocol_type(),
             ratatui_image::picker::ProtocolType::Kitty
         )
-        .then(|| crate::kitty_pages::KittyPageRegistry::new(is_tmux, stable_kitty_id()));
+        .then(|| crate::kitty_pages::KittyPageRegistry::new(is_tmux, kitty_id_seed));
         let app = Self {
             document,
             path: path.to_path_buf(),
@@ -529,7 +557,7 @@ impl<'doc> App<'doc> {
             text_cache: TextCache::default(),
             mouse_dragging: false,
             picker,
-            kitty_image_id: stable_kitty_id(),
+            kitty_image_id: kitty_id_seed,
             is_tmux,
             page_cache: HashMap::new(),
             pages_at_fast_quality: std::collections::HashSet::new(),
@@ -640,6 +668,24 @@ impl<'doc> App<'doc> {
         self.page_cache.clear();
         self.overlay_cache.clear();
         self.highlights_baked_cache.clear();
+        // Auxiliary state HashSets and the LRU vec must be reset
+        // alongside the bitmap caches. Otherwise a page that was
+        // Fast-quality at the OLD layout still sits in
+        // `pages_at_fast_quality`; the next idle tick's
+        // `upgrade_one_visible_to_sharp` re-renders it Sharp at the
+        // NEW layout while the disk cache could have served it for
+        // free. The LRU vec also accumulates stale page indices that
+        // walk through `enforce_byte_budget`'s loop on every byte
+        // pass until they self-clean.
+        self.page_cache_lru.clear();
+        self.pages_at_fast_quality.clear();
+        // `pages_in_flight` keys on (page, fit_width_px, dark); after
+        // a layout change every entry's `fit_width_px` is stale, and
+        // the worker (when implemented) would still respond with the
+        // OLD-width bitmap that the renderer now ignores. Cheaper to
+        // drop the slot and let `request_prefetch` re-issue at the
+        // new layout.
+        self.pages_in_flight.clear();
         // A page can OOM at huge zoom but render fine after the user
         // zooms back out — don't keep it permanently blacklisted.
         self.failed_pages.clear();
@@ -660,6 +706,17 @@ impl<'doc> App<'doc> {
         self.highlights_baked_cache
             .retain(|&k, _| k >= lo && k < hi);
         self.page_cache_lru.retain(|&k| k >= lo && k < hi);
+        // Auxiliary state HashSets that gate render-quality logic.
+        // Without pruning these alongside `page_cache`, a page can be
+        // evicted from `page_cache` while still flagged as Fast or
+        // in-flight — `upgrade_one_visible_to_sharp` then re-renders
+        // a page no longer in cache, and `request_prefetch`'s
+        // `pages_in_flight.contains` gate refuses to re-prefetch a
+        // page whose render-worker request was lost mid-flight.
+        self.pages_at_fast_quality
+            .retain(|&k| k >= lo && k < hi);
+        self.pages_in_flight
+            .retain(|key| key.0 >= lo && key.0 < hi);
         // The text-layout cache holds char bbox + line index per page;
         // a few hundred KB per page in dense documents. Drop any entry
         // outside the visible window unless it's part of the active
@@ -676,19 +733,31 @@ impl<'doc> App<'doc> {
     }
 
     /// Read the page's composed bitmap (highlights + search hits +
-    /// optional selection band). When the active selection touches
-    /// this page, an `overlay_cache` entry exists with the selection
-    /// baked on top; otherwise the `highlights_baked_cache` bitmap is
-    /// already exactly what we'd render, so we return it directly
-    /// without paying for a per-page clone in `ensure_overlay`.
-    /// Returns `None` if neither cache has the page.
+    /// optional selection band). Source ladder:
+    ///   1. `overlay_cache` — populated when the active selection
+    ///      touches this page. Includes saved highlights, search,
+    ///      AND the selection band.
+    ///   2. `highlights_baked_cache` — populated when the page has
+    ///      saved highlights or search hits but no live selection.
+    ///   3. `page_cache` (fallback) — the raw page bitmap when
+    ///      neither overlay tier has anything to add. The kitty
+    ///      path has its own fallback to page_cache (see
+    ///      `draw_pages_kitty`); the canvas path goes through this
+    ///      function and previously returned None for highlight-and-
+    ///      search-free pages, leaving them painted as the canvas
+    ///      background. Without this fallback a sixel/iterm/halfblock
+    ///      session reading a doc with no highlights would render
+    ///      every page blank — and `try_selection_only_repaint`
+    ///      would leave the prior frame's stale selection band
+    ///      ghosting on the canvas.
     pub fn composed_image(&self, page_idx: usize) -> Option<&RgbaImage> {
         if let Some((img, _)) = self.overlay_cache.get(&page_idx) {
             return Some(img);
         }
-        self.highlights_baked_cache
-            .get(&page_idx)
-            .map(|(img, _)| img)
+        if let Some((img, _)) = self.highlights_baked_cache.get(&page_idx) {
+            return Some(img);
+        }
+        self.page_cache.get(&page_idx).and_then(|d| d.as_rgba8())
     }
 
     /// Mark a page as the most-recently-used. Called every time
@@ -776,6 +845,20 @@ impl<'doc> App<'doc> {
         // retained item.
         let evict_set: std::collections::HashSet<usize> = to_evict.into_iter().collect();
         self.page_cache_lru.retain(|p| !evict_set.contains(p));
+        // Mirror the auxiliary-state pruning that `evict_far_pages`
+        // does: a page evicted from `page_cache` here must also leave
+        // `pages_at_fast_quality` (else the idle-upgrade loop tries to
+        // re-render a no-longer-cached page) and `pages_in_flight`
+        // (else `request_prefetch`'s contains-gate refuses to re-issue
+        // a render request whose cache entry was just freed). text_cache
+        // isn't byte-budget-pinned but the same staleness applies — drop
+        // entries for pages whose bitmap was just evicted (selection-pin
+        // pages are protected by the layout-visible budget caller anyway).
+        self.pages_at_fast_quality
+            .retain(|k| !evict_set.contains(k));
+        self.pages_in_flight
+            .retain(|key| !evict_set.contains(&key.0));
+        self.text_cache.retain(|p| !evict_set.contains(&p));
     }
 
     /// Pages worth speculatively rendering ahead of the current
@@ -1127,7 +1210,17 @@ impl<'doc> App<'doc> {
     /// scroll position auto-adjusts to keep the same logical reading
     /// position (see `ensure_layout`).
     pub fn zoom_by(&mut self, factor: f32) {
+        // Reject NaN/Inf inputs — `f32::clamp(NaN, ..)` returns NaN
+        // (not the bound), so a NaN factor would silently poison
+        // `self.zoom` and propagate through every fit_width and
+        // src/dst pixel calculation forever after.
+        if !factor.is_finite() {
+            return;
+        }
         let new = (self.zoom * factor).clamp(0.25, 8.0);
+        if !new.is_finite() {
+            return;
+        }
         if (new - self.zoom).abs() < f32::EPSILON {
             return;
         }
@@ -1187,12 +1280,17 @@ impl<'doc> App<'doc> {
     /// mode entry so that e.g. `5g:` (numeric prefix → Command) doesn't
     /// leave `5g` sitting in `pending` to fire later, and `m:` (mark-
     /// set → Command) doesn't silently consume the next post-Esc
-    /// keystroke as the mark name.
+    /// keystroke as the mark name. Also exits any active link-hint or
+    /// TOC-filter modal — those are independent navigation modes that
+    /// should not survive a transition into Visual / mouse drag / etc.
     pub fn clear_chord_state(&mut self) {
         self.pending.clear();
         self.awaiting_mark_set = false;
         self.awaiting_mark_jump = false;
         self.awaiting_highlight_delete_confirm = false;
+        self.link_hint_mode = false;
+        self.hint_filter.clear();
+        self.toc_filter_editing = false;
     }
 
     pub fn enter_visual(&mut self) {
@@ -1213,7 +1311,11 @@ impl<'doc> App<'doc> {
         let pt = match self.text_cache.get_or_load(&self.document, page, &metrics) {
             Ok(pt) => pt,
             Err(e) => {
-                self.status = format!("page {}: cannot read text ({e:#})", page + 1);
+                // pdfium's Display impl can reflect bytes from the
+                // document — sanitise before letting them hit the
+                // status line / wire.
+                let safe = crate::term_safe::safe_for_stderr(&format!("{e:#}"));
+                self.status = format!("page {}: cannot read text ({safe})", page + 1);
                 return;
             }
         };
@@ -1363,12 +1465,31 @@ impl<'doc> App<'doc> {
             let Some(pt) = self.text_cache.get(page_idx) else {
                 continue;
             };
-            let start = if page_idx == lo.page { lo.idx } else { 0 };
-            let end = if page_idx == hi.page {
+            let mut start = if page_idx == lo.page { lo.idx } else { 0 };
+            let mut end = if page_idx == hi.page {
                 hi.idx
             } else {
                 pt.chars.len().saturating_sub(1)
             };
+            // Linewise mode: widen `start`/`end` to whole lines —
+            // mirroring `bake_selection_into_page`'s widen logic
+            // (ui.rs near `pt.line_of(start)`). Without this, the
+            // user sees a full-line highlight band on screen but
+            // the saved rect and the clipboard text only cover the
+            // original char range — confusing, and a real-today
+            // bug in `V`-mode yanks.
+            if matches!(sel.mode, SelMode::Linewise) {
+                if let Some(line) = pt.line_of(start) {
+                    if let Some(s) = pt.line_start(line) {
+                        start = s;
+                    }
+                }
+                if let Some(line) = pt.line_of(end) {
+                    if let Some(e) = pt.line_end(line) {
+                        end = e;
+                    }
+                }
+            }
             // Extract first; only emit a page separator if this page
             // actually contributed text. Otherwise an image-only page
             // mid-selection would leave dangling `\n\n\n\n` runs, and
@@ -1400,6 +1521,7 @@ impl<'doc> App<'doc> {
             // process; persisted to AnnotMeta so identity survives
             // save+reopen.
             let group_id = self.alloc_highlight_group_id();
+            let mut added_any = false;
             for (page_idx, rects) in per_page_rects {
                 for r in rects {
                     if r.w < 1e-4 || r.h < 1e-4 {
@@ -1415,18 +1537,47 @@ impl<'doc> App<'doc> {
                         note: None,
                         group_id: Some(group_id),
                     });
+                    added_any = true;
                 }
             }
-            self.highlight_revision += 1;
-            self.invalidate_compose();
+            // Bump the revision and invalidate compose only if we
+            // actually added something. If every page in the selection
+            // had no rects (text not cached) or every rect was below
+            // the 1e-4 floor, bumping busts every overlay/baked entry
+            // for nothing — major churn on a heavily-highlighted doc.
+            if added_any {
+                self.highlight_revision += 1;
+                self.invalidate_compose();
+            }
         }
 
+        // Distinguish "actually-copied" from "tried-and-both-paths-
+        // failed". The CopyOutcome counts bytes against the payload
+        // length whether or not either the OSC 52 path or the native
+        // binary actually succeeded. Without this check, a session
+        // that cannot reach `/dev/tty` AND has no clipboard binary
+        // (rare but real for some headless containers) would still
+        // show "copied N bytes" even though pasting later yields
+        // nothing.
+        let any_clip_path = copy_outcome
+            .as_ref()
+            .map(|o| o.osc52_written || o.native_written)
+            .unwrap_or(false);
         self.status = match (save, copy_outcome) {
+            (true, Some(o)) if !any_clip_path => {
+                format!(
+                    "highlight saved (clipboard unavailable; {} bytes)",
+                    o.bytes
+                )
+            }
             (true, Some(o)) if o.truncated => {
                 format!("highlight saved + copied {} bytes (truncated)", o.bytes)
             }
             (true, Some(o)) => format!("highlight saved + copied {} bytes", o.bytes),
             (true, None) => "highlight saved (no extractable text)".into(),
+            (false, Some(o)) if !any_clip_path => {
+                format!("clipboard unavailable ({} bytes not copied)", o.bytes)
+            }
             (false, Some(o)) if o.truncated => {
                 format!("copied {} bytes (truncated)", o.bytes)
             }
@@ -1502,7 +1653,8 @@ impl<'doc> App<'doc> {
                 self.invalidate_compose();
             }
             Err(e) => {
-                self.status = format!("search error: {e:#}");
+                let safe = crate::term_safe::safe_for_stderr(&format!("{e:#}"));
+                self.status = format!("search error: {safe}");
                 self.invalidate_compose();
             }
         }
@@ -1637,10 +1789,19 @@ impl<'doc> App<'doc> {
                 //      "--version" would do something unexpected
                 //      instead of erroring. The `--` ensures the URL
                 //      is interpreted as a positional arg.
+                // The URL is attacker-controlled (PDF link annotation
+                // payload). ratatui filters C0/C1 escapes at render
+                // time, but not bidi marks, line/paragraph
+                // separators, or isolate controls — those can flip
+                // the rendering of the rest of the status line. Run
+                // the URL through `safe_for_stderr` everywhere it's
+                // composed into a status string.
+                let url_safe =
+                    crate::term_safe::safe_for_stderr(&truncate_for_status(&url, 256));
                 if !is_safe_external_url(&url) {
                     self.status = format!(
                         "blocked link with unsafe scheme: {}",
-                        truncate_for_status(&url, 80)
+                        truncate_for_status(&url_safe, 80)
                     );
                 } else {
                     let r = std::process::Command::new("xdg-open")
@@ -1648,8 +1809,11 @@ impl<'doc> App<'doc> {
                         .arg(&url)
                         .spawn();
                     match r {
-                        Ok(_) => self.status = format!("opened: {url}"),
-                        Err(e) => self.status = format!("xdg-open failed for {url}: {e}"),
+                        Ok(_) => self.status = format!("opened: {url_safe}"),
+                        Err(e) => {
+                            let safe = crate::term_safe::safe_for_stderr(&format!("{e}"));
+                            self.status = format!("xdg-open failed for {url_safe}: {safe}");
+                        }
                     }
                 }
             }
@@ -1703,7 +1867,14 @@ impl<'doc> App<'doc> {
             return;
         };
         let page_y = self.layout.page_y(hit.page);
-        let page_h = self.layout.page_h(hit.page) as i64;
+        // `.max(1)` guards against a zero-height page (DRM-stripped or
+        // pdfium parse error returning empty rect). Without it
+        // `hit_y_in_page = 0` and the scroll target is `page_y - vh/3`
+        // — landing the user a third of a viewport above the broken
+        // page, on the page above, which is confusing. Other call
+        // sites (`scroll_to_head_if_offscreen`, `first_visible_char_idx`,
+        // `ensure_layout`, `persist_session`) already use this pattern.
+        let page_h = self.layout.page_h(hit.page).max(1) as i64;
         let hit_y_in_page = (hit.rect.y * page_h as f32) as i64;
         let target = page_y + hit_y_in_page - (self.viewport_px.1 as i64 / 3);
         self.scroll_y_px = self.layout.clamp_scroll(target.max(0), self.viewport_px.1);
@@ -1862,22 +2033,49 @@ impl<'doc> App<'doc> {
             let Some(pt) = self.text_cache.get(sel.head.page) else {
                 return;
             };
+            // Bail before computing line-clamps if `pt.lines` is
+            // empty — `clamp(0, -1)` panics with "min > max" when
+            // `pt.lines.len() == 0`. line_of returning Some implies
+            // non-empty, but a stale snapshot from a re-loaded text
+            // layout could violate that.
+            if pt.lines.is_empty() {
+                return;
+            }
             let cur_line = match pt.line_of(sel.head.idx) {
                 Some(l) => l as i32,
                 None => return,
             };
-            let new_line = (cur_line + delta).clamp(0, pt.lines.len() as i32 - 1) as usize;
+            let max_line = pt.lines.len().saturating_sub(1) as i32;
+            let new_line = (cur_line + delta).clamp(0, max_line) as usize;
             // Pick the char on the new line whose origin_x is nearest
             // to the current caret's origin_x. The `[start_idx, end_idx]`
             // span is in *stream* order — pdfium can interleave chars
             // from neighbouring lines (footnote/marginalia/multi-column
             // pages) — so filter by `c.line == new_line` or the caret
             // can teleport to a different visual line.
-            let target_x = pt.chars[sel.head.idx].origin_x;
-            let span = &pt.lines[new_line];
-            let mut best = (span.start_idx, f32::MAX);
-            for i in span.start_idx..=span.end_idx {
-                let c = &pt.chars[i];
+            // Use `get` instead of direct index — `sel.head.idx` is
+            // persisted across page re-loads (LRU eviction → reload
+            // of the same page may produce a shorter `chars` if the
+            // pdfium build differs), so the index can outlive its
+            // backing data.
+            let target_x = match pt.chars.get(sel.head.idx) {
+                Some(c) => c.origin_x,
+                None => return,
+            };
+            // Use `lines.get(new_line)` for the same reason as
+            // `pt.chars.get(sel.head.idx)` above — a re-loaded page can
+            // yield a shorter `lines`/`chars` than the cached spans
+            // claim. `i` is allowed to drift past `chars.len()` if a
+            // line span over-counts; bail to defensive `chars.get(i)`
+            // rather than direct index.
+            let Some(span) = pt.lines.get(new_line) else {
+                return;
+            };
+            let span_start = span.start_idx;
+            let span_end = span.end_idx;
+            let mut best = (span_start, f32::MAX);
+            for i in span_start..=span_end {
+                let Some(c) = pt.chars.get(i) else { break };
                 if c.line != new_line {
                     continue;
                 }
@@ -1886,7 +2084,16 @@ impl<'doc> App<'doc> {
                     best = (i, dx);
                 }
             }
-            sel.head.idx = best.0;
+            // Only commit if at least one matching-line char was found.
+            // Without this guard, a multi-column / interleaved-stream
+            // page where no `c.line == new_line` falls inside the span
+            // leaves `best.1 == f32::MAX` and `best.0 == span_start` —
+            // and `chars[span_start].line` may not equal `new_line`,
+            // producing the exact teleport-to-wrong-line glitch this
+            // function is supposed to prevent.
+            if best.1 != f32::MAX {
+                sel.head.idx = best.0;
+            }
         }
     }
 
@@ -2000,6 +2207,10 @@ impl<'doc> App<'doc> {
     }
 
     /// `iw` — set selection to the word containing the head.
+    /// Clears placement mode: the user explicitly issued an
+    /// extending operator, so the next caret motion should grow the
+    /// selection rather than collapse anchor=head as it would in
+    /// placement mode (`sync_anchor_to_head_if_placing`).
     pub fn select_inner_word(&mut self) {
         if let Some(sel) = self.text_selection.as_mut() {
             if let Some(pt) = self.text_cache.get(sel.head.page) {
@@ -2010,9 +2221,11 @@ impl<'doc> App<'doc> {
                 }
             }
         }
+        self.selection_placement = false;
     }
 
-    /// `is` — sentence around the head.
+    /// `is` — sentence around the head. See `select_inner_word` for
+    /// why this clears placement mode.
     pub fn select_inner_sentence(&mut self) {
         if let Some(sel) = self.text_selection.as_mut() {
             if let Some(pt) = self.text_cache.get(sel.head.page) {
@@ -2023,9 +2236,11 @@ impl<'doc> App<'doc> {
                 }
             }
         }
+        self.selection_placement = false;
     }
 
-    /// `ip` — paragraph around the head.
+    /// `ip` — paragraph around the head. See `select_inner_word` for
+    /// why this clears placement mode.
     pub fn select_inner_paragraph(&mut self) {
         if let Some(sel) = self.text_selection.as_mut() {
             if let Some(pt) = self.text_cache.get(sel.head.page) {
@@ -2036,35 +2251,51 @@ impl<'doc> App<'doc> {
                 }
             }
         }
+        self.selection_placement = false;
     }
 
-    /// `V` — switch the active selection to linewise. The anchor and
-    /// head still point at chars; the renderer expands them to whole
-    /// lines.
+    /// `V` — toggle linewise. If already Linewise, reverts to
+    /// Charwise so users can recover (vim's `V` toggle semantics).
+    /// The anchor and head still point at chars; the renderer
+    /// expands them to whole lines while in Linewise mode.
+    /// Clears placement mode — pressing `V` while placing the caret
+    /// implies the user wants a band, but the placement-mode skip
+    /// in `bake_selection_into_page` would suppress it otherwise.
     pub fn enter_visual_line(&mut self) {
         if let Some(sel) = self.text_selection.as_mut() {
-            sel.mode = SelMode::Linewise;
+            sel.mode = if matches!(sel.mode, SelMode::Linewise) {
+                SelMode::Charwise
+            } else {
+                SelMode::Linewise
+            };
         } else {
             self.enter_visual();
             if let Some(sel) = self.text_selection.as_mut() {
                 sel.mode = SelMode::Linewise;
             }
         }
+        self.selection_placement = false;
     }
 
-    /// `<C-v>` — visual-block (rectangular). Reserved field on
-    /// `TextSelection`; renderer is char-rectangle (per-line slice
-    /// from the leftmost selected column to the rightmost on each
-    /// row covered by the selection).
+    /// `<C-v>` — toggle blockwise (rectangular). If already
+    /// Blockwise, reverts to Charwise (vim semantics). Renderer is
+    /// char-rectangle (per-line slice from the leftmost selected
+    /// column to the rightmost on each row covered by the selection).
+    /// Clears placement mode for the same reason `V` does.
     pub fn enter_visual_block(&mut self) {
         if let Some(sel) = self.text_selection.as_mut() {
-            sel.mode = SelMode::Blockwise;
+            sel.mode = if matches!(sel.mode, SelMode::Blockwise) {
+                SelMode::Charwise
+            } else {
+                SelMode::Blockwise
+            };
         } else {
             self.enter_visual();
             if let Some(sel) = self.text_selection.as_mut() {
                 sel.mode = SelMode::Blockwise;
             }
         }
+        self.selection_placement = false;
     }
 
     /// Allocate the next group id and bump the counter.
@@ -2126,7 +2357,7 @@ impl<'doc> App<'doc> {
                 }
             }
         }
-        let removed = before - self.highlights.items.len();
+        let removed = before.saturating_sub(self.highlights.items.len());
         if removed > 0 {
             self.highlight_revision += 1;
             self.invalidate_compose();
@@ -2135,7 +2366,14 @@ impl<'doc> App<'doc> {
     }
 
     pub fn cancel_delete_last_highlight(&mut self) {
-        self.awaiting_highlight_delete_confirm = false;
+        if self.awaiting_highlight_delete_confirm {
+            self.awaiting_highlight_delete_confirm = false;
+            // Without overwriting `status`, the "press y to confirm…"
+            // prompt lingers indefinitely until the next status-bearing
+            // event, leaving the user uncertain whether the cancel
+            // actually registered.
+            self.status = "highlight delete cancelled".into();
+        }
     }
 
     /// Find the group_id of the most-recently-added highlight on
@@ -2286,7 +2524,7 @@ impl<'doc> App<'doc> {
         }
     }
 
-    pub fn persist_highlights(&self) -> Result<()> {
+    pub fn persist_highlights(&mut self) -> Result<()> {
         // Skip the save entirely when the user didn't touch a highlight
         // this session. `save_to_pdf` walks every page in the document
         // (pdfium has no per-doc annotation index) and on a 700-page
@@ -2313,12 +2551,21 @@ impl<'doc> App<'doc> {
             .union(&now_pages)
             .copied()
             .collect();
-        pdfhighlights::save_to_pdf_filtered(
+        let result = pdfhighlights::save_to_pdf_filtered(
             &self.document,
             &self.highlights,
             &self.path,
             &candidate,
-        )
+        );
+        // After a successful save, the on-disk truth is the in-memory
+        // set — refresh `prev_highlight_pages` so a subsequent save
+        // (e.g. user calls `:w` and keeps editing) doesn't redundantly
+        // re-walk pages that no longer hold any of our annotations.
+        // Cheap; the HashSet is tiny.
+        if result.is_ok() {
+            self.prev_highlight_pages = now_pages;
+        }
+        result
     }
 
     /// Build a `StatefulProtocol` for the supplied canvas. For the
@@ -2359,29 +2606,42 @@ impl<'doc> App<'doc> {
             zoom: self.zoom,
             marks: self.marks.clone(),
             scroll_in_page,
+            selection_color_idx: self.selection_color_idx,
         }
         .save(&self.path)
     }
 
     /// Build a one-line PDF metadata summary for the status bar.
     /// Pulls title / author from pdfium and adds page count + file size.
+    /// Title and author are attacker-controlled (a malicious PDF can
+    /// embed terminal escape sequences in either field to hijack the
+    /// status line — OSC 52 clipboard write, alt-screen toggle, etc.);
+    /// run them through `term_safe::safe_for_stderr` before they hit
+    /// any render path that goes to the wire.
     pub fn show_info(&mut self) {
         use pdfium_render::prelude::PdfDocumentMetadataTagType;
         let meta = self.document.metadata();
         let title = meta
             .get(PdfDocumentMetadataTagType::Title)
-            .map(|t| t.value().to_string())
+            .map(|t| crate::term_safe::safe_for_stderr(&t.value().to_string()))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| {
-                self.path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("(unknown)")
-                    .to_string()
+                // Filename fallback when PDF Title is empty.
+                // Filenames are user-supplied via the shell; a
+                // hostile-named file (`/tmp/evil\u{202E}fdp.gif`)
+                // can leak bidi/separator chars into the status
+                // line. Run through the same sanitiser the title /
+                // author paths above use.
+                crate::term_safe::safe_for_stderr(
+                    self.path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("(unknown)"),
+                )
             });
         let author = meta
             .get(PdfDocumentMetadataTagType::Author)
-            .map(|t| t.value().to_string())
+            .map(|t| crate::term_safe::safe_for_stderr(&t.value().to_string()))
             .filter(|s| !s.is_empty());
         let bytes = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
         self.status = match author {
@@ -2521,6 +2781,11 @@ impl<'doc> App<'doc> {
     /// Pulled out of `yank_selection` so the regular y/Y paths stay
     /// plain-text. Sets status; clears Visual mode.
     pub fn yank_selection_as_markdown(&mut self) {
+        // Mirror `yank_selection`: pull all pages in the selection range
+        // into `text_cache` BEFORE consuming the selection. Otherwise a
+        // page-2→page-4 cross-page mouse drag silently drops page 3
+        // because that page's text was never cached during the drag.
+        self.ensure_selection_text_loaded();
         let Some(sel) = self.text_selection.take() else {
             self.mode = Mode::Normal;
             return;
@@ -2531,12 +2796,27 @@ impl<'doc> App<'doc> {
             let Some(pt) = self.text_cache.get(page_idx) else {
                 continue;
             };
-            let start = if page_idx == lo.page { lo.idx } else { 0 };
-            let end = if page_idx == hi.page {
+            let mut start = if page_idx == lo.page { lo.idx } else { 0 };
+            let mut end = if page_idx == hi.page {
                 hi.idx
             } else {
                 pt.chars.len().saturating_sub(1)
             };
+            // Linewise widening — same fix as `yank_selection`. The
+            // markdown blockquote should match what the user sees
+            // selected on screen.
+            if matches!(sel.mode, SelMode::Linewise) {
+                if let Some(line) = pt.line_of(start) {
+                    if let Some(s) = pt.line_start(line) {
+                        start = s;
+                    }
+                }
+                if let Some(line) = pt.line_of(end) {
+                    if let Some(e) = pt.line_end(line) {
+                        end = e;
+                    }
+                }
+            }
             let s = pt.extract(start, end);
             if !s.is_empty() {
                 if !combined.is_empty() {
@@ -2822,7 +3102,13 @@ fn stable_kitty_id() -> u32 {
         .wrapping_mul(0x9E37_79B1_185E_BCA1)
         .wrapping_add(nanos.wrapping_mul(0xBF58_476D_1CE4_E5B9));
     let id = ((mixed >> 32) ^ mixed) as u32;
-    id.max(1)
+    // Clamp into the lower half of u32 so `id_for(p) = id_base + 1
+    // + p` cannot wrap past u32::MAX into low IDs (image_id 0 is
+    // reserved by the kitty graphics protocol; wrapping there
+    // silently drops placements). A 31-bit namespace still gives
+    // ~2¹⁵ collisions on the birthday-paradox boundary — plenty
+    // for a "few PDFs open" workload.
+    (id & 0x7FFF_FFFF).max(1)
 }
 
 /// Inter-page gap in pixels. Small but visible — large enough that

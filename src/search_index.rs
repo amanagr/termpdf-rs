@@ -207,6 +207,15 @@ impl DocIndex {
         query: &'a str,
         case_sensitive: bool,
     ) -> Box<dyn Iterator<Item = usize> + 'a> {
+        // Empty-needle guard. `str::match_indices("")` yields one
+        // match per char-boundary; on a 5 MB haystack that's ~5M
+        // entries collected to a Vec on the case-insensitive path.
+        // `pages_matching` short-circuits empty queries before
+        // calling here, but `match_count` (public) does not — this
+        // catches the misuse close to the source.
+        if query.is_empty() {
+            return Box::new(std::iter::empty());
+        }
         if case_sensitive {
             Box::new(self.text.match_indices(query).map(|(i, _)| i))
         } else {

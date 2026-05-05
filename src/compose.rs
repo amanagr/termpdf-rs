@@ -105,7 +105,13 @@ pub fn fill_rect_blend(
 
     // Fixed-point lerp at q=8: 256 == "fully c", 0 == "fully out".
     // (256 - a_q) is the "keep existing" weight. Computed once.
-    let a_q: u16 = (alpha.clamp(0.0, 1.0) * 256.0) as u16;
+    // `.round()` rather than truncating: `0.998 * 256 = 255.488` would
+    // truncate to 255, leaving `inv = 1` — a "near-saturated" alpha
+    // produces a 254 channel value that should round to 255. Capped at
+    // 256 since the >=0.999 short-circuit above already handles full
+    // alpha; here `clamp(0,1) * 256.0` is in [0, 255.7] so .round() is
+    // safe in u16.
+    let a_q: u16 = (alpha.clamp(0.0, 1.0) * 256.0).round().min(256.0) as u16;
     let inv: u16 = 256 - a_q;
     let cr_q = (cr as u16) * a_q;
     let cg_q = (cg as u16) * a_q;

@@ -200,7 +200,7 @@ fn dump_printable(bytes: &[u8], n: usize) -> String {
 /// status line to appear, then look for the kitty graphics transmit
 /// escape sequence (\x1b_G). Asserts that:
 ///   * the binary doesn't crash on the kitty path,
-///   * `f=100` (PNG) is the on-the-wire format (we shipped this),
+///   * `f=24,o=z` (zlib-deflated raw RGB) is the default wire format,
 ///   * `U=1` (unicode-placeholder mode) is in the transmit,
 ///   * the placeholder character `\u{10EEEE}` (UTF-8: F4 8E BB AE)
 ///     is in the buffer,
@@ -233,9 +233,12 @@ fn binary_kitty_path_emits_transmit_and_placeholders() {
         twoway_contains(&buf, b"\x1b_G"),
         "no kitty graphics escape (\\x1b_G) seen — kitty draw path didn't emit a transmit"
     );
+    // Default wire format is `f=24,o=z` (raw RGB + zlib) — ~3× faster
+    // to encode than PNG for opaque page bitmaps. The PNG path
+    // (`f=100`) is reachable via `TERMPDF_TRANSMIT_PNG=1` only.
     assert!(
-        twoway_contains(&buf, b"f=100"),
-        "kitty transmit didn't include f=100 (PNG); should have switched off raw RGBA"
+        twoway_contains(&buf, b"f=24") && twoway_contains(&buf, b"o=z"),
+        "kitty transmit didn't include f=24 + o=z (raw RGB + zlib); the default wire format"
     );
     assert!(
         twoway_contains(&buf, b"U=1"),

@@ -50,12 +50,21 @@ pub fn load(document: &PdfDocument<'_>) -> Result<Vec<OutlineEntry>> {
         // bookmark (which *does* have a title) — handled the same
         // way because walk() emits a title-bearing root then
         // recurses into its children.
-        walk(root, 0, &mut out);
+        let mut step_budget: usize = MAX_OUTLINE_STEPS;
+        walk(root, 0, &mut out, &mut step_budget);
     }
     Ok(out)
 }
 
-fn walk(start: PdfBookmark<'_>, depth: u8, out: &mut Vec<OutlineEntry>) {
+/// Hard cap on bookmark-tree walk steps. Protects against malicious
+/// PDFs whose `next_sibling()` returns a previously-seen node, creating
+/// an infinite loop bounded only by `MAX_OUTLINE_ENTRIES` per push but
+/// otherwise burning CPU forever after the entry vec fills. 500k is
+/// 10× the entry cap so a worst-case-shape legitimate doc still
+/// traverses fully.
+const MAX_OUTLINE_STEPS: usize = 500_000;
+
+fn walk(start: PdfBookmark<'_>, depth: u8, out: &mut Vec<OutlineEntry>, steps: &mut usize) {
     // Iterate the sibling chain instead of recursing into it. PDFs
     // with very long sibling chains (10k+, occasionally seen in
     // adversarial files or auto-generated reference indexes) would
@@ -63,17 +72,39 @@ fn walk(start: PdfBookmark<'_>, depth: u8, out: &mut Vec<OutlineEntry>) {
     // small and capped by MAX_OUTLINE_DEPTH.
     let mut cur = Some(start);
     while let Some(b) = cur {
+        if *steps == 0 {
+            return;
+        }
+        *steps -= 1;
         if out.len() >= MAX_OUTLINE_ENTRIES {
             return;
         }
         if let Some(title) = b.title() {
+            // Sanitize before storing — outline titles come straight
+            // from the PDF and a malicious file can embed CSI escapes
+            // or bidi-overrides that flip subsequent rows of the TOC
+            // panel and spoof neighbouring entry text. Cap raw-title
+            // length too: a 50k-entry outline with megabyte titles
+            // would otherwise allocate gigabytes before render-time
+            // truncation kicks in. 4 KiB is far above any real title.
+            const MAX_RAW_TITLE_LEN: usize = 4096;
+            let raw = if title.len() > MAX_RAW_TITLE_LEN {
+                let mut end = MAX_RAW_TITLE_LEN;
+                while end > 0 && !title.is_char_boundary(end) {
+                    end -= 1;
+                }
+                &title[..end]
+            } else {
+                title.as_str()
+            };
+            let safe_title = crate::term_safe::safe_for_stderr(raw);
             let page = b
                 .destination()
                 .and_then(|d| d.page_index().ok())
                 .map(|p| p as usize);
-            let lc_title: Vec<char> = title.to_lowercase().chars().collect();
+            let lc_title: Vec<char> = safe_title.to_lowercase().chars().collect();
             out.push(OutlineEntry {
-                title,
+                title: safe_title,
                 lc_title,
                 depth,
                 page,
@@ -81,7 +112,7 @@ fn walk(start: PdfBookmark<'_>, depth: u8, out: &mut Vec<OutlineEntry>) {
         }
         if depth < MAX_OUTLINE_DEPTH {
             if let Some(child) = b.first_child() {
-                walk(child, depth.saturating_add(1), out);
+                walk(child, depth.saturating_add(1), out, steps);
             }
         }
         cur = b.next_sibling();

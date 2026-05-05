@@ -125,7 +125,7 @@ fn read_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
         use std::io::Read as _;
         use std::os::unix::fs::OpenOptionsExt;
         const O_NOFOLLOW: i32 = 0x20000; // libc::O_NOFOLLOW on Linux
-        let mut file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(O_NOFOLLOW)
             .open(path)?;
@@ -145,8 +145,23 @@ fn read_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
                 "cache file too large",
             ));
         }
+        // Enforce the cap during the read itself, not just from the
+        // metadata snapshot. Same threat model as the symlink defense
+        // above: a same-UID attacker can grow the file between the
+        // metadata snapshot and `read_to_end`, bypassing the size
+        // check (`Vec::with_capacity` only sizes the initial alloc;
+        // the Vec grows on demand). `take(MAX+1)` lets us read one
+        // byte past the cap so we can detect the overflow case
+        // explicitly rather than silently truncating a legitimate
+        // 16 MB file.
         let mut buf = Vec::with_capacity(len as usize);
-        file.read_to_end(&mut buf)?;
+        let read = file.take(MAX_CACHED_PNG_BYTES + 1).read_to_end(&mut buf)?;
+        if read as u64 > MAX_CACHED_PNG_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cache file grew past size cap during read",
+            ));
+        }
         Ok(buf)
     }
     #[cfg(not(unix))]
@@ -201,13 +216,61 @@ pub fn store(path: &Path, image: &DynamicImage) -> std::io::Result<bool> {
             return Ok(false);
         }
     }
-    // Atomic-ish write: write to a tmp sibling then rename. Avoids
-    // half-written files on crash mid-write being read as truncated
-    // PNGs on next open.
-    let tmp = path.with_extension("png.tmp");
-    if std::fs::write(&tmp, &buf).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return Ok(false);
+    // Atomic-ish write: write to a unique tmp sibling then rename.
+    //
+    // Pattern matches `pdfhighlights.rs::save_atomic` and
+    // `session.rs::write_private_session`:
+    //   * pid+nanos suffix → no two concurrent writers ever collide
+    //     on the deterministic `path.with_extension("png.tmp")` slot.
+    //   * `create_new` (O_EXCL) + `O_NOFOLLOW` → a same-UID attacker
+    //     can't pre-plant the temp path as a symlink to a victim
+    //     file (~/.bashrc, etc.) and trick the cache write into
+    //     truncating it. Without these flags, `fs::write` follows
+    //     symlinks and silently corrupts the target.
+    //
+    // Best-effort throughout: any failure leaves the cache slot
+    // unwritten and the caller renders pdfium output normally.
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_name = format!(
+        "{}.{pid}.{nanos}.tmp",
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("page.png")
+    );
+    let tmp = parent.join(tmp_name);
+    {
+        #[cfg(unix)]
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt;
+            const O_NOFOLLOW: i32 = 0x20000;
+            const O_EXCL: i32 = 0o0200;
+            let mut f = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .custom_flags(O_NOFOLLOW | O_EXCL)
+                .mode(0o600)
+                .open(&tmp)
+            {
+                Ok(f) => f,
+                Err(_) => return Ok(false),
+            };
+            if f.write_all(&buf).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+                return Ok(false);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if std::fs::write(&tmp, &buf).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+                return Ok(false);
+            }
+        }
     }
     if std::fs::rename(&tmp, path).is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -238,14 +301,47 @@ pub fn evict_to_budget(budget_bytes: u64) -> std::io::Result<()> {
     // and .bin (search index) files toward the budget.
     let mut entries: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
     let mut total: u64 = 0;
-    for pdf_dir in std::fs::read_dir(&cache_root)?.flatten() {
+    // Reap orphan `.tmp` sidecars that an earlier crash left behind.
+    // The atomic-write scheme creates `.{name}.{pid}.{nanos}.tmp` and
+    // renames it into place; on SIGKILL between O_EXCL and rename the
+    // tmp leaks forever (extension filter below excludes it from the
+    // budget). One-hour mtime cutoff is safe — no legitimate writer
+    // takes longer than that to flush a single PNG / index file.
+    let now = SystemTime::now();
+    const TMP_REAP_AGE_SECS: u64 = 3600;
+    // Also tolerate per-PDF read errors instead of aborting the whole
+    // sweep — a stale-perm or transient EIO on one directory used to
+    // bail out of `evict_to_budget` entirely, leaving the cache
+    // unbounded until the next sweep.
+    let pdf_dirs = match std::fs::read_dir(&cache_root) {
+        Ok(rd) => rd,
+        Err(e) => return Err(e.into()),
+    };
+    for pdf_dir in pdf_dirs.flatten() {
         let pdf_dir_path = pdf_dir.path();
         if !pdf_dir_path.is_dir() {
             continue;
         }
-        for file in std::fs::read_dir(&pdf_dir_path)?.flatten() {
+        let inner = match std::fs::read_dir(&pdf_dir_path) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for file in inner.flatten() {
             let path = file.path();
-            let keep = path.extension().is_some_and(|e| e == "png" || e == "bin");
+            let ext = path.extension().and_then(|e| e.to_str());
+            if matches!(ext, Some("tmp")) {
+                if let Ok(meta) = file.metadata() {
+                    if let Ok(mtime) = meta.modified() {
+                        if let Ok(age) = now.duration_since(mtime) {
+                            if age.as_secs() > TMP_REAP_AGE_SECS {
+                                let _ = std::fs::remove_file(&path);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            let keep = matches!(ext, Some("png") | Some("bin"));
             if !keep {
                 continue;
             }

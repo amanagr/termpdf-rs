@@ -38,9 +38,13 @@ pub fn invert_luminance(img: DynamicImage) -> RgbaImage {
         let mut hsl: Hsl = Hsl::from_color(srgb);
         hsl.lightness = 1.0 - hsl.lightness;
         let srgb_out: Srgb = hsl.into_color();
-        let rr = (srgb_out.red.clamp(0.0, 1.0) * 255.0) as u8;
-        let gg = (srgb_out.green.clamp(0.0, 1.0) * 255.0) as u8;
-        let bb = (srgb_out.blue.clamp(0.0, 1.0) * 255.0) as u8;
+        // Round (not truncate) to u8: `0.999 * 255 = 254.745`, truncates
+        // to 254 when 255 is the desired saturated channel. Half-pixel
+        // luminance loss across the whole bitmap shifts the dark mode
+        // a touch toward grey on every recompose.
+        let rr = (srgb_out.red.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let gg = (srgb_out.green.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let bb = (srgb_out.blue.clamp(0.0, 1.0) * 255.0).round() as u8;
         px.0 = [rr, gg, bb, a];
     }
     out

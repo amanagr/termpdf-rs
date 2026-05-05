@@ -35,6 +35,11 @@ pub struct Session {
     /// landing at page top, matching pre-feature behaviour.
     #[serde(default)]
     pub scroll_in_page: f32,
+    /// Last-used highlight color index (0..HIGHLIGHT_COLORS.len()).
+    /// Persisted so the user's preferred color survives a reopen
+    /// instead of resetting to 0 every session.
+    #[serde(default)]
+    pub selection_color_idx: usize,
 }
 
 fn default_zoom() -> f32 {
@@ -49,6 +54,7 @@ impl Default for Session {
             zoom: 1.0,
             marks: std::collections::BTreeMap::new(),
             scroll_in_page: 0.0,
+            selection_color_idx: 0,
         }
     }
 }
@@ -93,13 +99,28 @@ impl Session {
     }
 }
 
-/// Same atomic 0600 write as highlight.rs::write_private; duplicated
-/// instead of pub-exposed to keep highlight.rs internals private and
-/// because session.rs predates the security hardening.
+/// Same atomic 0600 write as `pdfhighlights::save_atomic`. Mitigates
+/// two same-UID concerns from the deterministic-tempfile pattern that
+/// used to live here:
+///   1. **Symlink-write attack**: an attacker pre-plants
+///      `.{filename}.tmp` as a symlink to a victim file (~/.bashrc,
+///      etc.). Our open follows the link, truncates the target, and
+///      writes session JSON there. `O_NOFOLLOW + O_EXCL` defeats
+///      this — the open fails noisily on either symlink-or-existing.
+///   2. **Concurrent-instance write race**: two termpdf-rs procs on
+///      the same PDF both open the deterministic temp path with
+///      truncate; their writes interleave and rename loses the
+///      loser. A pid+nanos suffix guarantees a unique temp path
+///      per write.
 fn write_private_session(path: &Path, data: &[u8]) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     let tmp = parent.join(format!(
-        ".{}.tmp",
+        ".{}.{pid}.{nanos}.tmp",
         path.file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("session")
@@ -108,10 +129,12 @@ fn write_private_session(path: &Path, data: &[u8]) -> Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
+            const O_NOFOLLOW: i32 = 0x20000;
+            const O_EXCL: i32 = 0o0200;
             let mut f = fs::OpenOptions::new()
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true)
+                .custom_flags(O_NOFOLLOW | O_EXCL)
                 .mode(0o600)
                 .open(&tmp)?;
             std::io::Write::write_all(&mut f, data)?;
@@ -122,6 +145,8 @@ fn write_private_session(path: &Path, data: &[u8]) -> Result<()> {
             fs::write(&tmp, data)?;
         }
     }
+    // rename is atomic on the same filesystem; if it fails we leave
+    // the (now-unique) temp behind to be reaped by future opens.
     fs::rename(&tmp, path)?;
     Ok(())
 }
@@ -164,6 +189,7 @@ mod tests {
             zoom: 2.5,
             marks,
             scroll_in_page: 0.37,
+            selection_color_idx: 3,
         };
         s.save(&pdf).unwrap();
         let loaded = Session::load(&pdf);
@@ -173,6 +199,7 @@ mod tests {
         assert_eq!(loaded.marks.get(&'a'), Some(&12));
         assert_eq!(loaded.marks.get(&'z'), Some(&99));
         assert!((loaded.scroll_in_page - 0.37).abs() < 1e-6);
+        assert_eq!(loaded.selection_color_idx, 3);
         // Cleanup
         let _ = std::fs::remove_file(Session::store_path(&pdf).unwrap());
         let _ = std::fs::remove_file(&pdf);

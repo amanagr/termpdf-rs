@@ -223,15 +223,19 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
         };
         f.render_widget(Block::default().style(Style::default().bg(bg)), img_area);
         if let Err(e) = draw_pages_kitty(f, app, img_area) {
+            // pdfium error Display can reflect bytes from the doc —
+            // sanitise before painting into the image area.
+            let safe = crate::term_safe::safe_for_stderr(&format!("{e:#}"));
             f.render_widget(
-                Paragraph::new(format!("render error: {e:#}"))
+                Paragraph::new(format!("render error: {safe}"))
                     .style(Style::default().fg(Color::Red)),
                 img_area,
             );
         }
     } else if let Err(e) = ensure_image(app, img_area) {
+        let safe = crate::term_safe::safe_for_stderr(&format!("{e:#}"));
         f.render_widget(
-            Paragraph::new(format!("render error: {e:#}")).style(Style::default().fg(Color::Red)),
+            Paragraph::new(format!("render error: {safe}")).style(Style::default().fg(Color::Red)),
             img_area,
         );
     } else if let Some(proto) = app.image_proto.as_mut() {
@@ -334,6 +338,7 @@ fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
         scroll_x_milli: (app.scroll_x * 10000.0) as u32,
         highlight_revision: app.highlight_revision,
         selection_sig: app.selection_signature_global(),
+        search_revision: app.search.as_ref().map(|s| s.revision).unwrap_or(0),
     };
     if app.last_compose_key == Some(compose_key) && app.image_proto.is_some() {
         return Ok(());
@@ -656,7 +661,15 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
             // geometry to draw a "loading…" indicator centered in the
             // page's strip so the user knows the area is intentionally
             // pending instead of a glitch.
-            let is_cold = !app.page_cache.contains_key(&b.page_idx);
+            // A page that's been evicted from `page_cache` but still
+            // present in `highlights_baked_cache` or `overlay_cache`
+            // doesn't need pdfium work — `composed_image` ladders to
+            // those tiers and returns a ready-to-transmit RGBA. Don't
+            // penalize such pages with a loading indicator during a
+            // rapid burst.
+            let is_cold = !app.page_cache.contains_key(&b.page_idx)
+                && !app.highlights_baked_cache.contains_key(&b.page_idx)
+                && !app.overlay_cache.contains_key(&b.page_idx);
             if is_cold {
                 b.need_transmit = false;
                 b.placement_active = false;
@@ -742,83 +755,28 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
         })
         .collect();
 
-    // Selection bake-into-page replaces the prior classical-placement
-    // overlay. The page bitmap now carries the band (via overlay_cache;
-    // ensure_overlay populates it). Drop any overlay images still
-    // resident in the terminal from before this code change so the
-    // terminal can free their bitmaps. The delete escapes ride out on
-    // the next page transmit via take_pending_deletes below.
-    let mut overlay_payloads: Vec<Option<String>> = vec![None; blits.len()];
-    let overlay_marks: Vec<Option<(u64, u64, u32, u32)>> = vec![None; blits.len()];
-    {
-        let kp = app.kitty_pages.as_mut().unwrap();
-        for b in blits.iter() {
-            if kp.overlay_is_present(b.page_idx) {
-                kp.overlay_drop(b.page_idx);
-            }
-        }
-    }
-
     // Drain any pending kitty `a=d,d=I,i=ID` deletes from prior
-    // evictions (page or overlay) and ride them in on the first
-    // transmit of this frame. Doing it here rather than as a separate
-    // write keeps the deletes inside the `term.draw` window and avoids
-    // a second pty round-trip.
+    // evictions and ride them in on the first transmit of this frame.
+    // Doing it here rather than as a separate write keeps the deletes
+    // inside the `term.draw` window and avoids a second pty round-trip.
     let kp = app.kitty_pages.as_mut().unwrap();
     if let Some(mut deletes) = kp.take_pending_deletes() {
-        // Prefer riding deletes on a slot that already has bytes
-        // (page transmit OR overlay payload); only reject onto the
-        // pending queue if NEITHER exists this frame. Move-merge the
-        // existing slot string into our `deletes` buffer to avoid an
-        // extra clone per merge.
-        let attached = if let Some(i) = transmits.iter().position(|t| t.is_some()) {
+        if let Some(i) = transmits.iter().position(|t| t.is_some()) {
             let existing = transmits[i].take().unwrap();
             deletes.reserve(existing.len());
             deletes.push_str(&existing);
             transmits[i] = Some(deletes);
-            true
-        } else if let Some(i) = overlay_payloads.iter().position(|p| p.is_some()) {
-            let existing = overlay_payloads[i].take().unwrap();
-            deletes.reserve(existing.len());
-            deletes.push_str(&existing);
-            overlay_payloads[i] = Some(deletes);
-            true
         } else {
-            // No transmits or overlay APCs this frame — stash the
-            // deletes for next. Cheap to write back; eviction is rare
-            // relative to draws.
+            // No transmits this frame — stash the deletes for next.
+            // Cheap to write back; eviction is rare relative to draws.
             kp.put_back_pending_deletes(deletes);
-            false
-        };
-        let _ = attached;
+        }
     }
 
-    // Concatenate page transmit + overlay payload into the per-blit
-    // prefix actually passed to `place_page`. The order matters:
-    //   1. page transmit ships the page bitmap (no placement).
-    //   2. overlay transmit ships the selection-band bitmap.
-    //   3. \x1b[s + overlay classical place + \x1b[u places the
-    //      overlay at the cursor (= page first cell), keeping cursor
-    //      bracketed for the page's placement loop that follows.
-    // Move-merge transmits + overlays into a single per-blit prefix
-    // by consuming both Vecs. The (Some(t), None) branch — the steady
-    // scroll case — used to clone the full ~270 KB transmit string for
-    // nothing; `into_iter()` lets us hand the existing String along
-    // unchanged, saving ~7-8 MB of allocation per `scroll_steady_30`.
-    let combined_prefixes: Vec<Option<String>> = transmits
-        .into_iter()
-        .zip(overlay_payloads)
-        .map(|(t, ov)| match (t, ov) {
-            (None, None) => None,
-            (Some(t), None) => Some(t),
-            (None, Some(o)) => Some(o),
-            (Some(mut t), Some(o)) => {
-                t.reserve(o.len());
-                t.push_str(&o);
-                Some(t)
-            }
-        })
-        .collect();
+    // The per-blit prefix passed to `place_page` IS the per-page
+    // transmit string (or None for fresh pages). The pre-bake design
+    // had a separate overlay payload concatenated here; that's gone.
+    let combined_prefixes: Vec<Option<String>> = transmits;
 
     drop(_compose);
 
@@ -936,11 +894,8 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
             kp.mark_transmitted(b.page_idx, layout_key, b.revision, b.pixel_w, b.pixel_h);
         }
     }
-    for (b, mark) in blits.iter().zip(overlay_marks.iter()) {
-        if let Some((rev, sel_sig, w, h)) = *mark {
-            kp.overlay_mark_transmitted(b.page_idx, layout_key, rev, sel_sig, w, h);
-        }
-    }
+    // The overlay_marks loop that used to live here was dead after
+    // the selection-bake-into-page switch (commit f83931e); deleted.
     kp.evict_to_budget(&visible_range_pin);
 
     // Link-hint overlay: rendered last so labels sit on top of
@@ -1077,22 +1032,46 @@ fn draw_link_hints(
         if dy_px < 0 || dy_px >= viewport_h as i64 {
             continue;
         }
+        // `.max(1)` on the divisor — Picker is supposed to never
+        // return zero cell dims, but it's a `u8` from an external
+        // crate; without the guard a buggy backend would divide by
+        // zero (panic in debug, wrap in release).
+        let cell_h_safe = (cell_h as i64).max(1);
+        let cell_w_safe = (cell_w as i64).max(1);
         let cell_y = area
             .top()
-            .saturating_add((dy_px / cell_h as i64).max(0) as u16);
+            .saturating_add((dy_px / cell_h_safe).max(0) as u16);
 
-        // Center horizontally within the page area: the page may
-        // have been centered if narrower than viewport.
+        // Two horizontal cases — must mirror `draw_pages_kitty` (see
+        // around line 600) or hints land in a different column from
+        // the link they point at:
+        //   1. Image fits in viewport → center it. dst_left_cell
+        //      shifts the hint right by the centering offset; the
+        //      page's column 0 sits at `area.left() + dst_left_cell`.
+        //   2. Image overflows → no centering. The viewport shows a
+        //      window of the page starting at `src_left_cell`
+        //      (cell-quantised app.scroll_x), so a link at page
+        //      column C appears at viewport column `C - src_left_cell`
+        //      (or off-screen and the bounds check skips it).
         let img_w_cells = (pixel_w / cell_w.max(1)) as u16;
-        let dst_left_cell = if img_w_cells < area.width {
-            (area.width - img_w_cells) / 2
+        let link_cell_x = (link_x_px / cell_w_safe).max(0) as u16;
+        let (dst_left_cell, src_left_cell) = if img_w_cells <= area.width {
+            ((area.width - img_w_cells) / 2, 0u16)
         } else {
-            0
+            let overflow_cells = img_w_cells - area.width;
+            let src_left = ((overflow_cells as f32) * app.scroll_x.clamp(0.0, 1.0)).round() as u16;
+            (0u16, src_left)
         };
+        // Skip when the link column is left of the visible window —
+        // wrapping_sub would otherwise wrap to a huge u16 and the
+        // hint would render at the right edge of the area.
+        if link_cell_x < src_left_cell {
+            continue;
+        }
         let cell_x = area
             .left()
             .saturating_add(dst_left_cell)
-            .saturating_add((link_x_px / cell_w as i64).max(0) as u16);
+            .saturating_add(link_cell_x - src_left_cell);
 
         // Write the label chars across consecutive cells.
         let label = &hint.label;
@@ -1215,13 +1194,18 @@ fn try_scroll_shift_canvas(
     viewport_h: u32,
 ) -> Option<RgbaImage> {
     let prev = app.last_compose_key.as_ref()?;
-    // Every field except scroll_y_px must match.
+    // Every field except scroll_y_px must match. `search_revision` is
+    // the bumped-on-`n`/`N` counter — without checking it, advancing
+    // to a new search hit on the same page that doesn't change the
+    // viewport (or only scrolls a few rows) would skip the canvas
+    // re-bake, leaving the OLD current-hit outline painted.
     if prev.layout != new_key.layout
         || prev.viewport_w != new_key.viewport_w
         || prev.viewport_h != new_key.viewport_h
         || prev.scroll_x_milli != new_key.scroll_x_milli
         || prev.highlight_revision != new_key.highlight_revision
         || prev.selection_sig != new_key.selection_sig
+        || prev.search_revision != new_key.search_revision
     {
         return None;
     }
@@ -1314,12 +1298,16 @@ fn try_selection_only_repaint(
     viewport_h: u32,
 ) -> Option<RgbaImage> {
     let prev = app.last_compose_key.as_ref()?;
+    // Same caveat as `try_scroll_shift_canvas`: `search_revision` must
+    // be in the dissimilar-fields check, else `n`/`N` without scroll
+    // change leaves the OLD current-hit outline painted.
     if prev.layout != new_key.layout
         || prev.viewport_w != new_key.viewport_w
         || prev.viewport_h != new_key.viewport_h
         || prev.scroll_x_milli != new_key.scroll_x_milli
         || prev.scroll_y_px != new_key.scroll_y_px
         || prev.highlight_revision != new_key.highlight_revision
+        || prev.search_revision != new_key.search_revision
     {
         return None;
     }
@@ -1562,6 +1550,11 @@ pub(crate) fn ensure_page_rendered(
         if let Some(img) = crate::disk_cache::load(p) {
             if img.width() == fit_width_px {
                 app.page_cache.insert(page_idx, img);
+                // Without `touch_page`, this entry never appears in
+                // `page_cache_lru` and `enforce_byte_budget` cannot
+                // see it as a victim. Sync-fallback prefetch + idle
+                // warm both reach this path.
+                app.touch_page(page_idx);
                 app.pages_at_fast_quality.remove(&page_idx);
                 app.last_compose_key = None;
                 return Ok(());
@@ -1584,6 +1577,7 @@ pub(crate) fn ensure_page_rendered(
                 img
             };
             app.page_cache.insert(page_idx, img);
+            app.touch_page(page_idx);
             app.pages_at_fast_quality.insert(page_idx);
             app.last_compose_key = None;
             Ok(())
@@ -1638,6 +1632,7 @@ pub(crate) fn upgrade_page_to_sharp(
         let _ = crate::disk_cache::store(&p, &img);
     }
     app.page_cache.insert(page_idx, img);
+    app.touch_page(page_idx);
     app.pages_at_fast_quality.remove(&page_idx);
     // Source pixels changed — drop the derived per-page caches and
     // force the kitty registry to re-transmit. Neither revision nor
@@ -1732,31 +1727,56 @@ pub(crate) fn ensure_overlay(app: &mut App<'_>, page_idx: usize, layout: LayoutK
     // ~8 MB Vec and copies, while a reused buffer only does the copy.
     // On dim mismatch (zoom changed) we fall back to clone and the
     // old buffer's storage drops naturally.
+    //
+    // Source ladder for the selection bake target:
+    //   1. highlights_baked_cache — present whenever the page has
+    //      saved highlights or search hits.
+    //   2. page_cache — fallback when ensure_highlights_baked took
+    //      its no_overlays short-circuit (no highlights AND no
+    //      search). Without this the selection band is invisible on
+    //      pages that have neither saved highlights nor hits — the
+    //      common case, since most pages of most PDFs are blank of
+    //      both.
     let prev_buf = app.overlay_cache.remove(&page_idx).map(|(b, _)| b);
-    let Some((baked, _)) = app.highlights_baked_cache.get(&page_idx) else {
+    let baked_src: Option<&RgbaImage> = app.highlights_baked_cache.get(&page_idx).map(|(b, _)| b);
+    let page_src: Option<&RgbaImage> = app.page_cache.get(&page_idx).and_then(|d| d.as_rgba8());
+    let Some(src_img) = baked_src.or(page_src) else {
         return;
     };
     let mut img = match prev_buf {
-        Some(mut existing) if existing.dimensions() == baked.dimensions() => {
+        Some(mut existing) if existing.dimensions() == src_img.dimensions() => {
             let dst: &mut [u8] = existing.as_mut();
-            dst.copy_from_slice(baked.as_raw());
+            dst.copy_from_slice(src_img.as_raw());
             existing
         }
-        _ => baked.clone(),
+        _ => src_img.clone(),
     };
 
     // Tier 2: paint the live selection band on top.
+    //
+    // Text-cache miss: if the selection touches this page (= we're
+    // past the `selection_sig == 0` short-circuit) but the page's
+    // text layout isn't loaded yet, skip BOTH the bake AND the
+    // overlay_cache insert. Caching a band-less overlay with the
+    // current `selection_sig` would suppress every future re-bake
+    // (the cache key would already match) — the band would be
+    // permanently missing on this page until the user moved the
+    // selection. Better to leave the overlay absent so consumers
+    // (`composed_image`, `draw_pages_kitty`) fall back to the
+    // baked/page tier (no band) THIS frame, then retry next frame
+    // when text has loaded.
     if let Some(sel) = app.text_selection {
-        if let Some(pt) = app.text_cache.get(page_idx) {
-            bake_selection_into_page(
-                &mut img,
-                page_idx,
-                sel,
-                pt,
-                app.selection_color_idx,
-                app.selection_placement,
-            );
-        }
+        let Some(pt) = app.text_cache.get(page_idx) else {
+            return;
+        };
+        bake_selection_into_page(
+            &mut img,
+            page_idx,
+            sel,
+            pt,
+            app.selection_color_idx,
+            app.selection_placement,
+        );
     }
 
     app.overlay_cache.insert(page_idx, (img, overlay_key));
@@ -1906,8 +1926,19 @@ fn compose_into_buffer(app: &mut App<'_>, viewport_w: u32, viewport_h: u32) -> R
 
     // Build a list of (start_row, end_row) extents that the visible
     // pages cover in the viewport. Then fill the inverse with bg.
+    //
+    // CRITICAL: only mark a page's row range as `covered` if we
+    // actually have a composed image for it — otherwise `fill_gaps_bulk`
+    // skips the range AND the blit loop below skips the page (no
+    // image), leaving the prior frame's pixels visible until the next
+    // settle redraw. Manifests on canvas-mode (sixel/iterm2) after a
+    // big jump (`100G`) when a fresh page enters the viewport before
+    // pdfium completes its render.
     let mut covered: Vec<(i64, i64)> = Vec::with_capacity(visible.len());
     for page_idx in visible.clone() {
+        if app.composed_image(page_idx).is_none() {
+            continue;
+        }
         let page_doc_y = app.layout.page_y(page_idx);
         let page_h = app.layout.page_h(page_idx) as i64;
         let top = (page_doc_y - scroll_y).max(0);
@@ -2334,22 +2365,22 @@ pub fn help_overlay_lines() -> Vec<&'static str> {
         "  + / - / 0              zoom in / out / reset",
         "  d                      toggle dark mode (luminance-only)",
         "",
-        "  v                      Visual mode — placement first (caret moves freely)",
-        "    h j k l              move caret by char / line (no selection yet)",
-        "    v  again             lock anchor → motions now grow the selection",
-        "    v  third time        unlock anchor → caret moves freely again",
+        "  v                      Visual mode — selection (motions grow band from anchor)",
+        "    h j k l              extend selection by char / line",
+        "    v  again             unlock anchor → caret moves freely (placement)",
+        "    v  again             relock anchor → resume growing the selection",
         "    w / b / e            next / prev word start / word end",
         "    0 / ^ / $            line start / first non-blank / line end",
         "    gg / G               first / last char on this page",
         "    f<c> / F<c>          jump to next/prev <c> on this line",
         "    iw / is / ip         select inner word / sentence / paragraph",
-        "    V                    switch to linewise selection",
-        "    Ctrl-v               switch to blockwise (rectangular)",
+        "    V                    toggle linewise selection",
+        "    Ctrl-v               toggle blockwise (rectangular) selection",
         "    c                    cycle highlight color",
         "    y / Enter            save highlight + copy text",
         "    Y                    copy text (no highlight)",
         "    gy                   copy as Markdown blockquote with citation",
-        "    Esc                  cancel",
+        "    q / Esc              cancel",
         "  click + drag           highlight with the mouse",
         "  x  then  y             delete last highlight on current page",
         "                         (whole multi-line group; press anything else to cancel)",

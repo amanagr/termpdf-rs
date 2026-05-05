@@ -45,7 +45,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches, Parser};
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -276,19 +279,37 @@ fn main() -> Result<()> {
     // restore the exact pixel position they were at last session.
     let start_scroll_in_page = if page_explicit {
         0.0
-    } else {
+    } else if saved.scroll_in_page.is_finite() {
         saved.scroll_in_page
+    } else {
+        0.0
+    };
+    // Sanitize saved zoom — a corrupted session.json with `"zoom": "huge"`
+    // or NaN would otherwise produce `1.0 * NaN = NaN` after clamp (which
+    // is identity on NaN), and downstream `viewport_w as f32 * NaN = NaN`
+    // makes `fit_width_px = 1` and the page renders as a 1px-wide strip.
+    let safe_zoom = if saved.zoom.is_finite() {
+        saved.zoom.clamp(0.25, 8.0)
+    } else {
+        1.0
     };
     let mut app = App::new(
         document,
         &args.path,
         start_page,
         start_dark,
-        saved.zoom,
+        safe_zoom,
         saved.marks.clone(),
         start_scroll_in_page,
         picker,
     )?;
+    // Restore the user's last-used highlight color so they don't have
+    // to cycle back to it every reopen. Clamp into the palette range
+    // so a corrupted session file (or future palette shrink) doesn't
+    // index out-of-range — the colour-cycle code already does `% len`
+    // on use, but the field itself should sit in a sane range.
+    let palette_len = crate::highlight::HIGHLIGHT_COLORS.len().max(1);
+    app.selection_color_idx = saved.selection_color_idx % palette_len;
 
     // Background render worker for prefetch (steady-scroll smoothness).
     // Failure to spawn falls back to fully synchronous rendering — the
@@ -337,6 +358,11 @@ fn setup_terminal() -> Result<()> {
         io::stdout(),
         EnterAlternateScreen,
         EnableMouseCapture,
+        // Bracketed paste — without this a multi-line paste at the
+        // `:` or `/` prompt arrives as a stream of `KeyCode::Enter`
+        // events (each commits a partial line), and a paste in
+        // Normal mode can fire `q` mid-stream and quit the app.
+        EnableBracketedPaste,
         crossterm::cursor::Hide,
     )?;
     Ok(())
@@ -354,6 +380,7 @@ fn teardown_terminal() -> Result<()> {
     execute!(
         out,
         crossterm::cursor::Show,
+        DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen,
     )?;
@@ -377,8 +404,16 @@ fn install_decset_panic_hook() {
         let _ = out.flush();
         // Best-effort tty restore; if we can't (e.g. stdout already
         // closed) the default hook still runs and the user can fix
-        // the terminal with `reset`.
-        let _ = execute!(out, DisableMouseCapture, LeaveAlternateScreen);
+        // the terminal with `reset`. Show the cursor explicitly —
+        // setup_terminal hid it; without an unhide here the user's
+        // recovered shell prompt is invisible until they `tput cnorm`
+        // or restart their emulator.
+        let _ = execute!(
+            out,
+            crossterm::cursor::Show,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = disable_raw_mode();
         prev(info);
     }));
@@ -717,12 +752,16 @@ fn index_one_page_text(app: &mut App<'_>) {
     };
     let pages = app.document.pages();
     let Ok(page) = pages.get(page_idx as i32) else {
-        app.doc_index.add_page(page_idx, String::new());
+        // Page handle unobtainable — try again next idle tick. Don't
+        // mark the page indexed-with-empty-text: that would persist
+        // to disk on `is_complete()` and bake the failure into every
+        // future search session for this PDF (search would skip the
+        // page silently). A retry costs one idle tick.
         return;
     };
     let text = match page.text() {
         Ok(t) => t.all(),
-        Err(_) => String::new(),
+        Err(_) => return,
     };
     app.doc_index.add_page(page_idx, text);
 
@@ -927,9 +966,39 @@ fn apply_coalesced_scroll(app: &mut App<'_>, net: i32, shifted: bool) {
 
 fn dispatch_event(app: &mut App<'_>, ev: Event) -> Result<()> {
     match ev {
-        Event::Key(k) if k.kind == KeyEventKind::Press => keys::dispatch(app, k)?,
+        // Accept Press AND Repeat. The Kitty Keyboard Protocol-aware
+        // terminals (Kitty, Ghostty, WezTerm, Foot) emit `Repeat` for
+        // held-key autorepeat — without this branch, holding `j` does
+        // nothing on those terminals. Drop only `Release`.
+        Event::Key(k)
+            if k.kind == KeyEventKind::Press || k.kind == KeyEventKind::Repeat =>
+        {
+            keys::dispatch(app, k)?
+        }
         Event::Resize(_, _) => app.invalidate_compose(),
         Event::Mouse(m) => keys::dispatch_mouse(app, m)?,
+        // Bracketed paste — the body is the literal pasted text. Route
+        // it to the cmd/search/TOC-filter buffer when one of those
+        // input modes is active. Ignore in other modes so a paste in
+        // Normal mode doesn't run keystroke shortcuts (e.g. a stray
+        // `q` in the paste would quit the app).
+        Event::Paste(s) => {
+            use crate::app::Mode;
+            let filtered: String = s.chars().filter(|c| !c.is_control()).collect();
+            if filtered.is_empty() {
+                return Ok(());
+            }
+            if app.show_toc && app.toc_filter_editing {
+                for c in filtered.chars() {
+                    app.toc_filter_push(c);
+                }
+            } else {
+                match app.mode {
+                    Mode::Command | Mode::Search => app.cmd_buffer.push_str(&filtered),
+                    _ => {}
+                }
+            }
+        }
         _ => {}
     }
     Ok(())

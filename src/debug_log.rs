@@ -1,9 +1,10 @@
 //! Optional debug logging for the kitty graphics path.
 //!
 //! Activated by setting `TERMPDF_DEBUG_LOG=/path/to/log.txt` in the
-//! environment. The first call from anywhere truncates and opens the
-//! file; subsequent calls append timestamped one-line records. When
-//! the env var is unset, every call short-circuits to a no-op (one
+//! environment. The first call from anywhere opens the file in append
+//! mode (NO truncate — see `handle()` below for the data-loss guard);
+//! subsequent calls append timestamped one-line records. When the env
+//! var is unset, every call short-circuits to a no-op (one
 //! `OnceLock::get()` and a None match) so production builds pay no
 //! cost beyond that.
 //!
@@ -32,10 +33,31 @@ static START: OnceLock<Instant> = OnceLock::new();
 fn handle() -> Option<&'static Mutex<File>> {
     LOG.get_or_init(|| {
         let path = std::env::var("TERMPDF_DEBUG_LOG").ok()?;
+        // Defenses against accidental data loss / symlink hijack:
+        //   * O_NOFOLLOW — refuse to follow a symlink at the final path
+        //     component. If `~/.termpdf-log` is a symlink to ~/.bashrc
+        //     (an attacker- or self-induced typo), don't truncate the
+        //     target. EOPNOTSUPP / ELOOP returns Err → opt out of logs.
+        //   * No `truncate(true)` — append instead. Past behaviour
+        //     silently overwrote any file the user pointed the env var
+        //     at; appending preserves prior content if the user
+        //     mistypes (e.g. `TERMPDF_DEBUG_LOG=~/.bashrc` for the
+        //     duration of one session is recoverable, not a wipe).
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            const O_NOFOLLOW: i32 = 0x20000; // matches pdfhighlights.rs / disk_cache.rs
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .custom_flags(O_NOFOLLOW)
+                .open(&path)
+                .ok()?
+        };
+        #[cfg(not(unix))]
         let file = std::fs::OpenOptions::new()
             .create(true)
-            .truncate(true)
-            .write(true)
+            .append(true)
             .open(&path)
             .ok()?;
         let _ = START.set(Instant::now());

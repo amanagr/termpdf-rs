@@ -32,9 +32,26 @@ impl PageLayout {
         let mut heights = Vec::with_capacity(metrics.len());
         let mut offsets = Vec::with_capacity(metrics.len());
         let mut y: i64 = 0;
+        // Per-page pixel-height ceiling. Without this, an extreme zoom
+        // (`fit_width_px` ≈ 50000) on a tall thin page produces an
+        // f32 multiply that exceeds `u32::MAX`; `as u32` saturates and
+        // page heights become meaningless, downstream `clamp_scroll`
+        // returns nonsense scroll positions, and the run-loop scrolls
+        // forever without painting anything. 1 million px is far above
+        // any legitimate single-page height — A0 at 600 DPI is ~28k px.
+        const MAX_PAGE_PX: u32 = 1_000_000;
         for m in metrics {
-            let h = if m.width_pts > 0.0 {
-                ((fit_width_px as f32) * (m.height_pts / m.width_pts)).round() as u32
+            let h = if m.width_pts > 0.0
+                && m.height_pts.is_finite()
+                && m.height_pts >= 0.0
+                && m.width_pts.is_finite()
+            {
+                let raw = (fit_width_px as f32) * (m.height_pts / m.width_pts);
+                if raw.is_finite() && raw >= 0.0 {
+                    raw.round().min(MAX_PAGE_PX as f32) as u32
+                } else {
+                    0
+                }
             } else {
                 0
             };

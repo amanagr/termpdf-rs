@@ -70,18 +70,40 @@ pub fn load_from_pdf(document: &PdfDocument<'_>) -> Result<HighlightStore> {
             // intent: those are already painted into the page bitmap
             // by pdfium's own renderer, so they're still visible.
             let contents = hl.contents();
+            // Cap the size of the Contents string we'll actually parse.
+            // A hostile PDF can stuff multi-megabyte JSON into the
+            // annotation Contents field; serde_json scales O(n) but the
+            // load loop runs once per annotation per page on every
+            // open. Real termpdf-emitted Contents are < 1 KiB
+            // (color + group_id + a short note); 64 KiB is far above
+            // any plausible legitimate use.
+            const MAX_CONTENTS_LEN: usize = 64 * 1024;
             let Some(meta) = contents
                 .as_deref()
-                .filter(|s| s.starts_with(TAG_PREFIX))
+                .filter(|s| s.starts_with(TAG_PREFIX) && s.len() <= MAX_CONTENTS_LEN)
                 .and_then(|s| serde_json::from_str::<AnnotMeta>(&s[TAG_PREFIX.len()..]).ok())
             else {
                 continue;
             };
             let Ok(bounds) = hl.bounds() else { continue };
-            let left = bounds.left().value.max(0.0);
-            let bottom = bounds.bottom().value.max(0.0);
-            let right = bounds.right().value.min(page_w);
-            let top = bounds.top().value.min(page_h);
+            // Reject NaN/Inf coords from pdfium — `f32::clamp` is
+            // identity on NaN, so the dirty value would propagate into
+            // the in-memory store and back into a malformed-saved PDF.
+            let raw_left = bounds.left().value;
+            let raw_bottom = bounds.bottom().value;
+            let raw_right = bounds.right().value;
+            let raw_top = bounds.top().value;
+            if !raw_left.is_finite()
+                || !raw_bottom.is_finite()
+                || !raw_right.is_finite()
+                || !raw_top.is_finite()
+            {
+                continue;
+            }
+            let left = raw_left.max(0.0);
+            let bottom = raw_bottom.max(0.0);
+            let right = raw_right.min(page_w);
+            let top = raw_top.min(page_h);
             let x = (left / page_w).clamp(0.0, 1.0);
             let w = ((right - left) / page_w).clamp(0.0, 1.0);
             // Y flip.
@@ -188,10 +210,20 @@ fn apply_store_to_document(
                 if annotation.as_highlight_annotation().is_none() {
                     continue;
                 }
-                let is_ours = annotation
-                    .contents()
-                    .map(|s| s.starts_with(TAG_PREFIX))
-                    .unwrap_or(false);
+                // CRITICAL: must mirror the load predicate exactly.
+                // If save's "is_ours" check is just `starts_with`, but
+                // load also requires valid AnnotMeta JSON, then a
+                // foreign tool's annotation that happens to begin with
+                // `termpdf-rs:` (or a corrupted termpdf annotation) is
+                // skipped at load (treated as foreign) yet DELETED at
+                // save — silent foreign-data destruction. Apply the
+                // same JSON-parseability gate here.
+                const MAX_CONTENTS_LEN: usize = 64 * 1024;
+                let is_ours = annotation.contents().is_some_and(|s| {
+                    s.starts_with(TAG_PREFIX)
+                        && s.len() <= MAX_CONTENTS_LEN
+                        && serde_json::from_str::<AnnotMeta>(&s[TAG_PREFIX.len()..]).is_ok()
+                });
                 if is_ours {
                     out.push(i);
                 }
@@ -212,6 +244,14 @@ fn apply_store_to_document(
         // Phase 2: create one annotation per highlight on this page.
         let annotations = page.annotations_mut();
         for h in store.for_page(page_idx as usize) {
+            // Skip NaN/Inf coords — `f32::clamp` is identity on NaN
+            // (only panics with NaN bounds), so a NaN x/y/w/h would
+            // pass through and `PdfPoints::new(NaN)` gets written into
+            // the saved PDF as a malformed numeric, which other
+            // viewers can crash on.
+            if !h.x.is_finite() || !h.y.is_finite() || !h.w.is_finite() || !h.h.is_finite() {
+                continue;
+            }
             // Convert top-left normalised 0..1 → PDF points (bottom-left).
             let left = (h.x.clamp(0.0, 1.0)) * page_w;
             let right = ((h.x + h.w).clamp(0.0, 1.0)) * page_w;

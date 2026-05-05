@@ -516,8 +516,27 @@ impl PageText {
         };
         let lo = lo.min(self.chars.len() - 1);
         let hi = hi.min(self.chars.len() - 1);
-        let line_lo = self.chars[lo].line;
-        let line_hi = self.chars[hi].line;
+        // Compute the visual-line range from the actual line indices of
+        // chars in the stream range — `chars[lo].line` and `chars[hi].line`
+        // give wrong bounds when stream order interleaves visual lines
+        // (multi-column / footnote / marginalia layouts), since the lowest
+        // stream-idx char in the selection isn't guaranteed to be on the
+        // visually-topmost line. Without this scan, `line_lo > line_hi`
+        // would make `line_lo..=line_hi` an empty range and the entire
+        // selection would render zero rects (visible-as-nothing).
+        let mut line_lo = usize::MAX;
+        let mut line_hi = 0usize;
+        for c in &self.chars[lo..=hi] {
+            if c.line < line_lo {
+                line_lo = c.line;
+            }
+            if c.line > line_hi {
+                line_hi = c.line;
+            }
+        }
+        if line_lo == usize::MAX {
+            return Vec::new();
+        }
 
         // Upper bound: one rect per line in [line_lo, line_hi]. The
         // bake-selection path calls this on every Visual-mode keystroke

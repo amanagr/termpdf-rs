@@ -17,14 +17,51 @@
 /// Strip ANSI / control bytes that a terminal would interpret.
 ///
 /// Allowed through: printable Unicode (anything `>=0x20`), tab,
-/// newline. Everything else (ESC, BEL, BS, DEL, C1 0x80–0x9F) is
-/// replaced with `?`. The function works on `char`s, so it is safe
-/// for arbitrary UTF-8 input.
+/// newline. Replaced with `?`:
+///   - C0 controls (ESC, BEL, BS, DEL, …)
+///   - C1 controls (0x80–0x9F)
+///   - U+2028 LINE SEPARATOR / U+2029 PARAGRAPH SEPARATOR (treated
+///     as line breaks by some terminals — can split a status line)
+///   - Bidi-override class (U+200E/U+200F LTR/RTL marks,
+///     U+202A–U+202E embedding/override, U+2066–U+2069 isolates).
+///     A malicious PDF outline title with these can flip the visual
+///     rendering of subsequent characters in the status line.
 pub fn safe_for_stderr(s: &str) -> String {
+    // Hot-path: pure ASCII text (status bar's common case — paths,
+    // page numbers, error messages). Skip the per-char walk and
+    // return owned-without-rebuilding when nothing needs rewriting.
+    if s.bytes()
+        .all(|b| b == b'\n' || b == b'\t' || (0x20..0x7F).contains(&b))
+    {
+        return s.to_string();
+    }
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         let code = ch as u32;
-        let is_allowed = ch == '\n' || ch == '\t' || (0x20..0x7F).contains(&code) || code >= 0xA0;
+        let is_bidi = matches!(
+            code,
+            0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069
+        );
+        let is_separator = code == 0x2028 || code == 0x2029;
+        // Zero-width / format-effect characters that shift cursor
+        // alignment without occupying a visible cell — terminals
+        // disagree about handling, status-bar widths drift. ZWSP /
+        // ZWNJ / ZWJ / WJ / BOM / variation selectors / Mongolian
+        // selectors / tag characters (the U+E0000-block exploit
+        // surface used in the 2021 iMessage trick).
+        let is_zero_width = matches!(
+            code,
+            0x200B..=0x200D
+                | 0x2060
+                | 0xFEFF
+                | 0xFE00..=0xFE0F
+                | 0x180B..=0x180D
+                | 0xE0000..=0xE007F
+        );
+        let is_allowed = !is_bidi
+            && !is_separator
+            && !is_zero_width
+            && (ch == '\n' || ch == '\t' || (0x20..0x7F).contains(&code) || code >= 0xA0);
         if is_allowed {
             out.push(ch);
         } else {
@@ -89,5 +126,36 @@ mod tests {
     #[test]
     fn strips_del() {
         assert_eq!(safe_for_stderr("a\x7Fb"), "a?b");
+    }
+
+    #[test]
+    fn strips_bidi_overrides() {
+        // RTL override sandwich — left-side text renders mirrored if
+        // the terminal honours U+202E.
+        let injected = "safe\u{202E}txet_yldneirf\u{202C}rest";
+        let cleaned = safe_for_stderr(injected);
+        assert!(!cleaned.contains('\u{202E}'));
+        assert!(!cleaned.contains('\u{202C}'));
+    }
+
+    #[test]
+    fn strips_line_separators() {
+        // U+2028 / U+2029 — some terminals treat these as line
+        // breaks, splitting a status string across rows.
+        let injected = "before\u{2028}after\u{2029}end";
+        let cleaned = safe_for_stderr(injected);
+        assert!(!cleaned.contains('\u{2028}'));
+        assert!(!cleaned.contains('\u{2029}'));
+    }
+
+    #[test]
+    fn strips_zero_width_and_bom() {
+        // BOM / ZWSP / variation selector — width-drift in status bar.
+        let injected = "a\u{FEFF}b\u{200B}c\u{FE0F}d";
+        let cleaned = safe_for_stderr(injected);
+        assert!(!cleaned.contains('\u{FEFF}'));
+        assert!(!cleaned.contains('\u{200B}'));
+        assert!(!cleaned.contains('\u{FE0F}'));
+        assert!(cleaned.contains('a') && cleaned.contains('d'));
     }
 }

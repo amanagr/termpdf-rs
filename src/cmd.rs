@@ -98,9 +98,12 @@ pub fn parse(line: &str) -> Command {
         "diag" | "diagnostics" => Command::Diag,
         "export" | "notes" => {
             // `:export some/path/with spaces.md` is rare but possible;
-            // collect the rest of the line verbatim rather than split
-            // on whitespace so a single-arg path with spaces survives.
-            let rest: String = parts.collect::<Vec<_>>().join(" ");
+            // take the rest of the line verbatim rather than re-joining
+            // split tokens. The previous `parts.collect().join(" ")`
+            // collapsed runs of whitespace and tabs (so `:export  /tmp/a  b.md`
+            // silently became `/tmp/a b.md`, writing to the wrong file).
+            let head_end = head.len();
+            let rest = line.get(head_end..).unwrap_or("").trim();
             let target = if rest.is_empty() {
                 None
             } else {
@@ -140,13 +143,33 @@ pub fn execute(app: &mut App<'_>, line: &str) {
                 p
             });
             match app.export_notes(&target) {
-                Ok(()) => app.status = format!("exported notes → {}", target.display()),
-                Err(e) => app.status = format!("export failed: {e:#}"),
+                Ok(()) => {
+                    app.status = format!(
+                        "exported notes → {}",
+                        crate::term_safe::safe_for_stderr(&target.display().to_string())
+                    )
+                }
+                Err(e) => {
+                    app.status = format!(
+                        "export failed: {}",
+                        crate::term_safe::safe_for_stderr(&format!("{e:#}"))
+                    )
+                }
             }
         }
         Command::GotoMissingArg => app.status = ":goto needs a page number".into(),
-        Command::GotoBadArg(arg) => app.status = format!(":goto needs a number, got {arg:?}"),
-        Command::Unknown(cmd) => app.status = format!("unknown command: {cmd}"),
+        Command::GotoBadArg(arg) => {
+            app.status = format!(
+                ":goto needs a number, got {:?}",
+                crate::term_safe::safe_for_stderr(&arg)
+            )
+        }
+        Command::Unknown(cmd) => {
+            app.status = format!(
+                "unknown command: {}",
+                crate::term_safe::safe_for_stderr(&cmd)
+            )
+        }
     }
 }
 
