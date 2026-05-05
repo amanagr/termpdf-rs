@@ -71,6 +71,47 @@ pub fn safe_for_stderr(s: &str) -> String {
     out
 }
 
+/// Strip terminal-execution chars from clipboard payloads.
+///
+/// More permissive than `safe_for_stderr`: keeps bidi marks and
+/// zero-width characters because legitimate non-Latin PDF text
+/// extraction depends on them. ONLY strips the chars that EXECUTE
+/// when pasted into a terminal:
+///   - C0 controls (ESC, BEL, BS, OSC/CSI initiators…) except `\n`/`\t`
+///   - C1 controls (0x80–0x9F) — single-byte CSI/OSC equivalents
+///   - DEL (0x7F)
+///   - U+2028 / U+2029 (some terminals split rows on these)
+///
+/// Removed (not replaced) — pasting `?` into the user's editor or
+/// shell is just noise. Removal preserves text length parity with
+/// the visible content.
+///
+/// Threat model: a hostile PDF embeds CSI/OSC bytes in extractable
+/// text. The user yanks the selection and pastes into a shell. With
+/// no sanitization the escapes execute (cursor moves, OSC 52
+/// readback, terminal title spoof). After this filter the bytes are
+/// just gone.
+pub fn safe_for_clipboard(s: &str) -> String {
+    // Hot path: pure printable ASCII + common whitespace.
+    if s.bytes()
+        .all(|b| b == b'\n' || b == b'\t' || (0x20..0x7F).contains(&b))
+    {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        let code = ch as u32;
+        let is_c0 = code < 0x20 && ch != '\n' && ch != '\t';
+        let is_c1 = (0x80..=0x9F).contains(&code);
+        let is_del = code == 0x7F;
+        let is_separator = code == 0x2028 || code == 0x2029;
+        if !(is_c0 || is_c1 || is_del || is_separator) {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +198,46 @@ mod tests {
         assert!(!cleaned.contains('\u{200B}'));
         assert!(!cleaned.contains('\u{FE0F}'));
         assert!(cleaned.contains('a') && cleaned.contains('d'));
+    }
+
+    #[test]
+    fn clipboard_strips_csi_keeps_text() {
+        // Hostile PDF embeds CSI; pasting it into a shell would
+        // execute. The visible text survives.
+        let injected = "innocent\x1b[31mevil\x1b[0mtext";
+        let cleaned = safe_for_clipboard(injected);
+        assert!(!cleaned.contains('\x1b'));
+        assert!(cleaned.contains("innocent"));
+        assert!(cleaned.contains("text"));
+    }
+
+    #[test]
+    fn clipboard_keeps_bidi_and_zero_width() {
+        // International PDF text legitimately contains bidi marks and
+        // zero-width joiners. Don't break those.
+        let s = "\u{202E}\u{200D}عربي\u{200B}";
+        assert_eq!(safe_for_clipboard(s), s);
+    }
+
+    #[test]
+    fn clipboard_keeps_newlines_and_tabs() {
+        let s = "line one\nline two\tcol";
+        assert_eq!(safe_for_clipboard(s), s);
+    }
+
+    #[test]
+    fn clipboard_strips_c1_controls() {
+        let injected = "before\u{0085}after\u{009B}5;5H";
+        let cleaned = safe_for_clipboard(injected);
+        assert!(!cleaned.contains('\u{0085}'));
+        assert!(!cleaned.contains('\u{009B}'));
+    }
+
+    #[test]
+    fn clipboard_strips_line_separator() {
+        // U+2028 splits some terminals' rows on paste.
+        let injected = "before\u{2028}after";
+        let cleaned = safe_for_clipboard(injected);
+        assert!(!cleaned.contains('\u{2028}'));
     }
 }

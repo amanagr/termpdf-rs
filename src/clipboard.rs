@@ -35,7 +35,16 @@ pub struct CopyOutcome {
 }
 
 pub fn copy(text: &str) -> CopyOutcome {
-    let mut payload = text;
+    // Strip terminal-execution chars BEFORE truncation. Selection
+    // text comes from the PDF text layer and is attacker-controlled —
+    // a hostile PDF can embed CSI/OSC bytes inside extractable
+    // glyphs. Both sinks (OSC 52 over /dev/tty AND the native binary
+    // via stdin) deliver bytes the user later pastes into a shell;
+    // unsanitised escapes execute on paste. `safe_for_clipboard`
+    // keeps bidi/zero-width chars (legitimate in international text)
+    // but drops C0/C1 controls and line separators.
+    let sanitised = crate::term_safe::safe_for_clipboard(text);
+    let mut payload: &str = &sanitised;
     let truncated = payload.len() > MAX_COPY_BYTES;
     if truncated {
         // Truncate at a char boundary so we don't slice through a

@@ -1423,6 +1423,12 @@ impl<'doc> App<'doc> {
         self.selection_placement = false;
         self.mode = Mode::Normal;
         self.status.clear();
+        // Clear the previous-frame selection-range hint. Without this,
+        // `try_selection_only_repaint` after exit-visual can attempt
+        // a fast-path repaint of a now-nonexistent selection's prior
+        // range, doing pointless work (and worse, the math on
+        // None-selection assumes the field is None too).
+        self.last_selection_range = None;
         // Drop leftover chord state (e.g. partial `g` from `gg`,
         // dangling awaiting_mark_*) so the next Normal-mode keystroke
         // isn't misinterpreted.
@@ -2623,7 +2629,7 @@ impl<'doc> App<'doc> {
         let meta = self.document.metadata();
         let title = meta
             .get(PdfDocumentMetadataTagType::Title)
-            .map(|t| crate::term_safe::safe_for_stderr(&t.value().to_string()))
+            .map(|t| crate::term_safe::safe_for_stderr(t.value()))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| {
                 // Filename fallback when PDF Title is empty.
@@ -2641,7 +2647,7 @@ impl<'doc> App<'doc> {
             });
         let author = meta
             .get(PdfDocumentMetadataTagType::Author)
-            .map(|t| crate::term_safe::safe_for_stderr(&t.value().to_string()))
+            .map(|t| crate::term_safe::safe_for_stderr(t.value()))
             .filter(|s| !s.is_empty());
         let bytes = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
         self.status = match author {

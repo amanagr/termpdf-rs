@@ -313,10 +313,7 @@ pub fn evict_to_budget(budget_bytes: u64) -> std::io::Result<()> {
     // sweep — a stale-perm or transient EIO on one directory used to
     // bail out of `evict_to_budget` entirely, leaving the cache
     // unbounded until the next sweep.
-    let pdf_dirs = match std::fs::read_dir(&cache_root) {
-        Ok(rd) => rd,
-        Err(e) => return Err(e.into()),
-    };
+    let pdf_dirs = std::fs::read_dir(&cache_root)?;
     for pdf_dir in pdf_dirs.flatten() {
         let pdf_dir_path = pdf_dir.path();
         if !pdf_dir_path.is_dir() {

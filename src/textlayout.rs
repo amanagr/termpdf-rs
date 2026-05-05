@@ -151,11 +151,28 @@ impl PageText {
                 Ok(r) => r,
                 Err(_) => continue,
             };
+            // Reject NaN/Inf coords from pdfium for malformed glyphs.
+            // `f32::clamp` is identity on NaN, so an unchecked NaN
+            // would propagate into chars[] and silently break selection
+            // (`char_at_point`'s comparisons against NaN are all false,
+            // so the nearest-by-centre fallback also misses → the char
+            // becomes invisible to selection / un-yankable).
+            let raw_left = bbox.left().value;
+            let raw_right = bbox.right().value;
+            let raw_top = bbox.top().value;
+            let raw_bottom = bbox.bottom().value;
+            if !raw_left.is_finite()
+                || !raw_right.is_finite()
+                || !raw_top.is_finite()
+                || !raw_bottom.is_finite()
+            {
+                continue;
+            }
             // Y flip: pdfium PdfRect is bottom-left; we want top-left.
-            let x = (bbox.left().value / w).clamp(0.0, 1.0);
-            let right = (bbox.right().value / w).clamp(0.0, 1.0);
-            let top = ((h - bbox.top().value) / h).clamp(0.0, 1.0);
-            let bot = ((h - bbox.bottom().value) / h).clamp(0.0, 1.0);
+            let x = (raw_left / w).clamp(0.0, 1.0);
+            let right = (raw_right / w).clamp(0.0, 1.0);
+            let top = ((h - raw_top) / h).clamp(0.0, 1.0);
+            let bot = ((h - raw_bottom) / h).clamp(0.0, 1.0);
             chars.push(CharCell {
                 idx: ch.index(),
                 ch: ch.unicode_char(),

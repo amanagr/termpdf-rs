@@ -63,6 +63,37 @@ use crate::app::LayoutKey;
 /// terminal memory tight.
 const MAX_CACHED_PAGES: usize = 7;
 
+/// Hard cap on decoded-RGBA bytes the registry will allow Ghostty to
+/// hold simultaneously. Verified from `graphics_storage.zig`: Ghostty's
+/// `image-storage-limit` defaults to 320 MB (per screen) and is
+/// measured in `img.data.len` — DECODED RGBA bytes, NOT bytes-on-wire.
+/// Once Ghostty's store is at the cap, the next transmit forces
+/// `evictImage` to run; it prefers unused images but **WILL evict
+/// images that have live placements** if unused images don't cover the
+/// deficit. That's the unloading-on-scroll bug.
+///
+/// We cap our own resident decoded-RGBA at a fraction of Ghostty's
+/// budget so Ghostty itself never needs to evict — we always free
+/// pages first, with proper `a=d` deletes, picking LRU non-pinned
+/// pages so visible content survives.
+///
+/// 200 MB ≈ 8–20 pages of letter-sized RGBA at our render DPI.
+/// Configurable via `TERMPDF_GHOSTTY_BUDGET_MB` env var (clamped
+/// 32–4096 MB).
+const DEFAULT_GHOSTTY_BUDGET_BYTES: u64 = 200 * 1024 * 1024;
+
+fn ghostty_budget_bytes() -> u64 {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<u64> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("TERMPDF_GHOSTTY_BUDGET_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|mb| mb.clamp(32, 4096) * 1024 * 1024)
+            .unwrap_or(DEFAULT_GHOSTTY_BUDGET_BYTES)
+    })
+}
+
 /// Image-cache entry per page index.
 #[derive(Debug, Clone)]
 struct PageEntry {
@@ -249,30 +280,50 @@ impl KittyPageRegistry {
     }
 
     /// Evict LRU entries until the registry holds at most
-    /// `MAX_CACHED_PAGES` pages. Pages in `pinned` are skipped (so the
-    /// current frame's visible pages stay alive). For each eviction,
-    /// emits a kitty `a=d,d=I,i=ID` delete escape into
+    /// `MAX_CACHED_PAGES` pages AND its on-terminal decoded-RGBA
+    /// footprint is under the Ghostty budget (see
+    /// `DEFAULT_GHOSTTY_BUDGET_BYTES`). Pages in `pinned` are skipped
+    /// so the current frame's visible pages stay alive. For each
+    /// eviction, emits a kitty `a=d,d=I,i=ID` delete escape into
     /// `pending_deletes` so the terminal also frees its image.
+    ///
+    /// The byte cap is the unloading-on-scroll mitigation: by evicting
+    /// ourselves before Ghostty has to, we control which pages get
+    /// unloaded (LRU non-pinned) instead of letting Ghostty's
+    /// `evictImage` evict in-use placements when its store fills.
     pub fn evict_to_budget(&mut self, pinned: &[usize]) {
-        if self.pages.len() <= MAX_CACHED_PAGES {
+        // Pre-build a HashSet of pinned ids to make the inner check O(1).
+        let pin: std::collections::HashSet<usize> = pinned.iter().copied().collect();
+        let budget = ghostty_budget_bytes();
+        let bytes_for = |e: &PageEntry| (e.pixel_w as u64).saturating_mul(e.pixel_h as u64) * 4;
+        let total_bytes: u64 = self.pages.values().map(bytes_for).sum();
+
+        let over_pages = self.pages.len().saturating_sub(MAX_CACHED_PAGES);
+        let over_bytes = total_bytes.saturating_sub(budget);
+        if over_pages == 0 && over_bytes == 0 {
             return;
         }
+
         // Scan front (LRU) to back, collecting victims that aren't
-        // pinned. Stop once we've trimmed enough. Building the
-        // eviction set up-front lets us drop entries from `self.lru`
-        // with one pass instead of an O(N) `VecDeque::remove(idx)`
-        // per evicted page; the previous loop was O(K·N) for K
-        // evictions on a doc that just blew past the cap.
-        let over = self.pages.len() - MAX_CACHED_PAGES;
-        let mut victims: Vec<usize> = Vec::with_capacity(over);
+        // pinned. Stop once both the page-count AND byte-budget caps
+        // are satisfied. Building the eviction set up-front lets us
+        // drop entries from `self.lru` with one pass instead of an
+        // O(N) `VecDeque::remove(idx)` per evicted page.
+        let mut victims: Vec<usize> = Vec::new();
+        let mut bytes_freed: u64 = 0;
+        let mut pages_freed: usize = 0;
         for &cand in self.lru.iter() {
-            if victims.len() >= over {
+            if pages_freed >= over_pages && bytes_freed >= over_bytes {
                 break;
             }
-            if pinned.contains(&cand) {
+            if pin.contains(&cand) {
                 continue;
             }
+            if let Some(entry) = self.pages.get(&cand) {
+                bytes_freed = bytes_freed.saturating_add(bytes_for(entry));
+            }
             victims.push(cand);
+            pages_freed += 1;
         }
         if victims.is_empty() {
             return;
@@ -363,8 +414,36 @@ impl KittyPageRegistry {
         self.pending_deletes = combined;
     }
 
+    /// Stable image_id for `page_idx`. Uses `checked_add` so a giant
+    /// document (page_idx in the millions) on top of an `id_base`
+    /// near `u32::MAX` doesn't silently alias two distinct pages onto
+    /// the same id — `wrapping_add` would let `id_for(0)` and
+    /// `id_for(some_high_idx)` collide, causing the second transmit
+    /// to overwrite the first in Ghostty's image store and mapping
+    /// the first page's placeholders to wrong content.
+    ///
+    /// On overflow, fall back to a deterministic re-fold into the
+    /// low half of the id space — keeps the function total without
+    /// a panic. The fold loses uniqueness for documents with more
+    /// than `u32::MAX / 2` pages (impossible in practice — max known
+    /// PDF page count is ~50k), but for any realistic input the
+    /// fold's input never overflows and the function reduces to the
+    /// original `add`.
     fn id_for(&self, page_idx: usize) -> u32 {
-        self.id_base.wrapping_add(1).wrapping_add(page_idx as u32)
+        let pi = page_idx as u32;
+        match self.id_base.checked_add(1).and_then(|b| b.checked_add(pi)) {
+            Some(id) => id,
+            None => {
+                // Fold into low half. Distinct page_idx values in the
+                // realistic range (< 2^31) still produce distinct ids
+                // because the fold preserves the low 31 bits of the
+                // (id_base + page_idx + 1) sum modulo 2^31.
+                let folded = (self.id_base as u64)
+                    .wrapping_add(1)
+                    .wrapping_add(pi as u64);
+                ((folded & 0x7FFF_FFFF) as u32).max(1)
+            }
+        }
     }
 
     /// True if this page has been transmitted to the terminal at least
@@ -798,6 +877,16 @@ fn build_transmit_string(
     let chunk_count = payload.len().div_ceil(RAW_PER_CHUNK).max(1);
     let mut data = String::with_capacity(chunk_count * (CHARS_PER_CHUNK + 64));
 
+    // Decoded-RGBA size hint for kitty `S=NNN`. Lets Ghostty
+    // pre-allocate against `image-storage-limit` and reject mid-load
+    // if the cumulative transmit would exceed the cap, instead of
+    // discovering near the end and evicting a still-in-use image to
+    // make room.
+    let decoded_size_bytes = (pixel_w as u64).saturating_mul(pixel_h as u64).saturating_mul(
+        // RGB for f=24, RGBA for f=32, PNG/anything-else: best-effort
+        // approximation as RGBA.
+        if format_code == 24 { 3 } else { 4 },
+    );
     for (i, chunk) in payload.chunks(RAW_PER_CHUNK).enumerate() {
         data.push_str(start);
         write!(data, "{escape}_Gq=2,").unwrap();
@@ -813,14 +902,26 @@ fn build_transmit_string(
             // uncompressed raw paths leave it off — PNG carries its own
             // zlib stream inside the container, double-deflate is wasted
             // work and Ghostty rejects it.
+            // S=N is the decoded-size hint so the terminal can plan
+            // storage up-front (mitigates Ghostty image-storage-limit
+            // mid-load eviction; see `ghostty_budget_bytes`).
             write!(
                 data,
-                "i={id},a=T,U=1,f={format_code},t=d,s={pixel_w},v={pixel_h},"
+                "i={id},a=T,U=1,f={format_code},t=d,s={pixel_w},v={pixel_h},S={decoded_size_bytes},"
             )
             .unwrap();
             if compression == b'z' {
                 write!(data, "o=z,").unwrap();
             }
+        } else {
+            // Continuation chunks MUST carry `i={id}` per the kitty
+            // graphics protocol, so the terminal can route the chunk
+            // to the correct in-progress upload. Both kitty and
+            // current Ghostty also accept the omission (they fall
+            // back to "last active chunked upload for this client"),
+            // but a future stricter parser would silently drop the
+            // chunk → blank page.
+            write!(data, "i={id},").unwrap();
         }
         let more = u8::from(chunk_count > i + 1);
         write!(data, "m={more};").unwrap();
@@ -1023,13 +1124,13 @@ pub fn place_page(
             }
         }
     }
-    // Record the placement so future frames' clear_page_area can
-    // preserve these cells if the page collapses to 0 visible cells
-    // at a sub-cell scroll boundary. The rect is in absolute buffer
-    // coordinates; entries linger until the page leaves the registry
-    // (pruned by evict_to_budget) so the preservation survives any
-    // number of consecutive cell-clipped frames.
-    scratch.last_placed.insert(page_idx, new_rect);
+    // last_placed insert moved to AFTER the placement loop (see end
+    // of function) — recording the rect before writing cells means
+    // a loop that exits early (cell_y >= area.bottom() on iter 0)
+    // would mark the page as "placed" at `new_rect` even though no
+    // cells actually carry the placeholder. Next-frame
+    // clear_page_area would then preserve cells that were never
+    // written, leaving them holding their previous state forever.
 
     // Encode image ID in foreground color (24-bit). The high byte goes
     // into a third diacritic on each placeholder.
@@ -1095,6 +1196,7 @@ pub fn place_page(
         symbol.reserve(2048 - symbol.capacity());
     }
     let mut prefix_ref = prefix;
+    let mut rows_written: u16 = 0;
 
     for dy in 0..height_cells {
         symbol.clear();
@@ -1130,6 +1232,7 @@ pub fn place_page(
             // reaches the terminal. Centered pages were rendering
             // blank as a result.
             cell.set_skip(false);
+            rows_written = rows_written.saturating_add(1);
         }
         // Mark cells right of column 0 as skipped so ratatui's diff
         // doesn't overwrite our placeholders with empty cells.
@@ -1143,7 +1246,23 @@ pub fn place_page(
             }
         }
     }
-    height_cells
+    // Record the placement so future frames' clear_page_area can
+    // preserve these cells if the page collapses to 0 visible cells
+    // at a sub-cell scroll boundary. The rect is in absolute buffer
+    // coordinates; entries linger until the page leaves the registry
+    // (pruned by evict_to_budget) so the preservation survives any
+    // number of consecutive cell-clipped frames.
+    //
+    // Conditional on `rows_written > 0`: if the loop exited early
+    // (cell_y >= area.bottom() on iter 0) we wrote zero placeholder
+    // cells, so recording new_rect would lie to next frame's
+    // clear_page_area (it'd preserve cells that hold whatever was
+    // there before — possibly a stale placeholder for a different
+    // image_id).
+    if rows_written > 0 {
+        scratch.last_placed.insert(page_idx, new_rect);
+    }
+    rows_written
 }
 
 /// Clear every cell in `area` so it no longer carries a stale kitty

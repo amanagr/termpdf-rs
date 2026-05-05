@@ -170,11 +170,13 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         // (The compound guard `if ctrl && note_scroll_attempt()` is
         // misleading: arm-guard failure makes the arm not match,
         // not the keystroke not handled.)
+        #[allow(clippy::collapsible_match, clippy::collapsible_if)]
         KeyCode::Char('d') if ctrl => {
             if app.note_scroll_attempt() {
                 app.scroll_by_screens(SCROLL_HALF);
             }
         }
+        #[allow(clippy::collapsible_match, clippy::collapsible_if)]
         KeyCode::Char('u') if ctrl => {
             if app.note_scroll_attempt() {
                 app.scroll_by_screens(-SCROLL_HALF);

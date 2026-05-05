@@ -1154,13 +1154,22 @@ pub(crate) fn compute_page_revision(app: &App<'_>, page_idx: usize) -> u64 {
     // FNV-1a-style mix; doesn't need to be cryptographic — just
     // non-degenerate enough that flipping any single field flips the
     // revision.
+    //
+    // Bool-domain fields are shifted into disjoint high bits before
+    // mixing so they can't collide with low-bit revisions. Without
+    // this, `(rev=1, hits=true, cur=false)` xors to `(1^1^0)=0` which
+    // also equals `(rev=0, hits=false, cur=false)`, leaving the
+    // canvas tier unable to distinguish "first hit found" from "no
+    // search active" — `n`/`N` near a low search_revision then fails
+    // to repaint the new current-hit outline.
+    let bool_bits =
+        ((has_search_hits as u64) << 32) | ((current_hit_on_this_page as u64) << 33);
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for v in [
         highlight_sig,
         selection_sig,
         search_revision,
-        has_search_hits as u64,
-        current_hit_on_this_page as u64,
+        bool_bits,
     ] {
         h ^= v;
         h = h.wrapping_mul(0x100_0000_01b3);
@@ -1465,6 +1474,15 @@ fn drain_worker_results(app: &mut App<'_>) {
             Ok(img) => {
                 app.page_cache.insert(resp.req.page, img);
                 app.touch_page(resp.req.page);
+                // Worker results are Fast-quality (matches the sync
+                // request_prefetch fallback path at ensure_page_rendered
+                // — see the `pages_at_fast_quality.insert` there).
+                // Without this insert, `upgrade_one_visible_to_sharp`'s
+                // `pages_at_fast_quality.contains` gate would reject
+                // worker-rendered pages and the user would see Fast
+                // quality forever despite an idle Sharp upgrade
+                // budget being available.
+                app.pages_at_fast_quality.insert(resp.req.page);
                 // Force a recompose since a previously-blank page
                 // now has pixels.
                 app.last_compose_key = None;
