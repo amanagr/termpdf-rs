@@ -295,10 +295,55 @@ pub fn save(index: &DocIndex, path: &std::path::Path) -> std::io::Result<bool> {
 
     // Atomic write via rename so a crash mid-write doesn't leave a
     // truncated index that later loads as garbage.
-    let tmp = path.with_extension("idx.tmp");
-    if std::fs::write(&tmp, &buf).is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return Ok(false);
+    //
+    // Pattern matches `disk_cache.rs::store` and `pdfhighlights::save_atomic`:
+    //   * pid+nanos suffix → no two concurrent writers ever collide on
+    //     the deterministic temp slot.
+    //   * `create_new` (O_EXCL) + `O_NOFOLLOW` → a same-UID attacker
+    //     can't pre-plant the temp path as a symlink to a victim file
+    //     (~/.bashrc, etc.) and trick the index write into truncating
+    //     it. Without these flags, `fs::write` follows symlinks.
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_name = format!(
+        "{}.{pid}.{nanos}.tmp",
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("index.idx")
+    );
+    let tmp = parent.join(tmp_name);
+    {
+        #[cfg(unix)]
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt;
+            const O_NOFOLLOW: i32 = 0x20000;
+            const O_EXCL: i32 = 0o0200;
+            let mut f = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .custom_flags(O_NOFOLLOW | O_EXCL)
+                .mode(0o600)
+                .open(&tmp)
+            {
+                Ok(f) => f,
+                Err(_) => return Ok(false),
+            };
+            if f.write_all(&buf).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+                return Ok(false);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if std::fs::write(&tmp, &buf).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+                return Ok(false);
+            }
+        }
     }
     if std::fs::rename(&tmp, path).is_err() {
         let _ = std::fs::remove_file(&tmp);

@@ -1554,6 +1554,19 @@ impl<'doc> App<'doc> {
             if added_any {
                 self.highlight_revision += 1;
                 self.invalidate_compose();
+                // Auto-persist so a panic / SIGKILL / power loss mid-
+                // session bounds the worst-case loss to one yank instead
+                // of "every highlight made since startup". Best-effort:
+                // a write failure is surfaced via status but doesn't
+                // abort the user's flow. ~50ms per call (filtered save
+                // walks only touched pages) — acceptable per-yank cost
+                // for the safety guarantee.
+                if let Err(e) = self.persist_highlights() {
+                    self.status = format!(
+                        "highlight saved in memory; auto-persist failed: {}",
+                        crate::term_safe::safe_for_stderr(&format!("{e:#}"))
+                    );
+                }
             }
         }
 
@@ -2367,6 +2380,15 @@ impl<'doc> App<'doc> {
         if removed > 0 {
             self.highlight_revision += 1;
             self.invalidate_compose();
+            // Mirror the auto-persist on the yank path so a panic
+            // between delete and exit doesn't resurrect the deleted
+            // highlight on next reopen.
+            if let Err(e) = self.persist_highlights() {
+                self.status = format!(
+                    "deleted in memory; auto-persist failed: {}",
+                    crate::term_safe::safe_for_stderr(&format!("{e:#}"))
+                );
+            }
         }
         removed
     }
@@ -2878,6 +2900,17 @@ impl<'doc> App<'doc> {
     /// at `out_path`. One entry per highlight, page-grouped, with the
     /// quoted text pulled from the page's text layer if available.
     pub fn export_notes(&mut self, out_path: &Path) -> Result<()> {
+        self.export_notes_inner(out_path, false)
+    }
+
+    /// Variant that overwrites an existing file. Wired to `:export!` so
+    /// the user has to opt in (vim convention) — accidentally typing
+    /// `:export ~/.bashrc` should fail loudly, not wipe the target.
+    pub fn export_notes_force(&mut self, out_path: &Path) -> Result<()> {
+        self.export_notes_inner(out_path, true)
+    }
+
+    fn export_notes_inner(&mut self, out_path: &Path, force_overwrite: bool) -> Result<()> {
         use std::io::Write;
         if self.highlights.items.is_empty() {
             anyhow::bail!("no highlights to export");
@@ -2921,8 +2954,56 @@ impl<'doc> App<'doc> {
                 }
             }
         }
-        let mut f = std::fs::File::create(out_path)
-            .with_context(|| format!("creating {}", out_path.display()))?;
+        // Path safety: open with O_NOFOLLOW so a planted symlink at
+        // `out_path` doesn't redirect the write to a victim file
+        // (~/.bashrc, etc.). On unix, also use O_EXCL by default; only
+        // pass `truncate(true)` when the user has explicitly opted in
+        // via `:export!`. Without these defenses, `:export ~/.bashrc`
+        // (or a symlink at the auto-derived `<stem>.notes.md` next
+        // to the PDF in a writable shared dir) silently wipes the
+        // target file.
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            const O_NOFOLLOW: i32 = 0x20000;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).custom_flags(O_NOFOLLOW).mode(0o644);
+            if force_overwrite {
+                opts.create(true).truncate(true);
+            } else {
+                opts.create_new(true);
+            }
+            opts.open(out_path).with_context(|| {
+                if force_overwrite {
+                    format!("opening {} for write", out_path.display())
+                } else {
+                    format!(
+                        "creating {} (use `:export!` to overwrite)",
+                        out_path.display()
+                    )
+                }
+            })?
+        };
+        #[cfg(not(unix))]
+        let mut f = {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true);
+            if force_overwrite {
+                opts.create(true).truncate(true);
+            } else {
+                opts.create_new(true);
+            }
+            opts.open(out_path).with_context(|| {
+                if force_overwrite {
+                    format!("opening {} for write", out_path.display())
+                } else {
+                    format!(
+                        "creating {} (use `:export!` to overwrite)",
+                        out_path.display()
+                    )
+                }
+            })?
+        };
         f.write_all(buf.as_bytes())
             .with_context(|| format!("writing {}", out_path.display()))?;
         Ok(())

@@ -34,7 +34,13 @@ pub enum Command {
     Refs,
     /// `:export [path]`. `None` means "derive default path from the
     /// open PDF" (resolved at execute-time so the parser stays pure).
-    Export(Option<PathBuf>),
+    /// `force` is set by `:export!` (vim convention) to permit
+    /// overwriting an existing file. Without `!`, an existing
+    /// destination is refused — protects against `:export ~/.bashrc`.
+    Export {
+        target: Option<PathBuf>,
+        force: bool,
+    },
     /// Show PDF metadata (title, author, page count, file size).
     Info,
     /// Show rendering diagnostics (cell pixel size, viewport, zoom,
@@ -96,12 +102,13 @@ pub fn parse(line: &str) -> Command {
         "refs" | "ref" | "bib" | "bibliography" | "references" => Command::Refs,
         "info" | "metadata" => Command::Info,
         "diag" | "diagnostics" => Command::Diag,
-        "export" | "notes" => {
+        "export" | "notes" | "export!" | "notes!" => {
             // `:export some/path/with spaces.md` is rare but possible;
             // take the rest of the line verbatim rather than re-joining
             // split tokens. The previous `parts.collect().join(" ")`
             // collapsed runs of whitespace and tabs (so `:export  /tmp/a  b.md`
             // silently became `/tmp/a b.md`, writing to the wrong file).
+            let force = head.ends_with('!');
             let head_end = head.len();
             let rest = line.get(head_end..).unwrap_or("").trim();
             let target = if rest.is_empty() {
@@ -109,7 +116,7 @@ pub fn parse(line: &str) -> Command {
             } else {
                 Some(PathBuf::from(rest))
             };
-            Command::Export(target)
+            Command::Export { target, force }
         }
         other => Command::Unknown(other.to_string()),
     }
@@ -131,8 +138,8 @@ pub fn execute(app: &mut App<'_>, line: &str) {
         Command::Refs => app.jump_to_references(),
         Command::Info => app.show_info(),
         Command::Diag => app.show_diag(),
-        Command::Export(maybe_target) => {
-            let target = maybe_target.unwrap_or_else(|| {
+        Command::Export { target, force } => {
+            let target = target.unwrap_or_else(|| {
                 let mut p = app.path.clone();
                 let stem = p
                     .file_stem()
@@ -142,7 +149,12 @@ pub fn execute(app: &mut App<'_>, line: &str) {
                 p.set_file_name(format!("{stem}.notes.md"));
                 p
             });
-            match app.export_notes(&target) {
+            let result = if force {
+                app.export_notes_force(&target)
+            } else {
+                app.export_notes(&target)
+            };
+            match result {
                 Ok(()) => {
                     app.status = format!(
                         "exported notes → {}",
@@ -243,16 +255,59 @@ mod tests {
 
     #[test]
     fn export_with_and_without_path() {
-        assert_eq!(parse("export"), Command::Export(None));
-        assert_eq!(parse("notes"), Command::Export(None));
+        assert_eq!(
+            parse("export"),
+            Command::Export {
+                target: None,
+                force: false
+            }
+        );
+        assert_eq!(
+            parse("notes"),
+            Command::Export {
+                target: None,
+                force: false
+            }
+        );
         assert_eq!(
             parse("export /tmp/notes.md"),
-            Command::Export(Some(PathBuf::from("/tmp/notes.md")))
+            Command::Export {
+                target: Some(PathBuf::from("/tmp/notes.md")),
+                force: false,
+            }
         );
         // Path with spaces survives — collected verbatim, not split.
         assert_eq!(
             parse("export /tmp/has spaces.md"),
-            Command::Export(Some(PathBuf::from("/tmp/has spaces.md")))
+            Command::Export {
+                target: Some(PathBuf::from("/tmp/has spaces.md")),
+                force: false,
+            }
+        );
+    }
+
+    #[test]
+    fn export_bang_sets_force() {
+        assert_eq!(
+            parse("export!"),
+            Command::Export {
+                target: None,
+                force: true,
+            }
+        );
+        assert_eq!(
+            parse("export! /tmp/notes.md"),
+            Command::Export {
+                target: Some(PathBuf::from("/tmp/notes.md")),
+                force: true,
+            }
+        );
+        assert_eq!(
+            parse("notes!"),
+            Command::Export {
+                target: None,
+                force: true,
+            }
         );
     }
 
