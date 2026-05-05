@@ -1,18 +1,20 @@
 name: CI
 
-# Ship-readiness gate. Runs on every push to main + every PR. Three
+# Ship-readiness gate. Runs on every push to main + every PR. Two
 # tiers, in order of cost:
 #   1. fmt/clippy/build  — fast, fails the run early on lint/build
 #                          breakage so the slower jobs don't waste
 #                          a runner.
-#   2. unit + integration tests — the 264 unit tests, render_kitty
+#   2. unit + integration tests — the unit tests, render_kitty
 #                          smoke, render_pty pty-driven smoke, and
-#                          the registry property tests at the
+#                          the registry property tests at 4× the
 #                          default case count.
-#   3. perf regression   — runs the perf_harness scenarios against
-#                          the tracked baseline. Gated to push-to-main
-#                          and PRs touching perf-sensitive paths so
-#                          PR cycles stay under 2 minutes.
+#
+# Perf regression tracking is *not* in CI: wall-clock numbers swing
+# wildly across runner hardware, so cross-machine baselines are
+# noise. `tests/perf_baseline.json` is a developer-local artifact;
+# the nightly soak workflow (stress-nightly.yml) is the long-horizon
+# perf signal.
 #
 # All tiers share a vendor cache: pdfium-binaries is ~7.5 MB
 # downloaded once per cache-key bump (= setup.sh hash change), so the
@@ -95,36 +97,3 @@ jobs:
         env:
           PROPTEST_CASES: "256"
         run: cargo test --release --bin termpdf registry_proptests
-
-  perf:
-    name: perf regression
-    runs-on: ubuntu-24.04
-    needs: test
-    # Skip perf on draft PRs — they're typically WIP and the
-    # +90 s on every push isn't worth it.
-    if: github.event_name == 'push' || !github.event.pull_request.draft
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install rust toolchain
-        run: rustup default stable
-      - name: Cache vendor
-        uses: actions/cache@v4
-        with:
-          path: vendor
-          key: vendor-pdfium-${{ hashFiles('setup.sh') }}
-      - name: setup.sh (fetch pdfium if missing)
-        run: ./setup.sh
-      - name: Cache cargo registry + target
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-      - name: perf_harness vs tracked baseline
-        # Verbose stdout makes the fail mode explorable from the
-        # workflow log without re-running.
-        env:
-          TERMPDF_PERF_VERBOSE: "1"
-        run: cargo test --release --test perf_harness

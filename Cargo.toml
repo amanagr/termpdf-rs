@@ -85,6 +85,22 @@ portable-pty = "0.9"
 # support and `proptest-regressions/` replay of past counterexamples.
 proptest = "1"
 
+# Clippy lint thresholds. Carve-outs are deliberate, not aspirational:
+#   - too_many_arguments / type_complexity: a few hot signatures (kitty
+#     blit planning, pty spawn helpers in tests) carry their state as
+#     positional args by design — refactoring to a struct would obscure
+#     the data flow without changing what the function does.
+#   - doc_lazy_continuation / doc_overindented_list_items: stylistic
+#     lints that flag fully-readable doc bullets the moment they
+#     wrap; not worth the churn on every doc edit.
+#   - missing_safety_doc / new_without_default: false-positives on
+#     internal APIs that are private to the crate.
+[lints.clippy]
+too_many_arguments = "allow"
+type_complexity = "allow"
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
+
 [profile.release]
 # Smaller binary, no measurable perf loss for our workload.
 lto = "thin"
