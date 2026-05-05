@@ -313,6 +313,16 @@ impl KittyPageRegistry {
             }
         }
         self.lru.retain(|p| !victim_set.contains(p));
+        if crate::debug_log::enabled() {
+            crate::debug_log::write(
+                "evict",
+                &format!(
+                    "victims={victims:?} freed_ids={freed_ids:?} pinned={pinned:?} \
+                     remaining={n}",
+                    n = self.pages.len()
+                ),
+            );
+        }
         self.queue_deletes(&freed_ids);
     }
 
@@ -406,6 +416,12 @@ impl KittyPageRegistry {
         for entry in self.pages.values_mut() {
             entry.transmitted_layout = None;
         }
+        if crate::debug_log::enabled() {
+            crate::debug_log::write(
+                "invalidate_all",
+                &format!("n_pages={n}", n = self.pages.len()),
+            );
+        }
     }
 
     /// True if the cached transmit for this page is fresh — caller
@@ -465,6 +481,17 @@ impl KittyPageRegistry {
         entry.pixel_w = pixel_w;
         entry.pixel_h = pixel_h;
         self.touch(page_idx);
+        if crate::debug_log::enabled() {
+            crate::debug_log::write(
+                "mark_transmitted",
+                &format!(
+                    "page={page_idx} id={id} rev={revision} w={pixel_w} h={pixel_h} \
+                     fit_w={fit} dark={dark}",
+                    fit = layout.fit_width_px,
+                    dark = layout.dark
+                ),
+            );
+        }
     }
 
     /// Build the kitty transmit escape for this page's bitmap. Free
@@ -530,7 +557,11 @@ impl KittyPageRegistry {
                 .cached_payload
                 .as_ref()
                 .expect("cached_payload populated on the line above");
-            build_transmit_string(
+            let needs_encode_log = needs_encode;
+            let bytes_len = c.bytes.len();
+            let format_code = c.format_code;
+            let compression = c.compression;
+            let s = build_transmit_string(
                 &c.bytes,
                 c.format_code,
                 c.compression,
@@ -538,7 +569,19 @@ impl KittyPageRegistry {
                 pixel_w,
                 pixel_h,
                 is_tmux,
-            )
+            );
+            if crate::debug_log::enabled() {
+                crate::debug_log::write(
+                    "transmit",
+                    &format!(
+                        "page={page_idx} id={id} w={pixel_w} h={pixel_h} \
+                         payload_bytes={bytes_len} wire_bytes={wire} \
+                         f={format_code} o={compression} re_encoded={needs_encode_log}",
+                        wire = s.len()
+                    ),
+                );
+            }
+            s
         };
         self.touch(page_idx);
         result
@@ -923,7 +966,30 @@ pub fn place_page(
     // fewer image cols remain than the placement area can show.
     let width_cells = width_cells.min(max_src_cols.saturating_sub(src_left_cell));
     if height_cells == 0 || width_cells == 0 {
+        if crate::debug_log::enabled() {
+            crate::debug_log::write(
+                "place_skip",
+                &format!(
+                    "page={page_idx} id={image_id} reason=zero_cells \
+                     dst_h={dst_height_cells} src_top={src_top_cell} src_left={src_left_cell}"
+                ),
+            );
+        }
         return 0;
+    }
+    if crate::debug_log::enabled() {
+        crate::debug_log::write(
+            "place",
+            &format!(
+                "page={page_idx} id={image_id} dst_top={dst_top_cell} \
+                 dst_left={x} dst_h={height_cells} dst_w={width_cells} \
+                 src_top={src_top_cell} src_left={src_left_cell} \
+                 area_y={ay} area_h={ah}",
+                x = area.x,
+                ay = area.y,
+                ah = area.height
+            ),
+        );
     }
     if width_cells as u32 > MAX_COLS {
         // Source col diacritic capacity exceeded; clamp silently.
@@ -1095,6 +1161,18 @@ pub fn clear_page_area(
     use std::fmt::Write;
     if area.width == 0 || area.height == 0 {
         return;
+    }
+    if crate::debug_log::enabled() {
+        crate::debug_log::write(
+            "clear_area",
+            &format!(
+                "x={x} y={y} w={w} h={h}",
+                x = area.x,
+                y = area.y,
+                w = area.width,
+                h = area.height
+            ),
+        );
     }
     let dims = (area.width, area.height);
     if scratch.cached_row_clear_dims != dims || scratch.cached_row_clear.is_empty() {

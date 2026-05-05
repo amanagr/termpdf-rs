@@ -429,6 +429,22 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
             ) > 0
         })
         .collect();
+    if crate::debug_log::enabled() {
+        let layout_visible: Vec<usize> = visible_range.clone().collect();
+        let dropped: Vec<usize> = layout_visible
+            .iter()
+            .copied()
+            .filter(|p| !visible.contains(p))
+            .collect();
+        crate::debug_log::write(
+            "visible",
+            &format!(
+                "scroll_y={sy} layout_visible={layout_visible:?} placed={visible:?} \
+                 dropped_by_cell_filter={dropped:?}",
+                sy = app.scroll_y_px
+            ),
+        );
+    }
     if visible.is_empty() {
         return Ok(());
     }
@@ -644,6 +660,12 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
             if is_cold {
                 b.need_transmit = false;
                 b.placement_active = false;
+                if crate::debug_log::enabled() {
+                    crate::debug_log::write(
+                        "rapid_defer",
+                        &format!("page={p} id={id}", p = b.page_idx, id = b.image_id),
+                    );
+                }
             }
         }
     }
@@ -671,6 +693,17 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
         let current_page = app.current_page();
         let to_defer = plan_transmit_deferrals(&triples, current_page, MAX_TRANSMITS_PER_DRAW);
         if !to_defer.is_empty() {
+            if crate::debug_log::enabled() {
+                let deferred_pages: Vec<usize> =
+                    to_defer.iter().map(|&i| blits[i].page_idx).collect();
+                crate::debug_log::write(
+                    "budget_defer",
+                    &format!(
+                        "current_page={current_page} deferred={deferred_pages:?} \
+                         budget={MAX_TRANSMITS_PER_DRAW}"
+                    ),
+                );
+            }
             for i in to_defer {
                 blits[i].need_transmit = false;
             }

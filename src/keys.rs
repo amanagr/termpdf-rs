@@ -175,6 +175,7 @@ fn normal_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         // re-transmit. Same effect as the user's zoom-out + zoom-in
         // workaround, without the layout/scroll churn.
         KeyCode::Char('l') if ctrl => {
+            crate::debug_log::write("ctrl_l", "user pressed Ctrl-L");
             if let Some(kp) = app.kitty_pages.as_mut() {
                 kp.invalidate_all_transmits();
             }
