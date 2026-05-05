@@ -94,7 +94,10 @@ impl Session {
 
     pub fn save(&self, pdf: &Path) -> Result<()> {
         let p = Self::store_path(pdf)?;
-        let body = serde_json::to_string_pretty(self)?;
+        // Compact JSON: this file is private (0600) and never user-edited.
+        // Pretty-print added a trailing newline + 4-space indent to every
+        // field for no reader benefit and 2x the byte count.
+        let body = serde_json::to_string(self)?;
         write_private_session(&p, body.as_bytes())
     }
 }
@@ -138,7 +141,12 @@ fn write_private_session(path: &Path, data: &[u8]) -> Result<()> {
                 .mode(0o600)
                 .open(&tmp)?;
             std::io::Write::write_all(&mut f, data)?;
-            f.sync_all()?;
+            // No sync_all: the rename below is atomic on the same FS,
+            // so we either see the OLD complete file or the NEW complete
+            // file after a crash — never a partial. Session data is
+            // best-effort anyway (a corrupt load returns Default and
+            // logs nothing). fsync on slow / network FS is multi-tens
+            // to hundreds of ms per save and added no real safety.
         }
         #[cfg(not(unix))]
         {

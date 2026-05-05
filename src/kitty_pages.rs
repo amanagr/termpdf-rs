@@ -917,11 +917,18 @@ fn encode_payload_opaque(bitmap: &RgbaImage) -> (u8, u8, Vec<u8>) {
 /// Strip alpha, then zlib-deflate the RGB bytes. Returns the `o=z`
 /// payload for kitty `f=24,o=z` transmit. Uses `flate2::Compression::fast()`
 /// (zlib level 1) — see body comment for why level 1 is the sweet spot.
+///
+/// Streams RGB into the encoder in fixed-size stack-allocated chunks
+/// rather than materialising the entire RGB plane first: at high zoom
+/// the full RGB Vec was ~24 MB, so peak memory was RGBA + RGB + zlib
+/// output simultaneously. Streaming caps the additional working set
+/// at the chunk size (12 KB on the stack) plus the encoder's own
+/// internal buffers — the input RGBA is borrowed in-place, never
+/// copied wholesale.
 fn encode_rgb_zlib(bitmap: &RgbaImage) -> std::io::Result<Vec<u8>> {
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
     use std::io::Write;
-    let rgb = strip_alpha(bitmap);
     // PDF pages typically deflate 5–20× on real content. Reserve a
     // generous lower bound so the inner Vec doesn't grow during the
     // flush (encoder writes in ~32 KB chunks).
@@ -933,13 +940,37 @@ fn encode_rgb_zlib(bitmap: &RgbaImage) -> std::io::Result<Vec<u8>> {
     // this swap perf-neutral against the kitty PNG encode it
     // replaced.
     let mut enc = ZlibEncoder::new(Vec::with_capacity(384 * 1024), Compression::fast());
-    enc.write_all(&rgb)?;
+    let raw = bitmap.as_raw();
+    // Process 4096 pixels (16 KB RGBA → 12 KB RGB) per pass. Stack
+    // arrays at this size are safe on every supported platform
+    // (default stack is ≥ 1 MB).
+    const PIXELS_PER_CHUNK: usize = 4096;
+    let mut rgb_buf = [0u8; PIXELS_PER_CHUNK * 3];
+    let mut iter = raw.chunks_exact(PIXELS_PER_CHUNK * 4);
+    for rgba_chunk in &mut iter {
+        for (i, px) in rgba_chunk.chunks_exact(4).enumerate() {
+            // Copy 3 bytes; the compiler vectorises this into wider
+            // loads/stores at -O.
+            rgb_buf[i * 3..i * 3 + 3].copy_from_slice(&px[..3]);
+        }
+        enc.write_all(&rgb_buf)?;
+    }
+    // Tail: bitmap dimensions don't always align to PIXELS_PER_CHUNK.
+    let tail = iter.remainder();
+    if !tail.is_empty() {
+        let pixels = tail.len() / 4;
+        for (i, px) in tail.chunks_exact(4).enumerate() {
+            rgb_buf[i * 3..i * 3 + 3].copy_from_slice(&px[..3]);
+        }
+        enc.write_all(&rgb_buf[..pixels * 3])?;
+    }
     enc.finish()
 }
 
-/// Copy RGBA → RGB, dropping the alpha byte. Iterates 4-byte chunks
-/// so the compiler can vectorise; ~5 ms on a 10 MB page bitmap, which
-/// is dwarfed by the ~30-50 ms PNG encode that follows.
+/// Copy RGBA → RGB, dropping the alpha byte. Used by the uncompressed
+/// `f=24` fallback paths (`TERMPDF_TRANSMIT_RAW=1` and the zlib-error
+/// branch); the main `f=24,o=z` path streams instead via
+/// `encode_rgb_zlib`. ~5 ms on a 10 MB page bitmap.
 fn strip_alpha(bitmap: &RgbaImage) -> Vec<u8> {
     let raw = bitmap.as_raw();
     let mut out = Vec::with_capacity(raw.len() / 4 * 3);
