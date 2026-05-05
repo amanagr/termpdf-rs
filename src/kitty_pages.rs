@@ -223,6 +223,13 @@ pub struct KittyPageRegistry {
     /// different page's transmit — caught by the registry property
     /// tests at I4 ("no live image_id is queued for delete").
     pending_deletes: Vec<u32>,
+    /// Running sum of decoded-RGBA bytes for pages whose
+    /// `transmitted_layout.is_some()` (i.e. Ghostty actually holds
+    /// the bitmap). Maintained incrementally on every mark_transmitted
+    /// / evict / invalidate so `evict_to_budget` doesn't have to
+    /// `pages.values().sum()` on every steady-state frame. The hot
+    /// early-out check now reads one u64 instead of walking the map.
+    transmitted_bytes: u64,
     /// Scratch buffers reused across `place_page` calls. Memoizes the
     /// per-row diacritic string (varies by viewport `cols` only) and
     /// the restore-cursor escape (varies by `area.width`/`area.height`
@@ -292,8 +299,16 @@ impl KittyPageRegistry {
             pages: HashMap::new(),
             lru: VecDeque::new(),
             pending_deletes: Vec::new(),
+            transmitted_bytes: 0,
             place_scratch: PlaceScratch::default(),
         }
+    }
+
+    /// Per-entry decoded-RGBA byte cost. Inline so the byte-budget
+    /// callers and the incremental tracker agree on the formula.
+    #[inline]
+    fn entry_bytes(pixel_w: u32, pixel_h: u32) -> u64 {
+        (pixel_w as u64).saturating_mul(pixel_h as u64) * 4
     }
 
     /// Mutable handle to the place-scratch. Hot path: passed into
@@ -359,35 +374,38 @@ impl KittyPageRegistry {
     /// would exceed Ghostty's store (high zoom on high-DPI displays).
     /// In the common case the byte path is a no-op.
     pub fn evict_to_budget(&mut self, pinned: &[usize]) {
-        // Pre-build a HashSet of pinned ids to make the inner check O(1).
-        let pin: std::collections::HashSet<usize> = pinned.iter().copied().collect();
+        // Debug-only invariant: running total must match the value a
+        // map-walk would produce. Catches any mutation site that
+        // forgot to update `transmitted_bytes`. Compiled out of
+        // release builds — production hot path is the early-out.
+        debug_assert_eq!(
+            self.transmitted_bytes,
+            self.pages
+                .values()
+                .filter(|e| e.transmitted_layout.is_some())
+                .map(|e| Self::entry_bytes(e.pixel_w, e.pixel_h))
+                .sum::<u64>(),
+            "transmitted_bytes drift — a mutation site forgot to update the running total"
+        );
+        // Hot early-out: read the running totals (no map walk, no
+        // HashSet alloc). In steady-state scrolls neither cap is
+        // breached and we return without touching anything.
         let budget = ghostty_budget_bytes();
-        let bytes_for = |e: &PageEntry| (e.pixel_w as u64).saturating_mul(e.pixel_h as u64) * 4;
-        // Count only TRANSMITTED pages toward Ghostty's budget — entries
-        // that exist locally but haven't been sent (transmitted_layout
-        // is None) don't occupy Ghostty's store. Without this filter,
-        // pre_encode'd prefetch pages get counted and evicted before
-        // the user ever reaches them.
-        let transmitted_bytes: u64 = self
-            .pages
-            .values()
-            .filter(|e| e.transmitted_layout.is_some())
-            .map(bytes_for)
-            .sum();
-
         let over_pages = self.pages.len().saturating_sub(max_cached_pages());
-        let over_bytes = transmitted_bytes.saturating_sub(budget);
+        let over_bytes = self.transmitted_bytes.saturating_sub(budget);
         if over_pages == 0 && over_bytes == 0 {
             return;
         }
 
-        // Scan front (LRU) to back, collecting victims that aren't
-        // pinned. Stop once both the page-count AND byte-budget caps
-        // are satisfied. Pre-encoded-but-unsent entries (no
-        // transmitted_layout) consume zero bytes against the budget,
-        // so evicting them only helps the page-count cap; we still
-        // pick them as victims to satisfy that cap, but they don't
-        // help bytes_freed cross the over_bytes threshold.
+        // Past the early-out: actually have to evict. Now build the
+        // pin-set and scan the LRU. Front (LRU) to back, collecting
+        // non-pinned victims. Stop once both the page-count AND
+        // byte-budget caps are satisfied. Pre-encoded-but-unsent
+        // entries (no transmitted_layout) consume zero bytes against
+        // the budget, so evicting them only helps the page-count cap;
+        // we still pick them as victims to satisfy that cap, but they
+        // don't help bytes_freed cross the over_bytes threshold.
+        let pin: std::collections::HashSet<usize> = pinned.iter().copied().collect();
         let mut victims: Vec<usize> = Vec::new();
         let mut bytes_freed: u64 = 0;
         let mut pages_freed: usize = 0;
@@ -400,7 +418,8 @@ impl KittyPageRegistry {
             }
             if let Some(entry) = self.pages.get(&cand) {
                 if entry.transmitted_layout.is_some() {
-                    bytes_freed = bytes_freed.saturating_add(bytes_for(entry));
+                    bytes_freed =
+                        bytes_freed.saturating_add(Self::entry_bytes(entry.pixel_w, entry.pixel_h));
                 }
             }
             victims.push(cand);
@@ -419,6 +438,11 @@ impl KittyPageRegistry {
         let mut freed_ids: Vec<u32> = Vec::with_capacity(victims.len());
         for v in &victims {
             if let Some(entry) = self.pages.remove(v) {
+                if entry.transmitted_layout.is_some() {
+                    self.transmitted_bytes = self
+                        .transmitted_bytes
+                        .saturating_sub(Self::entry_bytes(entry.pixel_w, entry.pixel_h));
+                }
                 freed_ids.push(entry.image_id);
             }
             // Drop the cached placement rect for evicted pages so
@@ -546,6 +570,12 @@ impl KittyPageRegistry {
     /// showing the Fast-quality pixels indefinitely.
     pub fn invalidate_transmit(&mut self, page_idx: usize) {
         if let Some(entry) = self.pages.get_mut(&page_idx) {
+            // If this entry was counted toward the running byte total,
+            // remove its contribution before flipping the flag.
+            if entry.transmitted_layout.is_some() {
+                let bytes = Self::entry_bytes(entry.pixel_w, entry.pixel_h);
+                self.transmitted_bytes = self.transmitted_bytes.saturating_sub(bytes);
+            }
             entry.transmitted_layout = None;
             // Drop any cached encoded payload too — its bytes no
             // longer match what we'd want to ship.
@@ -571,6 +601,9 @@ impl KittyPageRegistry {
         for entry in self.pages.values_mut() {
             entry.transmitted_layout = None;
         }
+        // Every page just lost its "Ghostty holds this" status, so the
+        // running total of transmitted bytes is zero.
+        self.transmitted_bytes = 0;
         if crate::debug_log::enabled() {
             crate::debug_log::write(
                 "invalidate_all",
@@ -622,6 +655,15 @@ impl KittyPageRegistry {
         // the stale delete now. Caught by the registry property
         // tests at I4.
         self.drop_pending_delete(id);
+        // Subtract the entry's previous byte contribution before we
+        // overwrite its dimensions; re-add after. Only entries whose
+        // transmitted_layout was Some counted toward the running total.
+        let prev_bytes = match self.pages.get(&page_idx) {
+            Some(e) if e.transmitted_layout.is_some() => {
+                Self::entry_bytes(e.pixel_w, e.pixel_h)
+            }
+            _ => 0,
+        };
         let entry = self.pages.entry(page_idx).or_insert(PageEntry {
             image_id: id,
             transmitted_layout: None,
@@ -635,6 +677,11 @@ impl KittyPageRegistry {
         entry.transmitted_revision = revision;
         entry.pixel_w = pixel_w;
         entry.pixel_h = pixel_h;
+        let new_bytes = Self::entry_bytes(pixel_w, pixel_h);
+        self.transmitted_bytes = self
+            .transmitted_bytes
+            .saturating_sub(prev_bytes)
+            .saturating_add(new_bytes);
         self.touch(page_idx);
         if crate::debug_log::enabled() {
             crate::debug_log::write(
