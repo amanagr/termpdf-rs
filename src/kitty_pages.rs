@@ -352,6 +352,13 @@ impl KittyPageRegistry {
     /// delete on the next ride-along. The cost is O(n) on the queued
     /// vec, but `n <= MAX_CACHED_PAGES` so the scan is trivial.
     fn drop_pending_delete(&mut self, image_id: u32) {
+        // Skip the retain scan in the common case where nothing is
+        // queued. mark_transmitted (the hot caller) calls this for
+        // every transmitted page every frame; pending_deletes is
+        // empty most of the time outside of cap-hit eviction bursts.
+        if self.pending_deletes.is_empty() {
+            return;
+        }
         self.pending_deletes.retain(|&id| id != image_id);
     }
 

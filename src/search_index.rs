@@ -268,12 +268,15 @@ impl DocIndex {
             let hay = self
                 .lower_text_cache
                 .get_or_init(|| self.text.to_lowercase());
-            // Materialise into a Vec because Rust can't express the
-            // borrow path "&'a Box<dyn Iterator borrowing &'a String>"
-            // through this signature without GATs. The collect cost is
-            // dominated by the encode-once lowercase we just skipped.
-            let v: Vec<usize> = hay.match_indices(&needle).map(|(i, _)| i).collect();
-            Box::new(v.into_iter())
+            // Custom iterator that OWNS the needle and borrows the
+            // cached haystack. Replaces an earlier Vec<usize> collect
+            // that was up to 5M entries on a query like "e" over a
+            // long book — the per-keystroke search-as-you-type path.
+            Box::new(CaseInsensitiveMatches {
+                hay,
+                needle,
+                pos: 0,
+            })
         }
     }
 
@@ -296,6 +299,33 @@ impl DocIndex {
     #[allow(dead_code)]
     pub(crate) fn text(&self) -> &str {
         &self.text
+    }
+}
+
+/// Iterator over case-insensitive match offsets of `needle` in `hay`.
+/// Owns the lowercased needle and borrows the cached lowercased
+/// haystack — replaces a per-call Vec<usize> materialisation that
+/// could collect millions of entries on a single-char query over a
+/// long book.
+struct CaseInsensitiveMatches<'a> {
+    hay: &'a str,
+    needle: String,
+    pos: usize,
+}
+
+impl<'a> Iterator for CaseInsensitiveMatches<'a> {
+    type Item = usize;
+    fn next(&mut self) -> Option<usize> {
+        if self.needle.is_empty() || self.pos >= self.hay.len() {
+            return None;
+        }
+        let rel = self.hay[self.pos..].find(&self.needle)?;
+        let abs = self.pos + rel;
+        // Advance by needle.len(); guard against overlap on a 1-char
+        // needle by clamping the step to ≥ 1 byte. The needle is
+        // already non-empty per the early-out above.
+        self.pos = abs + self.needle.len().max(1);
+        Some(abs)
     }
 }
 
