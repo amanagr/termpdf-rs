@@ -323,6 +323,32 @@ a session file. By design.
 | `TERMPDF_PROFILE`         | unset                              | Print phase timings to stderr at exit    |
 | `TERMPDF_FAST_LCD`        | unset                              | Re-enable LCD subpixel text on the Fast tier (sharper scroll, more CPU) |
 | `TERMPDF_TRANSMIT_RAW`    | unset                              | Ship raw RGBA instead of PNG (skip terminal-side PNG decode at the cost of larger pty bytes) |
+| `TERMPDF_TRANSMIT_PNG`    | unset                              | Force the legacy `f=100` PNG wire format. Escape hatch for terminals that mishandle the default `f=24,o=z` (raw RGB + zlib). |
+| `TERMPDF_GHOSTTY_BUDGET_MB` | `200`                            | Cap on decoded-RGBA bytes the kitty page registry will hold simultaneously (clamped 32–4096 MB). Self-imposed budget to stay under Ghostty's `image-storage-limit` (default 320 MB) so Ghostty itself never has to evict our images. Lower if you see "missing image for virtual placement" warnings; raise if you see frequent re-transmits in `TERMPDF_DEBUG_LOG`. |
+| `TERMPDF_DEBUG_LOG`       | unset                              | Path to a debug log for the kitty graphics state machine (transmits, evictions, deletes). File is opened append-only with `O_NOFOLLOW`. |
+| `TERMPDF_RENDER_SCALE`    | unset                              | Per-PDF render scale override; rarely needed. |
+| `TERMPDF_CELL_PX`         | unset                              | Force cell pixel dims (`WxH`) — used by tests where the picker can't autodetect. |
+
+### Ghostty users: extending the image-storage budget
+
+Ghostty's default `image-storage-limit` is 320 MB **per screen**, measured in
+*decoded RGBA bytes*. termpdf-rs caps its own resident-page byte total at 200 MB
+by default to leave Ghostty headroom, but if you read at very large zoom on
+high-DPI displays the per-page bitmap can be 30+ MB and the cap bites earlier
+than expected. To raise Ghostty's limit, add this to `~/.config/ghostty/config`:
+
+```
+image-storage-limit = 1073741824
+```
+
+That's 1 GiB; the protocol caps it at 4 GiB. Set termpdf-rs's
+`TERMPDF_GHOSTTY_BUDGET_MB` to ~75 % of whatever you pick.
+
+### Recovery from a stuck/blank page
+
+If a page renders blank mid-scroll (Ghostty silently evicted the image despite
+the budget), press **`Ctrl-L`** to force a re-transmit of every cached page.
+Same effect as the zoom-out + zoom-in dance, no scroll-position loss.
 
 Per-PDF state (current page, dark flag, zoom, marks) lives at
 `$XDG_DATA_HOME/termpdf-rs/<name>.<hash>.session.json` (mode 0600).
