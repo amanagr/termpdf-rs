@@ -497,13 +497,18 @@ pub fn load(path: &std::path::Path, expected_total: usize) -> Option<DocIndex> {
     let text = std::str::from_utf8(&bytes[starts_end..starts_end + text_len])
         .ok()?
         .to_string();
-    let indexed_pages: HashSet<usize> = (0..total_pages)
-        .filter(|i| page_starts[*i] != NOT_INDEXED)
-        .collect();
-    if indexed_pages.len() != indexed_count {
+    // Validate the count without materialising the HashSet first; on
+    // a 700-page book the validation set was 700 entries allocated
+    // just to compare a length. Build the real set only after the
+    // count check passes.
+    let real_count = page_starts.iter().filter(|&&v| v != NOT_INDEXED).count();
+    if real_count != indexed_count {
         // Length mismatch hints at corruption; reject so we rebuild.
         return None;
     }
+    let indexed_pages: HashSet<usize> = (0..total_pages)
+        .filter(|i| page_starts[*i] != NOT_INDEXED)
+        .collect();
     Some(DocIndex {
         text,
         page_starts,
