@@ -50,36 +50,40 @@ use crate::app::LayoutKey;
 /// per page exceeds ~17 MB (~A4 at high zoom on a hi-DPI display);
 /// past that, the byte budget below takes over.
 ///
-/// Sized to fit the prefetch window's working set without churn:
-///   - PREFETCH_DEPTH = 8 (idle prefetch looks 8 pages ahead in the
-///     scroll direction, transmitting them eagerly so a held-`j`
-///     burst doesn't pause for pdfium per page)
+/// Sized to fit the BIDIRECTIONAL working set without churn:
 ///   - viewport routinely shows 2–3 pages
-///   - scroll-back buffer: ~5 pages so a `k` peek doesn't immediately
-///     re-fetch
+///   - PREFETCH_DEPTH = 8 in the current scroll direction (idle
+///     prefetch looks 8 pages ahead, transmitting them eagerly so a
+///     held-`j` burst doesn't pause for pdfium per page)
+///   - 8 pages in the OPPOSITE direction (the pages the user just
+///     scrolled past — this is the working set for a quick
+///     direction flip such as scrolling forward to peek then back
+///     to read, which is the dominant reading pattern)
+///   - 5-page buffer
 ///
-/// Total: 8 + 3 + 5 = 16. Earlier value of 7 bottlenecked at the
-/// page-count cap during normal scroll: prefetch added pages 5 ahead
-/// of cursor, eviction killed them on the next draw because 2 visible
-/// + 5 prefetch = 7 already, leaving zero scroll-back budget. Held-`j`
-/// bursts then cycled the same pages through evict→re-fetch→evict
-/// (logged in TERMPDF_DEBUG_LOG as the same page transmitting 6×
-/// in 9 seconds — the unloading-on-scroll regression's actual
-/// in-process trigger, distinct from Ghostty's own image-storage
-/// eviction).
+/// Total: 3 + 8 + 8 + 5 = 24, rounded to 32 for headroom.
 ///
-/// At ~10 MB per page (typical render): 16 × 10 = 160 MB resident,
-/// well under the 280 MB self-budget AND under Ghostty's 320 MB
-/// image-storage-limit. At high zoom (~30 MB/page) the byte budget
-/// (`ghostty_budget_bytes`) takes over and trims the cap to ~9 pages
-/// — still better than 7, and visible pages remain protected by
-/// `visible_range_pin`.
+/// **Why bidirectional matters**: with cap=16 the LRU evicts pages
+/// the user just visited as soon as forward prefetch fills. On the
+/// reverse-scroll, those pages have to re-render from pdfium. The
+/// log signature is "8 contiguous pages adjacent to cursor evicted
+/// in one batch" — observed in TERMPDF_DEBUG_LOG with cap=16:
+/// pinned=340 evicting [326, 327, 328, 329, 330, 331, 332, 333].
+/// User then scrolls back and waits for re-render. Distinct from
+/// the cap=7 regression (same direction churn) and from Ghostty's
+/// own image-storage-limit eviction (different layer).
+///
+/// At ~10 MB per page (typical render): 32 × 10 = 320 MB resident,
+/// fits in the 768 MB self-budget and in 1 GiB Ghostty
+/// image-storage-limit (the README's recommended config). At high
+/// zoom (~30 MB/page) the byte budget kicks in to trim — still
+/// better than the page-count cap binding too tight.
 ///
 /// Overridable at runtime via `TERMPDF_MAX_CACHED_PAGES` (clamped 4–256)
 /// for users on terminals with non-default `image-storage-limit` or
 /// extreme working sets — kept as a knob for the same reason
 /// `TERMPDF_GHOSTTY_BUDGET_MB` exists for the byte cap.
-const DEFAULT_MAX_CACHED_PAGES: usize = 16;
+const DEFAULT_MAX_CACHED_PAGES: usize = 32;
 
 fn max_cached_pages() -> usize {
     use std::sync::OnceLock;
