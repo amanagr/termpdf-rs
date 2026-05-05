@@ -122,7 +122,7 @@ pub fn load_from_pdf(document: &PdfDocument<'_>) -> Result<HighlightStore> {
             });
         }
     }
-    Ok(HighlightStore { items })
+    Ok(HighlightStore::from_items(items))
 }
 
 /// Sync the in-memory `HighlightStore` back onto the PDF and write
@@ -472,40 +472,38 @@ mod tests {
             doc.save_to_file(&path).expect("save empty");
         }
         // Three rects sharing one group_id (think: a 3-line highlight).
-        let store = HighlightStore {
-            items: vec![
-                Highlight {
-                    page: 0,
-                    x: 0.10,
-                    y: 0.10,
-                    w: 0.20,
-                    h: 0.04,
-                    color: "#ffd54f".into(),
-                    note: None,
-                    group_id: Some(42),
-                },
-                Highlight {
-                    page: 0,
-                    x: 0.10,
-                    y: 0.15,
-                    w: 0.20,
-                    h: 0.04,
-                    color: "#ffd54f".into(),
-                    note: None,
-                    group_id: Some(42),
-                },
-                Highlight {
-                    page: 0,
-                    x: 0.10,
-                    y: 0.20,
-                    w: 0.20,
-                    h: 0.04,
-                    color: "#ffd54f".into(),
-                    note: None,
-                    group_id: Some(42),
-                },
-            ],
-        };
+        let store = HighlightStore::from_items(vec![
+            Highlight {
+                page: 0,
+                x: 0.10,
+                y: 0.10,
+                w: 0.20,
+                h: 0.04,
+                color: "#ffd54f".into(),
+                note: None,
+                group_id: Some(42),
+            },
+            Highlight {
+                page: 0,
+                x: 0.10,
+                y: 0.15,
+                w: 0.20,
+                h: 0.04,
+                color: "#ffd54f".into(),
+                note: None,
+                group_id: Some(42),
+            },
+            Highlight {
+                page: 0,
+                x: 0.10,
+                y: 0.20,
+                w: 0.20,
+                h: 0.04,
+                color: "#ffd54f".into(),
+                note: None,
+                group_id: Some(42),
+            },
+        ]);
         {
             let doc = pdfium.load_pdf_from_file(&path, None).expect("reload");
             save_to_pdf(&doc, &store, &path).expect("save");
@@ -587,18 +585,16 @@ mod tests {
                 .expect("page");
             doc.save_to_file(&path).expect("save empty");
         }
-        let store = HighlightStore {
-            items: vec![Highlight {
-                page: 0,
-                x: 0.10,
-                y: 0.20,
-                w: 0.30,
-                h: 0.05,
-                color: "#aed581".into(),
-                note: None,
-                group_id: None,
-            }],
-        };
+        let store = HighlightStore::from_items(vec![Highlight {
+            page: 0,
+            x: 0.10,
+            y: 0.20,
+            w: 0.30,
+            h: 0.05,
+            color: "#aed581".into(),
+            note: None,
+            group_id: None,
+        }]);
         // Save twice in a row — must not duplicate or lose the entry.
         {
             let doc = pdfium.load_pdf_from_file(&path, None).expect("reload");
@@ -649,18 +645,16 @@ mod tests {
         // Now add one of OUR highlights via save_to_pdf on the same page.
         {
             let doc = pdfium.load_pdf_from_file(&path, None).expect("reload");
-            let store = HighlightStore {
-                items: vec![Highlight {
-                    page: 0,
-                    x: 0.10,
-                    y: 0.10,
-                    w: 0.20,
-                    h: 0.05,
-                    color: "#ffd54f".into(),
-                    note: None,
-                    group_id: None,
-                }],
-            };
+            let store = HighlightStore::from_items(vec![Highlight {
+                page: 0,
+                x: 0.10,
+                y: 0.10,
+                w: 0.20,
+                h: 0.05,
+                color: "#ffd54f".into(),
+                note: None,
+                group_id: None,
+            }]);
             save_to_pdf(&doc, &store, &path).expect("save_to_pdf");
         }
 
@@ -711,18 +705,16 @@ mod tests {
         // Open the saved file and drop one of our highlights into it.
         {
             let doc = pdfium.load_pdf_from_file(&path, None).expect("reload");
-            let store = HighlightStore {
-                items: vec![Highlight {
-                    page: 0,
-                    x: 0.10,
-                    y: 0.20,
-                    w: 0.30,
-                    h: 0.05,
-                    color: "#ffd54f".into(),
-                    note: Some("hello".into()),
-                    group_id: None,
-                }],
-            };
+            let store = HighlightStore::from_items(vec![Highlight {
+                page: 0,
+                x: 0.10,
+                y: 0.20,
+                w: 0.30,
+                h: 0.05,
+                color: "#ffd54f".into(),
+                note: Some("hello".into()),
+                group_id: None,
+            }]);
             save_to_pdf(&doc, &store, &path).expect("save_to_pdf");
         }
 
@@ -765,30 +757,28 @@ mod tests {
                 .expect("page 1");
             doc.save_to_file(&path).expect("save empty");
         }
-        let store = HighlightStore {
-            items: vec![
-                Highlight {
-                    page: 0,
-                    x: 0.10,
-                    y: 0.10,
-                    w: 0.20,
-                    h: 0.05,
-                    color: "#ffd54f".into(),
-                    note: None,
-                    group_id: None,
-                },
-                Highlight {
-                    page: 1,
-                    x: 0.10,
-                    y: 0.10,
-                    w: 0.20,
-                    h: 0.05,
-                    color: "#aed581".into(),
-                    note: None,
-                    group_id: None,
-                },
-            ],
-        };
+        let store = HighlightStore::from_items(vec![
+            Highlight {
+                page: 0,
+                x: 0.10,
+                y: 0.10,
+                w: 0.20,
+                h: 0.05,
+                color: "#ffd54f".into(),
+                note: None,
+                group_id: None,
+            },
+            Highlight {
+                page: 1,
+                x: 0.10,
+                y: 0.10,
+                w: 0.20,
+                h: 0.05,
+                color: "#aed581".into(),
+                note: None,
+                group_id: None,
+            },
+        ]);
         // Only walk page 1; page 0's highlight in the store should be
         // ignored entirely.
         let mut candidate = std::collections::HashSet::new();

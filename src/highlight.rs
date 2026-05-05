@@ -5,6 +5,8 @@
 //! Coordinates are normalised 0..1 in PDF page space so they stay
 //! correct across zoom changes and re-renders.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Cap on the basename portion of derived on-disk filenames (the
@@ -48,59 +50,74 @@ pub struct Highlight {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct HighlightStore {
     pub items: Vec<Highlight>,
+    /// Per-page mutation counter — bumped on every add/remove that
+    /// touches this page. Used as the per-page cache-invalidation key
+    /// for the kitty re-transmit path: an edit on page 5 must not
+    /// invalidate the bitmap (and re-ship the encoded payload) for
+    /// pages 7-9.
+    ///
+    /// In-memory only (skipped during serde) — both this counter and
+    /// the bitmap cache it gates reset on restart, so persistence is
+    /// unnecessary and would just inflate the on-disk JSON.
+    ///
+    /// Replaced an O(N) FNV-over-items revision computation that fired
+    /// 3× per visible page per frame in the kitty draw loop; on
+    /// heavy-highlight docs that was the dominant per-frame cost. A
+    /// monotonic counter is O(1) read and O(1) bump on the rare
+    /// mutation path. Cross-store comparison isn't a contract — the
+    /// only consumer compares values within ONE store across frames.
+    #[serde(skip)]
+    page_revisions: HashMap<usize, u64>,
 }
 
 impl HighlightStore {
+    /// Build from a pre-collected list of items (the load-from-PDF path
+    /// returns this). Seeds `page_revisions` with one bump per page
+    /// that has any item, so cache keys are stable from the first
+    /// frame after load.
+    pub fn from_items(items: Vec<Highlight>) -> Self {
+        let mut page_revisions: HashMap<usize, u64> = HashMap::new();
+        for h in &items {
+            *page_revisions.entry(h.page).or_insert(0) += 1;
+        }
+        Self {
+            items,
+            page_revisions,
+        }
+    }
+
     pub fn for_page(&self, page: usize) -> impl Iterator<Item = &Highlight> {
         self.items.iter().filter(move |h| h.page == page)
     }
 
     pub fn add(&mut self, h: Highlight) {
+        let page = h.page;
         self.items.push(h);
+        *self.page_revisions.entry(page).or_insert(0) += 1;
     }
 
-    /// Order-independent fingerprint of the highlight set on `page`.
-    ///
-    /// Bumped only when *that page's* set of highlights changes. Used
-    /// as the per-page cache key for the kitty re-transmit path so a
-    /// highlight edit on page 5 doesn't invalidate the bitmap (and
-    /// re-ship the encoded payload) for pages 7-9.
-    ///
-    /// XORs per-item FNV-1a hashes — order-independent (Vec storage
-    /// can shuffle on delete-from-middle but the visual result is the
-    /// same set, so the cache invariant is "set membership, not
-    /// vector position"). The `count` term is mixed in last so two
-    /// items that XOR-cancel by accident don't collide with the empty
-    /// set.
+    /// Remove the item at `idx`, bumping the affected page's revision.
+    /// Use this instead of `items.remove(idx)` directly so the cache
+    /// invariant holds.
+    pub fn remove_at(&mut self, idx: usize) -> Highlight {
+        let h = self.items.remove(idx);
+        *self.page_revisions.entry(h.page).or_insert(0) += 1;
+        h
+    }
+
+    /// Per-page revision. Bumped on every mutation that touches this
+    /// page. Two consecutive frames with no mutation see the same
+    /// value; any add/remove on `page` strictly increases it.
     pub fn page_revision(&self, page: usize) -> u64 {
-        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-        const FNV_PRIME: u64 = 0x100_0000_01b3;
-        let mut acc: u64 = 0;
-        let mut count: u64 = 0;
-        for h in self.for_page(page) {
-            let mut x: u64 = FNV_OFFSET;
-            // Coordinates: hashing the bit-pattern preserves "moved by
-            // 1 px" precision across reloads.
-            for byte in
-                h.x.to_le_bytes()
-                    .iter()
-                    .chain(h.y.to_le_bytes().iter())
-                    .chain(h.w.to_le_bytes().iter())
-                    .chain(h.h.to_le_bytes().iter())
-                    .chain(h.color.as_bytes().iter())
-                    .chain(h.group_id.unwrap_or(0).to_le_bytes().iter())
-            {
-                x ^= *byte as u64;
-                x = x.wrapping_mul(FNV_PRIME);
-            }
-            acc ^= x;
-            count += 1;
-        }
-        // Mix `count` to distinguish "no items" from "two items whose
-        // hashes happened to XOR to zero". `count` is also a sanity
-        // gate — it changes monotonically on add/delete even when the
-        // XOR fingerprint coincidentally collides.
-        acc ^ count.wrapping_mul(FNV_PRIME)
+        self.page_revisions.get(&page).copied().unwrap_or(0)
+    }
+
+    /// Explicit page-revision bump for callers that mutate `items`
+    /// directly via batch operations like `Vec::retain` (which can't
+    /// route through `remove_at`). Only need to call this when a
+    /// mutation actually removed something.
+    pub fn bump_page_revision(&mut self, page: usize) {
+        *self.page_revisions.entry(page).or_insert(0) += 1;
     }
 }
 
@@ -230,20 +247,35 @@ mod tests {
     }
 
     #[test]
-    fn page_revision_empty_is_stable() {
+    fn page_revision_default_is_zero() {
         let s = HighlightStore::default();
-        let r1 = s.page_revision(0);
-        let r2 = s.page_revision(7);
-        assert_eq!(r1, r2, "same empty count should hash to same value");
+        assert_eq!(s.page_revision(0), 0);
+        assert_eq!(s.page_revision(7), 0);
     }
 
     #[test]
-    fn page_revision_changes_when_page_set_changes() {
+    fn page_revision_bumps_on_add() {
+        // The contract: any mutation on a page strictly increases its
+        // revision so the kitty bitmap-cache key changes and the page
+        // re-encodes/re-transmits.
         let mut s = HighlightStore::default();
         let r0 = s.page_revision(5);
         s.add(h(5, 0.1, "#ffd54f"));
         let r1 = s.page_revision(5);
-        assert_ne!(r0, r1, "adding to page 5 must bump page 5's revision");
+        assert!(r1 > r0, "add must bump page 5's revision (got {r0} -> {r1})");
+    }
+
+    #[test]
+    fn page_revision_bumps_on_remove() {
+        let mut s = HighlightStore::default();
+        s.add(h(5, 0.1, "#ffd54f"));
+        let r_after_add = s.page_revision(5);
+        s.remove_at(0);
+        let r_after_remove = s.page_revision(5);
+        assert!(
+            r_after_remove > r_after_add,
+            "remove must bump page 5's revision (got {r_after_add} -> {r_after_remove})"
+        );
     }
 
     #[test]
@@ -261,57 +293,15 @@ mod tests {
     }
 
     #[test]
-    fn page_revision_distinguishes_color_change() {
-        // Two highlights at the same coords with different colors
-        // should hash to different revisions — color is part of the
-        // visible bake.
-        let mut s1 = HighlightStore::default();
-        s1.add(h(0, 0.1, "#ffd54f"));
-        let mut s2 = HighlightStore::default();
-        s2.add(h(0, 0.1, "#80cbc4"));
-        assert_ne!(s1.page_revision(0), s2.page_revision(0));
-    }
-
-    #[test]
-    fn page_revision_distinguishes_position() {
-        let mut s1 = HighlightStore::default();
-        s1.add(h(0, 0.1, "#ffd54f"));
-        let mut s2 = HighlightStore::default();
-        s2.add(h(0, 0.5, "#ffd54f"));
-        assert_ne!(s1.page_revision(0), s2.page_revision(0));
-    }
-
-    #[test]
-    fn page_revision_order_independent_within_page() {
-        // Vec storage shuffles on delete-from-middle; visible result
-        // is the same set, so the per-page revision must agree.
-        let mut a = HighlightStore::default();
-        a.add(h(0, 0.1, "#ffd54f"));
-        a.add(h(0, 0.5, "#80cbc4"));
-
-        let mut b = HighlightStore::default();
-        b.add(h(0, 0.5, "#80cbc4"));
-        b.add(h(0, 0.1, "#ffd54f"));
-
-        assert_eq!(
-            a.page_revision(0),
-            b.page_revision(0),
-            "two ordering of the same set must hash equally"
-        );
-    }
-
-    #[test]
-    fn page_revision_count_distinguishes_xor_collisions() {
-        // Defensive: zero items must not equal the (theoretical)
-        // case of two items whose coord/color/groupid hashes XOR to
-        // zero. The `count` mix makes this impossible to collide.
-        let s_empty = HighlightStore::default();
-        let mut s_one = HighlightStore::default();
-        s_one.add(h(0, 0.1, "#ffd54f"));
-        // s_one's hash includes count=1; empty includes count=0. Even
-        // if the per-item XOR for s_one happened to be zero, the
-        // count term differs.
-        assert_ne!(s_empty.page_revision(0), s_one.page_revision(0));
+    fn from_items_seeds_revisions() {
+        // Loaded stores (from PDF annotations) must arrive with
+        // revision counters reflecting their items so the very first
+        // frame's cache key is stable across re-renders.
+        let items = vec![h(0, 0.1, "#ffd54f"), h(0, 0.5, "#80cbc4"), h(3, 0.1, "#ffd54f")];
+        let s = HighlightStore::from_items(items);
+        assert!(s.page_revision(0) > 0);
+        assert!(s.page_revision(3) > 0);
+        assert_eq!(s.page_revision(7), 0, "page with no items stays at 0");
     }
 }
 

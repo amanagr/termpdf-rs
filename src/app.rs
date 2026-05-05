@@ -2372,12 +2372,17 @@ impl<'doc> App<'doc> {
                 .retain(|h| !(h.page == page && h.group_id == Some(g))),
             None => {
                 if let Some(idx) = self.highlights.items.iter().rposition(|h| h.page == page) {
-                    self.highlights.items.remove(idx);
+                    self.highlights.remove_at(idx);
                 }
             }
         }
         let removed = before.saturating_sub(self.highlights.items.len());
         if removed > 0 {
+            // The retain branch above bypasses the per-page revision
+            // counter (Vec::retain can't route through remove_at). Bump
+            // explicitly here — only `page` is ever affected by either
+            // branch, so one bump covers both.
+            self.highlights.bump_page_revision(page);
             self.highlight_revision += 1;
             self.invalidate_compose();
             // Mirror the auto-persist on the yank path so a panic
