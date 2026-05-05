@@ -289,6 +289,21 @@ pub struct PlaceScratch {
     /// in `pages` linger harmlessly (only consulted when the page
     /// is also in `preserve_pages`).
     last_placed: std::collections::HashMap<usize, ratatui::layout::Rect>,
+    /// Reusable buffer for the per-frame rect set passed to
+    /// `clear_page_area`. The earlier code allocated a fresh
+    /// `Vec<Rect>` every frame even when both the preserve list and
+    /// `last_placed` map were empty (the steady-state idle case).
+    /// `clear()` instead of `Vec::new` keeps the underlying capacity
+    /// across frames.
+    preserve_rects: Vec<ratatui::layout::Rect>,
+    /// Reusable rect set for `place_page`'s own-page-moved cleanup
+    /// — the rects of OTHER pages currently in `last_placed`. The
+    /// per-cell `occupied` check iterates this once per cell;
+    /// pre-collecting it into a Vec (vs walking the HashMap per
+    /// cell) cuts the inner check from O(map_iter) per cell to O(N)
+    /// linear scan over a Vec already in cache. Also lets us
+    /// short-circuit when the Vec is empty (single visible page).
+    place_other_rects: Vec<ratatui::layout::Rect>,
 }
 
 impl KittyPageRegistry {
@@ -1221,14 +1236,23 @@ pub fn place_page(
             // and skips. The own-page entry is still the OLD rect at this
             // point — exclude it explicitly so we don't mistakenly skip
             // (old - new) cells that genuinely need wiping.
+            //
+            // Pre-collect OTHER pages' rects into a reusable Vec so
+            // the per-cell `occupied` check is a tight slice scan
+            // instead of a HashMap iterator allocation per cell.
+            // Empty in the single-visible-page case → the inner check
+            // becomes one bounds-test + early return.
+            scratch.place_other_rects.clear();
+            for (&p, &r) in scratch.last_placed.iter() {
+                if p != page_idx {
+                    scratch.place_other_rects.push(r);
+                }
+            }
+            let other_rects: &[ratatui::layout::Rect] = &scratch.place_other_rects;
             let occupied = |x: u16, y: u16| -> bool {
-                scratch.last_placed.iter().any(|(&p, &r)| {
-                    p != page_idx
-                        && x >= r.left()
-                        && x < r.right()
-                        && y >= r.top()
-                        && y < r.bottom()
-                })
+                other_rects
+                    .iter()
+                    .any(|r| x >= r.left() && x < r.right() && y >= r.top() && y < r.bottom())
             };
             for y in old_rect.top()..old_rect.bottom() {
                 for x in old_rect.left()..old_rect.right() {
@@ -1460,10 +1484,17 @@ pub fn clear_page_area(
     // genuinely scrolled out (not in `preserve_pages`) get cleared
     // normally so their stale placeholders go to spaces and Ghostty
     // doesn't log "missing image for virtual placement" forever.
-    let preserve_rects: Vec<ratatui::layout::Rect> = preserve_pages
-        .iter()
-        .filter_map(|p| scratch.last_placed.get(p).copied())
-        .collect();
+    // Refill the reusable preserve_rects buffer. Reuse keeps the
+    // underlying allocation alive across frames (typical len ≤ 8).
+    scratch.preserve_rects.clear();
+    for p in preserve_pages {
+        if let Some(r) = scratch.last_placed.get(p).copied() {
+            scratch.preserve_rects.push(r);
+        }
+    }
+    // Borrow as a slice for the per-cell check; `scratch` is then
+    // free to be re-borrowed mutably for the cached_row_clear path.
+    let preserve_rects: &[ratatui::layout::Rect] = &scratch.preserve_rects;
     let in_preserved = |x: u16, y: u16| -> bool {
         preserve_rects
             .iter()
