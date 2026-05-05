@@ -2077,6 +2077,48 @@ mod tests {
     /// concrete reproduction of invariant I4 from the registry
     /// proptest, kept here as a deterministic regression on the
     /// resurrection-clobber bug.
+    /// Direct regression for the Ctrl-L recovery hatch. The blank-
+    /// page bug surfaces when Ghostty silently drops a cached image
+    /// (image-storage-limit eviction) but our `is_fresh` still
+    /// returns true — the next draw skips the transmit and the page
+    /// stays blank. `invalidate_all_transmits` is the user-triggered
+    /// kick that flips every page to stale so the next draw
+    /// re-transmits cached payload bytes. If this test fails, the
+    /// Ctrl-L recovery path is broken end-to-end (the binding goes
+    /// straight here).
+    #[test]
+    fn invalidate_all_transmits_marks_every_page_stale() {
+        let mut r = KittyPageRegistry::new(false, 1000);
+        let layout = LayoutKey {
+            fit_width_px: 64,
+            dark: false,
+        };
+        // Three pages all freshly transmitted — simulates the steady
+        // state of an open PDF mid-read.
+        for i in 0..3 {
+            r.mark_transmitted(i, layout, 0, 16, 16);
+            assert!(
+                r.is_fresh(i, layout, 0, 16, 16),
+                "precondition: page {i} must be fresh after mark_transmitted"
+            );
+        }
+        // Ctrl-L equivalent.
+        r.invalidate_all_transmits();
+        for i in 0..3 {
+            assert!(
+                !r.is_fresh(i, layout, 0, 16, 16),
+                "page {i} must be stale after invalidate_all_transmits — \
+                 next draw must re-transmit"
+            );
+        }
+        // Re-transmitting page 1 must re-establish freshness for that
+        // page only — recovery is per-page, not all-or-nothing.
+        r.mark_transmitted(1, layout, 0, 16, 16);
+        assert!(r.is_fresh(1, layout, 0, 16, 16));
+        assert!(!r.is_fresh(0, layout, 0, 16, 16));
+        assert!(!r.is_fresh(2, layout, 0, 16, 16));
+    }
+
     #[test]
     fn mark_transmitted_drops_stale_pending_delete() {
         let mut r = KittyPageRegistry::new(false, 1000);
