@@ -1,0 +1,7 @@
+# CODEOWNERS for termpdf-rs
+#
+# GitHub uses this file to auto-request reviews on PRs that touch
+# the matching paths. Until the project has additional maintainers,
+# every path falls back to @amanagr.
+
+* @amanagr
