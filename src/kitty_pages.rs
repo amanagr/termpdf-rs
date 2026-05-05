@@ -63,24 +63,34 @@ use crate::app::LayoutKey;
 /// terminal memory tight.
 const MAX_CACHED_PAGES: usize = 7;
 
-/// Hard cap on decoded-RGBA bytes the registry will allow Ghostty to
-/// hold simultaneously. Verified from `graphics_storage.zig`: Ghostty's
+/// Soft ceiling on decoded-RGBA bytes that Ghostty currently holds
+/// for OUR images. Verified from `graphics_storage.zig`: Ghostty's
 /// `image-storage-limit` defaults to 320 MB (per screen) and is
 /// measured in `img.data.len` — DECODED RGBA bytes, NOT bytes-on-wire.
 /// Once Ghostty's store is at the cap, the next transmit forces
 /// `evictImage` to run; it prefers unused images but **WILL evict
-/// images that have live placements** if unused images don't cover the
-/// deficit. That's the unloading-on-scroll bug.
+/// images that have live placements** if unused images don't cover
+/// the deficit. That's the unloading-on-scroll bug.
 ///
-/// We cap our own resident decoded-RGBA at a fraction of Ghostty's
-/// budget so Ghostty itself never needs to evict — we always free
-/// pages first, with proper `a=d` deletes, picking LRU non-pinned
-/// pages so visible content survives.
+/// We act as a safety valve: when our transmitted-to-Ghostty footprint
+/// approaches the cap, we evict ourselves (LRU non-pinned, with proper
+/// `a=d` deletes) so Ghostty never has to choose. The threshold is set
+/// just below Ghostty's cap to leave ~40 MB headroom for the next
+/// transmit.
 ///
-/// 200 MB ≈ 8–20 pages of letter-sized RGBA at our render DPI.
-/// Configurable via `TERMPDF_GHOSTTY_BUDGET_MB` env var (clamped
-/// 32–4096 MB).
-const DEFAULT_GHOSTTY_BUDGET_BYTES: u64 = 200 * 1024 * 1024;
+/// IMPORTANT: this is a SOFT ceiling, not a hard one. The page-count
+/// cap (`MAX_CACHED_PAGES`) is the primary eviction trigger; this
+/// fires only when individual pages are large enough that a full
+/// MAX_CACHED_PAGES set would exceed the cap (high zoom + high-DPI).
+/// Counting only TRANSMITTED pages — pre-encoded-but-unsent entries
+/// do not occupy Ghostty's store and must not count toward this
+/// budget.
+///
+/// 280 MB by default (320 - 40 MB safety margin). Configurable via
+/// `TERMPDF_GHOSTTY_BUDGET_MB` env (clamped 32–4096 MB). Users who
+/// raised Ghostty's `image-storage-limit` should raise this in
+/// proportion (~75 % of whatever they set).
+const DEFAULT_GHOSTTY_BUDGET_BYTES: u64 = 280 * 1024 * 1024;
 
 fn ghostty_budget_bytes() -> u64 {
     use std::sync::OnceLock;
@@ -280,35 +290,54 @@ impl KittyPageRegistry {
     }
 
     /// Evict LRU entries until the registry holds at most
-    /// `MAX_CACHED_PAGES` pages AND its on-terminal decoded-RGBA
-    /// footprint is under the Ghostty budget (see
-    /// `DEFAULT_GHOSTTY_BUDGET_BYTES`). Pages in `pinned` are skipped
-    /// so the current frame's visible pages stay alive. For each
-    /// eviction, emits a kitty `a=d,d=I,i=ID` delete escape into
-    /// `pending_deletes` so the terminal also frees its image.
+    /// `MAX_CACHED_PAGES` pages AND its TRANSMITTED-to-Ghostty
+    /// decoded-RGBA footprint is under `ghostty_budget_bytes()`. Pages
+    /// in `pinned` are skipped so the current frame's visible pages
+    /// stay alive. For each eviction, queues a kitty `a=d,d=I,i=ID`
+    /// delete escape into `pending_deletes` so the terminal also
+    /// frees its image.
     ///
-    /// The byte cap is the unloading-on-scroll mitigation: by evicting
-    /// ourselves before Ghostty has to, we control which pages get
-    /// unloaded (LRU non-pinned) instead of letting Ghostty's
-    /// `evictImage` evict in-use placements when its store fills.
+    /// **Byte budget accounting**: only TRANSMITTED pages count toward
+    /// Ghostty's image-storage-limit. A pre-encoded-but-unsent entry
+    /// occupies our local cache but Ghostty doesn't know about it.
+    /// Counting it would over-trigger eviction during prefetch, evicting
+    /// pages the user is about to scroll into.
+    ///
+    /// **Soft ceiling philosophy**: the page-count cap
+    /// (`MAX_CACHED_PAGES`) is the primary trigger. The byte cap fires
+    /// only when individual pages are large enough that a full cap-set
+    /// would exceed Ghostty's store (high zoom on high-DPI displays).
+    /// In the common case the byte path is a no-op.
     pub fn evict_to_budget(&mut self, pinned: &[usize]) {
         // Pre-build a HashSet of pinned ids to make the inner check O(1).
         let pin: std::collections::HashSet<usize> = pinned.iter().copied().collect();
         let budget = ghostty_budget_bytes();
         let bytes_for = |e: &PageEntry| (e.pixel_w as u64).saturating_mul(e.pixel_h as u64) * 4;
-        let total_bytes: u64 = self.pages.values().map(bytes_for).sum();
+        // Count only TRANSMITTED pages toward Ghostty's budget — entries
+        // that exist locally but haven't been sent (transmitted_layout
+        // is None) don't occupy Ghostty's store. Without this filter,
+        // pre_encode'd prefetch pages get counted and evicted before
+        // the user ever reaches them.
+        let transmitted_bytes: u64 = self
+            .pages
+            .values()
+            .filter(|e| e.transmitted_layout.is_some())
+            .map(bytes_for)
+            .sum();
 
         let over_pages = self.pages.len().saturating_sub(MAX_CACHED_PAGES);
-        let over_bytes = total_bytes.saturating_sub(budget);
+        let over_bytes = transmitted_bytes.saturating_sub(budget);
         if over_pages == 0 && over_bytes == 0 {
             return;
         }
 
         // Scan front (LRU) to back, collecting victims that aren't
         // pinned. Stop once both the page-count AND byte-budget caps
-        // are satisfied. Building the eviction set up-front lets us
-        // drop entries from `self.lru` with one pass instead of an
-        // O(N) `VecDeque::remove(idx)` per evicted page.
+        // are satisfied. Pre-encoded-but-unsent entries (no
+        // transmitted_layout) consume zero bytes against the budget,
+        // so evicting them only helps the page-count cap; we still
+        // pick them as victims to satisfy that cap, but they don't
+        // help bytes_freed cross the over_bytes threshold.
         let mut victims: Vec<usize> = Vec::new();
         let mut bytes_freed: u64 = 0;
         let mut pages_freed: usize = 0;
@@ -320,7 +349,9 @@ impl KittyPageRegistry {
                 continue;
             }
             if let Some(entry) = self.pages.get(&cand) {
-                bytes_freed = bytes_freed.saturating_add(bytes_for(entry));
+                if entry.transmitted_layout.is_some() {
+                    bytes_freed = bytes_freed.saturating_add(bytes_for(entry));
+                }
             }
             victims.push(cand);
             pages_freed += 1;
@@ -877,16 +908,16 @@ fn build_transmit_string(
     let chunk_count = payload.len().div_ceil(RAW_PER_CHUNK).max(1);
     let mut data = String::with_capacity(chunk_count * (CHARS_PER_CHUNK + 64));
 
-    // Decoded-RGBA size hint for kitty `S=NNN`. Lets Ghostty
-    // pre-allocate against `image-storage-limit` and reject mid-load
-    // if the cumulative transmit would exceed the cap, instead of
-    // discovering near the end and evicting a still-in-use image to
-    // make room.
-    let decoded_size_bytes = (pixel_w as u64).saturating_mul(pixel_h as u64).saturating_mul(
-        // RGB for f=24, RGBA for f=32, PNG/anything-else: best-effort
-        // approximation as RGBA.
-        if format_code == 24 { 3 } else { 4 },
-    );
+    // NOTE: NO `S=` here. Per the kitty graphics protocol spec, `S=`
+    // applies to file (`t=f`) / SHM (`t=s`) transmissions and to the
+    // PNG-data size when transmitting PNG with compression — NOT to
+    // chunked direct (`t=d`) RGB+zlib transmits. Sending S= in this
+    // context caused Ghostty to allocate against the wrong size,
+    // triggering speculative eviction and making the unloading-on-
+    // scroll regression WORSE. Removed in the same commit that
+    // restructured the byte budget; see `ghostty_budget_bytes` for
+    // the eviction-side mitigation that doesn't depend on the
+    // protocol cooperating.
     for (i, chunk) in payload.chunks(RAW_PER_CHUNK).enumerate() {
         data.push_str(start);
         write!(data, "{escape}_Gq=2,").unwrap();
@@ -902,12 +933,9 @@ fn build_transmit_string(
             // uncompressed raw paths leave it off — PNG carries its own
             // zlib stream inside the container, double-deflate is wasted
             // work and Ghostty rejects it.
-            // S=N is the decoded-size hint so the terminal can plan
-            // storage up-front (mitigates Ghostty image-storage-limit
-            // mid-load eviction; see `ghostty_budget_bytes`).
             write!(
                 data,
-                "i={id},a=T,U=1,f={format_code},t=d,s={pixel_w},v={pixel_h},S={decoded_size_bytes},"
+                "i={id},a=T,U=1,f={format_code},t=d,s={pixel_w},v={pixel_h},"
             )
             .unwrap();
             if compression == b'z' {
