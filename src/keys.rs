@@ -318,12 +318,17 @@ fn visual_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         app.pending.clear();
         if let KeyCode::Char(c) = k.code {
             app.move_head_find_char(c, forward);
+            // In placement mode the anchor must follow the head so
+            // motions don't silently grow a selection — same contract
+            // as the unified motion arms below.
+            app.sync_anchor_to_head_if_placing();
             app.scroll_to_head_if_offscreen();
         }
         return Ok(());
     }
     // i-pending: previous keypress was `i`, awaiting text-object
-    // (`iw`/`is`/`ip`).
+    // (`iw`/`is`/`ip`). Text-objects explicitly set both anchor and
+    // head, so no sync_anchor call is needed here.
     if app.pending == "i" {
         app.pending.clear();
         match k.code {
@@ -342,6 +347,7 @@ fn visual_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
         match k.code {
             KeyCode::Char('g') => {
                 app.move_head_page_top();
+                app.sync_anchor_to_head_if_placing();
                 app.scroll_to_head_if_offscreen();
             }
             KeyCode::Char('y') => app.yank_selection_as_markdown(),

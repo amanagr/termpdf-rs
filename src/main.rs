@@ -299,7 +299,13 @@ fn main() -> Result<()> {
     setup_terminal()?;
     install_decset_panic_hook();
     let res = run_loop(&mut app);
-    teardown_terminal()?;
+    // Persist BEFORE teardown_terminal? returns its result. The
+    // earlier order — `teardown_terminal()?` then persist — meant a
+    // teardown failure (disable_raw_mode error, etc.) would propagate
+    // via `?` and silently drop the user's highlights and session
+    // bookmark. Highlights and session are best-effort either way:
+    // we surface failures via stderr, never abort.
+    let teardown = teardown_terminal();
     profile::report();
 
     if let Err(e) = app.persist_highlights() {
@@ -314,6 +320,7 @@ fn main() -> Result<()> {
             term_safe::safe_for_stderr(&format!("{e:?}"))
         );
     }
+    teardown?;
     res
 }
 
