@@ -628,6 +628,38 @@ fn search_keys(app: &mut App<'_>, k: KeyEvent) -> Result<()> {
 
 pub fn dispatch_mouse(app: &mut App<'_>, m: MouseEvent) -> Result<()> {
     let shift = m.modifiers.contains(KeyModifiers::SHIFT);
+
+    // TOC popup gets first crack at events that land inside it.
+    // Wheel scrolls the list; left-click activates the row under the
+    // cursor. Out-of-popup events fall through to the document
+    // handlers (so the user can still scroll the page area when the
+    // panel is open).
+    if app.show_toc && app.toc_hit(m.column, m.row) {
+        // Three rows per wheel notch — scaled by the same `SCROLL_LINE`
+        // step the document path uses, so wheel sensitivity feels
+        // consistent across modes.
+        const TOC_WHEEL_ROWS: i32 = 3;
+        match m.kind {
+            MouseEventKind::ScrollDown => {
+                app.toc_scroll_by(TOC_WHEEL_ROWS);
+                return Ok(());
+            }
+            MouseEventKind::ScrollUp => {
+                app.toc_scroll_by(-TOC_WHEEL_ROWS);
+                return Ok(());
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                app.toc_click_row(m.row);
+                return Ok(());
+            }
+            // Swallow other in-popup mouse events (drag, up, etc.) so
+            // a click that misses a row doesn't start a doc-area
+            // selection drag through the panel.
+            MouseEventKind::Drag(_) | MouseEventKind::Up(_) => return Ok(()),
+            _ => return Ok(()),
+        }
+    }
+
     match m.kind {
         // Wheel always scrolls — it works in any mode, including
         // Visual, where the user might want to drag past a page edge.

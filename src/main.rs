@@ -884,6 +884,20 @@ fn warm_next_uncached(app: &mut App<'_>) -> Result<bool> {
 ///    `scroll_by_screens` call.
 fn dispatch_event_coalesced(app: &mut App<'_>, ev: Event) -> Result<()> {
     use crossterm::event::{MouseEvent, MouseEventKind};
+
+    // Mouse events that land inside the open TOC popup must NOT enter
+    // the doc-area scroll coalescing path — wheel events would
+    // otherwise be summed into a `scroll_by_screens` call that moves
+    // the document instead of the popup list, and the popup-area
+    // dispatch in `keys::dispatch_mouse` would never run. Route them
+    // straight to dispatch_mouse, where the popup-aware branch picks
+    // them up.
+    if let Event::Mouse(m) = ev {
+        if app.show_toc && app.toc_hit(m.column, m.row) {
+            return dispatch_event(app, ev);
+        }
+    }
+
     if let Event::Mouse(MouseEvent {
         kind: MouseEventKind::Drag(btn),
         ..
@@ -930,7 +944,9 @@ fn dispatch_event_coalesced(app: &mut App<'_>, ev: Event) -> Result<()> {
                 let next = event::read()?;
                 if let Event::Mouse(me) = next {
                     let m_shift = me.modifiers.contains(crossterm::event::KeyModifiers::SHIFT);
-                    if m_shift == shifted {
+                    let same_modifier = m_shift == shifted;
+                    let in_popup = app.show_toc && app.toc_hit(me.column, me.row);
+                    if same_modifier && !in_popup {
                         match me.kind {
                             MouseEventKind::ScrollDown => {
                                 net += 1;
@@ -943,10 +959,12 @@ fn dispatch_event_coalesced(app: &mut App<'_>, ev: Event) -> Result<()> {
                             _ => {}
                         }
                     }
-                    // Different modifier or non-scroll mouse event: flush
-                    // the coalesced scroll first, then dispatch normally.
+                    // Different modifier, popup-area event, or non-scroll
+                    // mouse event: flush the coalesced scroll first, then
+                    // dispatch the breaking event normally (it'll re-enter
+                    // this function and pick the right branch).
                     apply_coalesced_scroll(app, net, shifted);
-                    return dispatch_event(app, Event::Mouse(me));
+                    return dispatch_event_coalesced(app, Event::Mouse(me));
                 }
                 // Non-mouse event (key / resize): flush + dispatch.
                 apply_coalesced_scroll(app, net, shifted);
@@ -1032,7 +1050,22 @@ fn dispatch_event(app: &mut App<'_>, ev: Event) -> Result<()> {
         {
             keys::dispatch(app, k)?
         }
-        Event::Resize(_, _) => app.invalidate_compose(),
+        Event::Resize(w, h) => {
+            // Update the cached image_area synchronously so any mouse
+            // events drained in the same batch as this resize use the
+            // new geometry. Without this, `App::toc_hit` and other
+            // hit-tests would consult the pre-resize rect until the
+            // next paint sets `image_area` again, mis-routing events.
+            // The same +/- 1 status row split happens in `ui::draw`
+            // around line 219 — keep these two derivations in sync.
+            app.image_area = ratatui::layout::Rect::new(
+                0,
+                0,
+                w,
+                h.saturating_sub(1),
+            );
+            app.invalidate_compose();
+        }
         Event::Mouse(m) => keys::dispatch_mouse(app, m)?,
         // Bracketed paste — the body is the literal pasted text. Route
         // it to the cmd/search/TOC-filter buffer when one of those

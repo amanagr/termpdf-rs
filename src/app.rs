@@ -136,6 +136,16 @@ pub struct App<'doc> {
     pub cmd_buffer: String, // text typed after `:` or `/`
     pub status: String,     // ephemeral status-line message
     pub show_help: bool,
+    /// True if a popup overlay (help / TOC) was open during the
+    /// previous frame's draw. Used by the kitty draw path to detect
+    /// the open→close transition: the popup `Clear` overwrites the
+    /// unicode-placeholder cells that anchor each page's image_id.
+    /// From Ghostty's view those images become "unused" and may be
+    /// evicted; the cached `is_fresh` flag stays true so we wouldn't
+    /// retransmit. On the close transition we call
+    /// `invalidate_all_transmits` so the next frame ships fresh image
+    /// data even when revision/layout are unchanged.
+    pub popup_open_prev: bool,
     pub zoom: f32,
 
     /// Vertical scroll position in pixels from the top of the
@@ -373,6 +383,11 @@ pub struct App<'doc> {
     /// Whether the user is currently editing `toc_filter` (started
     /// by `/` while the TOC is open).
     pub toc_filter_editing: bool,
+    /// First display-index (row in the filtered list) currently
+    /// scrolled into view in the TOC popup. Mouse wheel adjusts this
+    /// directly without moving the cursor; cursor moves auto-clamp it
+    /// so the cursor row stays visible.
+    pub toc_scroll: usize,
     /// Set by `App::new` when the user passed a starting page (or the
     /// session restored one). Consumed by the first `ensure_layout`
     /// call to compute the initial scroll offset, then cleared.
@@ -548,6 +563,7 @@ impl<'doc> App<'doc> {
             cmd_buffer: String::new(),
             status: String::new(),
             show_help: false,
+            popup_open_prev: false,
             zoom: zoom.clamp(0.25, 8.0),
             scroll_y_px: 0,
             scroll_x: 0.0,
@@ -603,6 +619,7 @@ impl<'doc> App<'doc> {
             toc_filter: String::new(),
             toc_filtered_cache: None,
             toc_filter_editing: false,
+            toc_scroll: 0,
             pending_initial_page: if page < page_count { Some(page) } else { None },
             pending_initial_scroll_in_page: scroll_in_page.clamp(0.0, 1.0),
             marks,
@@ -1945,6 +1962,7 @@ impl<'doc> App<'doc> {
         }
         self.show_toc = true;
         self.toc_cursor = 0;
+        self.toc_scroll = 0;
         self.toc_filter.clear();
         self.toc_filter_editing = false;
         self.invalidate_compose();
@@ -1985,11 +2003,13 @@ impl<'doc> App<'doc> {
         let n = filtered.len() as i32;
         let new = ((cursor as i32) + delta).clamp(0, n - 1);
         self.toc_cursor = new as usize;
+        self.toc_ensure_cursor_visible();
         self.invalidate_compose();
     }
 
     pub fn toc_jump_to_top(&mut self) {
         self.toc_cursor = 0;
+        self.toc_scroll = 0;
         self.invalidate_compose();
     }
 
@@ -1998,7 +2018,91 @@ impl<'doc> App<'doc> {
         if let Some(last) = filtered.len().checked_sub(1) {
             self.toc_cursor = last;
         }
+        self.toc_ensure_cursor_visible();
         self.invalidate_compose();
+    }
+
+    /// Compute the TOC popup rect from the latest known image area.
+    /// `None` while the image area hasn't been initialised yet (very
+    /// first frames before `ensure_image`/the kitty path runs). The
+    /// underlying calculation is pure (`toc_popup_rect_for`); this
+    /// just wraps it with the App's cached `image_area`.
+    pub fn toc_popup_rect(&self) -> Option<Rect> {
+        if self.image_area.width == 0 || self.image_area.height == 0 {
+            return None;
+        }
+        Some(toc_popup_rect_for(self.image_area))
+    }
+
+    /// Pull `toc_scroll` so the row at `toc_cursor` is inside the
+    /// visible popup window. No-op if the popup geometry isn't known
+    /// yet. Mouse-scrolling decouples cursor from scroll, but keyboard
+    /// cursor moves should always keep the cursor on screen.
+    pub fn toc_ensure_cursor_visible(&mut self) {
+        let body_h = match self.toc_popup_rect() {
+            Some(r) => (r.height as usize).saturating_sub(2),
+            None => return,
+        };
+        if body_h == 0 {
+            return;
+        }
+        let cursor = self.toc_cursor;
+        if cursor < self.toc_scroll {
+            self.toc_scroll = cursor;
+        } else if cursor >= self.toc_scroll + body_h {
+            self.toc_scroll = cursor + 1 - body_h;
+        }
+    }
+
+    /// Mouse-wheel: shift `toc_scroll` by `delta` rows without moving
+    /// the cursor, clamped to the valid range. Caller should have
+    /// already checked that the click is inside the popup.
+    pub fn toc_scroll_by(&mut self, delta: i32) {
+        let total = self.toc_filtered_indices().len();
+        let body_h = match self.toc_popup_rect() {
+            Some(r) => (r.height as usize).saturating_sub(2),
+            None => return,
+        };
+        if total == 0 || body_h == 0 {
+            return;
+        }
+        let max_scroll = total.saturating_sub(body_h);
+        let new = (self.toc_scroll as i64 + delta as i64).clamp(0, max_scroll as i64) as usize;
+        if new != self.toc_scroll {
+            self.toc_scroll = new;
+            self.invalidate_compose();
+        }
+    }
+
+    /// Click on a TOC row: set the cursor to that display index, then
+    /// activate it (jump-to-page + close). `abs_row` is the absolute
+    /// terminal row of the click. Returns `true` if a row was actually
+    /// clicked (not the border or padding past the last entry).
+    pub fn toc_click_row(&mut self, abs_row: u16) -> bool {
+        let popup = match self.toc_popup_rect() {
+            Some(r) => r,
+            None => return false,
+        };
+        let total = self.toc_filtered_indices().len();
+        let Some(display_idx) = toc_row_to_display_idx(popup, self.toc_scroll, abs_row, total)
+        else {
+            return false;
+        };
+        self.toc_cursor = display_idx;
+        self.toc_activate();
+        true
+    }
+
+    /// True if the given absolute terminal cell falls inside the TOC
+    /// popup. Computed from the cached image area, so it works
+    /// regardless of whether the popup has been drawn this frame.
+    pub fn toc_hit(&self, col: u16, row: u16) -> bool {
+        match self.toc_popup_rect() {
+            Some(r) => {
+                col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+            }
+            None => false,
+        }
     }
 
     /// Activate the highlighted TOC entry: jump to its page (if
@@ -2029,6 +2133,7 @@ impl<'doc> App<'doc> {
         if self.toc_filter_editing {
             self.toc_filter.push(c);
             self.toc_cursor = 0;
+            self.toc_scroll = 0;
             self.invalidate_compose();
         }
     }
@@ -2037,6 +2142,7 @@ impl<'doc> App<'doc> {
         if self.toc_filter_editing {
             self.toc_filter.pop();
             self.toc_cursor = 0;
+            self.toc_scroll = 0;
             self.invalidate_compose();
         }
     }
@@ -2046,6 +2152,7 @@ impl<'doc> App<'doc> {
             self.toc_filter.clear();
             self.toc_filter_editing = true;
             self.toc_cursor = 0;
+            self.toc_scroll = 0;
             self.invalidate_compose();
         }
     }
@@ -3385,6 +3492,43 @@ pub fn nudge_rect(sel: Rect01, dx: f32, dy: f32, resize: bool) -> Rect01 {
     }
 }
 
+/// Compute the TOC popup rect from the document image area. Pure:
+/// no App state, single source of truth shared by draw_toc and the
+/// mouse-hit path so they can never disagree about where the popup
+/// sits. Mirrors the geometry baked into `draw_toc`: 2/5 of the image
+/// area's width, clamped to [40, 80] columns, anchored to the right
+/// edge, full image-area height.
+pub fn toc_popup_rect_for(img_area: Rect) -> Rect {
+    let panel_w = img_area.width.saturating_mul(2) / 5;
+    let panel_w = panel_w.clamp(40, 80).min(img_area.width);
+    Rect {
+        x: img_area.x + img_area.width.saturating_sub(panel_w),
+        y: img_area.y,
+        width: panel_w,
+        height: img_area.height,
+    }
+}
+
+/// Map an absolute terminal row to a TOC display index given the popup
+/// rect and current scroll offset. Returns `None` if the row falls
+/// outside the popup body (border, blank rows past the last entry, or
+/// outside the popup entirely). Pure: no App state, easily testable.
+pub fn toc_row_to_display_idx(popup: Rect, scroll: usize, abs_row: u16, total: usize) -> Option<usize> {
+    // Body region: skip top border (popup.y) → first data row sits at
+    // popup.y + 1, last at popup.y + height - 2.
+    let first = popup.y.checked_add(1)?;
+    if abs_row < first {
+        return None;
+    }
+    let body_h = (popup.height as usize).saturating_sub(2);
+    let row_in_body = (abs_row - first) as usize;
+    if row_in_body >= body_h {
+        return None;
+    }
+    let display_idx = scroll + row_in_body;
+    (display_idx < total).then_some(display_idx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4045,5 +4189,104 @@ mod tests {
             human_bytes(1024u64 * 1024 * 1024 * 3 + 1024 * 1024 * 512),
             "3.5 GB"
         );
+    }
+
+    fn popup(x: u16, y: u16, w: u16, h: u16) -> Rect {
+        Rect { x, y, width: w, height: h }
+    }
+
+    #[test]
+    fn toc_row_first_data_row_maps_to_scroll() {
+        // height=10 → body rows are y+1..y+9 (top + bottom border).
+        // scroll=0 → click on first data row gives display_idx=0.
+        let p = popup(20, 5, 40, 10);
+        assert_eq!(toc_row_to_display_idx(p, 0, 6, 100), Some(0));
+        assert_eq!(toc_row_to_display_idx(p, 0, 7, 100), Some(1));
+        assert_eq!(toc_row_to_display_idx(p, 0, 13, 100), Some(7));
+    }
+
+    #[test]
+    fn toc_row_top_border_returns_none() {
+        let p = popup(20, 5, 40, 10);
+        // y=5 is the top border row, not a data row.
+        assert_eq!(toc_row_to_display_idx(p, 0, 5, 100), None);
+        assert_eq!(toc_row_to_display_idx(p, 0, 4, 100), None);
+    }
+
+    #[test]
+    fn toc_row_bottom_border_returns_none() {
+        let p = popup(20, 5, 40, 10);
+        // body_h = 8, so last data row is y+1+7 = 13. y+14 is bottom border.
+        assert_eq!(toc_row_to_display_idx(p, 0, 14, 100), None);
+        assert_eq!(toc_row_to_display_idx(p, 0, 99, 100), None);
+    }
+
+    #[test]
+    fn toc_row_respects_scroll_offset() {
+        let p = popup(20, 5, 40, 10);
+        // First data row at scroll=20 should map to display_idx=20.
+        assert_eq!(toc_row_to_display_idx(p, 20, 6, 100), Some(20));
+        assert_eq!(toc_row_to_display_idx(p, 20, 13, 100), Some(27));
+    }
+
+    #[test]
+    fn toc_row_past_last_entry_returns_none() {
+        // Filtered list has 5 entries; clicking on the 6th visible row
+        // (still inside body but past data) must not select.
+        let p = popup(20, 5, 40, 10);
+        assert_eq!(toc_row_to_display_idx(p, 0, 6, 5), Some(0));
+        assert_eq!(toc_row_to_display_idx(p, 0, 10, 5), Some(4));
+        assert_eq!(toc_row_to_display_idx(p, 0, 11, 5), None);
+    }
+
+    #[test]
+    fn toc_row_zero_height_popup_is_safe() {
+        // Pathological case: height < 2 means body_h = 0 — every row
+        // is rejected. saturating_sub keeps us out of underflow.
+        let p = popup(0, 0, 10, 1);
+        assert_eq!(toc_row_to_display_idx(p, 0, 0, 10), None);
+        assert_eq!(toc_row_to_display_idx(p, 0, 1, 10), None);
+    }
+
+    #[test]
+    fn toc_popup_rect_anchored_right_clamped_to_min_40() {
+        // Standard 100×30 viewport with status row already removed
+        // (img_area passed in). 2/5 of 100 = 40 — exactly the minimum.
+        let img = Rect { x: 0, y: 0, width: 100, height: 29 };
+        let r = toc_popup_rect_for(img);
+        assert_eq!(r.x, 60, "anchored to the right edge");
+        assert_eq!(r.y, 0, "shares the image area's y origin");
+        assert_eq!(r.width, 40);
+        assert_eq!(r.height, 29, "spans the full image area height");
+    }
+
+    #[test]
+    fn toc_popup_rect_clamps_max_at_80() {
+        // 2/5 of 300 = 120 → clamped down to 80.
+        let img = Rect { x: 0, y: 0, width: 300, height: 50 };
+        let r = toc_popup_rect_for(img);
+        assert_eq!(r.width, 80);
+        assert_eq!(r.x, 220);
+    }
+
+    #[test]
+    fn toc_popup_rect_narrow_viewport_falls_back_to_image_width() {
+        // Below the minimum: panel_w clamps to 40, but min(image.width)
+        // brings it back to image.width so the popup never extends
+        // past the image area.
+        let img = Rect { x: 5, y: 0, width: 30, height: 20 };
+        let r = toc_popup_rect_for(img);
+        assert_eq!(r.width, 30);
+        assert_eq!(r.x, 5, "saturating_sub keeps origin at image edge when popup == image");
+    }
+
+    #[test]
+    fn toc_popup_rect_offset_image_area() {
+        // Image area not at (0,0) — exercises the +x/+y math.
+        let img = Rect { x: 10, y: 2, width: 100, height: 25 };
+        let r = toc_popup_rect_for(img);
+        assert_eq!(r.x, 70, "popup.x = img.x + img.width - panel_w = 10+100-40");
+        assert_eq!(r.y, 2);
+        assert_eq!(r.height, 25);
     }
 }

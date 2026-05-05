@@ -250,6 +250,21 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
             img_area,
         );
     } else if app.kitty_pages.is_some() {
+        // Popup just closed: every kitty placeholder cell was painted
+        // over by the popup's `Clear`, so Ghostty saw the page images
+        // as "unused" while the popup was open and may have evicted
+        // them under image-storage pressure. Our `is_fresh` cache
+        // doesn't know that — same revision/layout would skip the
+        // retransmit and the placeholder cells would point at freed
+        // image_ids → blank pages on close. Forcing a one-shot
+        // re-transmit on the close transition guarantees the next
+        // frame ships fresh data without re-encoding (cached_payload
+        // stays).
+        if app.popup_open_prev {
+            if let Some(kp) = app.kitty_pages.as_mut() {
+                kp.invalidate_all_transmits();
+            }
+        }
         // Per-page kitty placements bypass ratatui-image: each page
         // becomes its own kitty image, transmitted once. Steady scroll
         // is then just a few hundred bytes of placeholder cells per
@@ -309,6 +324,10 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
     if app.show_help {
         draw_help(f, img_area);
     }
+
+    // Track popup state for the next frame's open→close transition
+    // detection in the kitty branch above.
+    app.popup_open_prev = popup_open;
 }
 
 // The selection-overlay cell-styling helpers used to live here.
@@ -2335,31 +2354,36 @@ fn status_line(app: &App<'_>) -> Paragraph<'static> {
 fn draw_toc(f: &mut Frame, app: &mut App<'_>, area: Rect) {
     use ratatui::style::Stylize;
 
-    let panel_w = area.width.saturating_mul(2) / 5;
-    let panel_w = panel_w.clamp(40, 80).min(area.width);
-    let panel_h = area.height;
-    let popup = Rect {
-        x: area.x + area.width.saturating_sub(panel_w),
-        y: area.y,
-        width: panel_w,
-        height: panel_h,
-    };
+    // Single source of truth for the popup rect — used here for
+    // rendering and in `App::toc_hit` / `toc_click_row` for mouse
+    // routing. Both paths derive the rect from the same image area
+    // so they cannot disagree.
+    let popup = crate::app::toc_popup_rect_for(area);
 
     f.render_widget(Clear, popup);
 
     let inner_w = popup.width.saturating_sub(2) as usize;
     let body_h = popup.height.saturating_sub(2) as usize;
 
-    // Scroll offset: keep the cursor visible.
+    // Clamp scroll once the popup geometry is known. Filter changes
+    // and content shrinkage between frames could leave toc_scroll past
+    // the new max; clamp before slicing.
+    let filtered_total = app.toc_filtered_indices().len();
+    let max_scroll = filtered_total.saturating_sub(body_h);
+    if app.toc_scroll > max_scroll {
+        app.toc_scroll = max_scroll;
+    }
+    // Keyboard cursor moves call toc_ensure_cursor_visible explicitly;
+    // mouse-wheel never moves the cursor. So cursor and scroll can
+    // legitimately diverge here — no auto-snap.
     let cursor = app.toc_cursor;
-    let scroll = cursor.saturating_sub(body_h.saturating_sub(1));
+    let scroll = app.toc_scroll;
 
     // Copy ONLY the visible window into a tiny local Vec so the
     // toc_filtered_indices borrow drops before the per-row loop
     // re-borrows app.outline. body_h is ≤ 50 in any realistic
     // terminal — much smaller than cloning the full filtered set
     // (potentially 50k entries on a long technical book).
-    let filtered_total = app.toc_filtered_indices().len();
     let window: Vec<(usize, usize)> = app
         .toc_filtered_indices()
         .iter()
@@ -2398,13 +2422,54 @@ fn draw_toc(f: &mut Frame, app: &mut App<'_>, area: Rect) {
     let title = if app.toc_filter_editing {
         format!(" outline · /{}_ ", app.toc_filter)
     } else if !app.toc_filter.is_empty() {
-        format!(" outline · /{} ", app.toc_filter)
+        format!(
+            " outline · /{} · {}/{} ",
+            app.toc_filter,
+            cursor.saturating_add(1).min(filtered_total),
+            filtered_total
+        )
     } else {
-        " outline (j/k Enter · / filter · Esc close) ".to_string()
+        format!(
+            " outline · {}/{} (click · wheel · / filter · Esc) ",
+            cursor.saturating_add(1).min(filtered_total.max(1)),
+            filtered_total
+        )
     };
     let para =
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title.bold()));
     f.render_widget(para, popup);
+
+    // Scrollbar on the right border: a single column of full / dim
+    // blocks indicating scroll position. Skipped when everything fits
+    // and when the popup is too narrow to spare a column.
+    if filtered_total > body_h && body_h > 0 && popup.width >= 3 {
+        let track_h = body_h as u16;
+        let thumb_h = ((body_h * body_h) / filtered_total).max(1) as u16;
+        // Position the thumb proportionally; clamp so it never spills
+        // past the track's last cell.
+        let thumb_y = if max_scroll == 0 {
+            0
+        } else {
+            ((scroll as u32 * (track_h.saturating_sub(thumb_h)) as u32)
+                / max_scroll as u32) as u16
+        };
+        let bar_x = popup.x + popup.width - 1;
+        let bar_y0 = popup.y + 1;
+        let buf = f.buffer_mut();
+        for i in 0..track_h {
+            let y = bar_y0 + i;
+            let in_thumb = i >= thumb_y && i < thumb_y + thumb_h;
+            let (sym, fg) = if in_thumb {
+                ("█", Color::Gray)
+            } else {
+                ("│", Color::DarkGray)
+            };
+            if let Some(cell) = buf.cell_mut((bar_x, y)) {
+                cell.set_symbol(sym);
+                cell.set_fg(fg);
+            }
+        }
+    }
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
@@ -2481,6 +2546,7 @@ pub fn help_overlay_lines() -> Vec<&'static str> {
         "  :refs / :bib           jump to References / Bibliography section",
         "  o  /  :toc             open outline panel",
         "    j/k Enter            navigate / jump to entry",
+        "    wheel / click        scroll list / jump to clicked entry",
         "    / type Enter         filter by substring",
         "    Esc                  close panel",
         "",
