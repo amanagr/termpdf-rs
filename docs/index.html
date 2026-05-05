@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>termpdf-rs — power-efficient terminal PDF reader</title>
-<meta name="description" content="Pixel-perfect PDF pages in your terminal via the kitty graphics protocol. Vim keys, indexed search, highlights stored in the PDF. Single-digit CPU during sustained scroll on a 600-page book.">
+<meta name="description" content="Pixel-perfect PDF pages in your terminal via the kitty graphics protocol. Vim keys, indexed search, highlights stored in the PDF, color-preserving dark mode that includes embedded images. Single-digit CPU during sustained scroll on a 600-page book.">
 <link rel="canonical" href="https://amanagr.github.io/termpdf-rs/">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="style.css">
@@ -12,13 +12,13 @@
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://amanagr.github.io/termpdf-rs/">
 <meta property="og:title" content="termpdf-rs — a PDF reader that lives in your terminal">
-<meta property="og:description" content="vim keys, kitty-native pixel-perfect pages, indexed search, single-digit CPU on a held-j. Linux + Rust.">
+<meta property="og:description" content="vim keys, kitty-native pixel-perfect pages, indexed search, color-preserving dark mode (images included), single-digit CPU on a held-j. Linux + Rust.">
 <meta property="og:image" content="https://amanagr.github.io/termpdf-rs/og.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="termpdf-rs — a PDF reader that lives in your terminal">
-<meta name="twitter:description" content="vim keys, kitty-native pixel-perfect pages, indexed search, single-digit CPU on a held-j. Linux + Rust.">
+<meta name="twitter:description" content="vim keys, kitty-native pixel-perfect pages, indexed search, color-preserving dark mode (images included), single-digit CPU on a held-j. Linux + Rust.">
 <meta name="twitter:image" content="https://amanagr.github.io/termpdf-rs/og.png">
 
 <script type="application/ld+json">
@@ -48,6 +48,7 @@
     <nav class="nav-links" id="nav-links" aria-label="primary">
       <a href="#features">Features</a>
       <a href="#power">Power</a>
+      <a href="#dark">Dark</a>
       <a href="#install">Install</a>
       <a href="#keys">Keys</a>
       <a href="#faq">FAQ</a>
@@ -103,7 +104,7 @@
     <div class="feature"><h3><span class="icon">vi</span>Vim keys, vim text-objects</h3><p><kbd>j</kbd>/<kbd>k</kbd>/<kbd>gg</kbd>/<kbd>G</kbd>; <kbd>viw</kbd>/<kbd>vis</kbd>/<kbd>vip</kbd> on PDF text; marks <kbd>m{a-z}</kbd>/<kbd>'{a-z}</kbd>; <kbd>Ctrl-o</kbd>/<kbd>Ctrl-i</kbd> jumplist.</p></div>
     <div class="feature"><h3><span class="icon">⌕</span>Indexed search</h3><p>First search builds a back-index in the background and persists it. Subsequent opens hit instantly.</p></div>
     <div class="feature"><h3><span class="icon">▰</span>Highlights live in the PDF</h3><p>Native PDF annotations — they travel with the file and render in Adobe, Preview, Sioyek, zathura.</p></div>
-    <div class="feature"><h3><span class="icon">◐</span>Color-aware dark mode</h3><p>Luminance-only HSL inversion via <code>palette</code>. Red text stays red, blue charts stay blue.</p></div>
+    <div class="feature"><h3><span class="icon">◐</span>Color-aware dark mode</h3><p>Luminance-only HSL inversion across the whole pixmap — embedded images inverted too, hue preserved. <a href="#dark">More →</a></p></div>
     <div class="feature"><h3><span class="icon">→f</span>Vimium-style link-follow</h3><p><kbd>f</kbd> overlays 1-2 char hints on every clickable link. Type the hint to jump or open.</p></div>
   </div>
 </section>
@@ -135,6 +136,70 @@
   </div>
 
   <p class="caption">Numbers come from <a href="https://github.com/amanagr/termpdf-rs/blob/main/scripts/bench-vs-browser.sh">scripts/bench-vs-browser.sh</a> and <code>monitor-scroll.sh</code> in the repo. Run them on your machine — you'll get something close, modulo your CPU and terminal.</p>
+
+  <h3 style="font-size:18px;margin:32px 0 12px;font-weight:700;">What makes it fast</h3>
+
+  <div class="features">
+    <div class="feature">
+      <h3><span class="icon">▷</span>Per-page kitty transmit</h3>
+      <p>Each PDF page becomes its own kitty <code>image_id</code> with cached <code>f=24,o=z</code> RGB+zlib payload. Scrolling re-emits a few hundred bytes of unicode-placeholder cells per frame instead of re-encoding a multi-MB canvas.</p>
+    </div>
+    <div class="feature">
+      <h3><span class="icon">∅</span>Idle = zero bytes</h3>
+      <p>Frames are gated on a dirty flag. With no input and no settle work pending, the binary writes nothing to the pty. A PDF open in the background pulls effectively zero CPU.</p>
+    </div>
+    <div class="feature">
+      <h3><span class="icon">⊕</span>Synchronized output</h3>
+      <p>Every frame is wrapped in <code>DECSET 2026</code> (BSU/ESU). The terminal commits the whole frame atomically — no partial-paint flicker, even mid-scroll on a 600-page book.</p>
+    </div>
+    <div class="feature">
+      <h3><span class="icon">⏃</span>Cold renders deferred</h3>
+      <p>Held-<kbd>j</kbd> bursts skip pdfium renders for off-screen pages until input goes idle. A single settle redraw catches up at 16 ms cadence so the next press isn't blocked behind a 20 ms pdfium decode.</p>
+    </div>
+    <div class="feature">
+      <h3><span class="icon">⌬</span>Worker-thread rendering</h3>
+      <p>Pdfium decodes happen on a background thread; the UI thread only ever copies the finished pixmap into the page cache. <kbd>j</kbd>/<kbd>k</kbd> feels instant because the cache is usually warm by the time you press.</p>
+    </div>
+    <div class="feature">
+      <h3><span class="icon">⌗</span>Persistent disk cache</h3>
+      <p>Rendered page bitmaps and the search back-index are sandboxed under <code>$XDG_CACHE_HOME/termpdf-rs/</code>. Re-opening a book skips the cold render entirely; first <code>/&lt;query&gt;</code> after a reopen hits the index instantly.</p>
+    </div>
+    <div class="feature">
+      <h3><span class="icon">⊞</span>Image-storage budget</h3>
+      <p>Tracks decoded-RGBA bytes residency in the terminal's image store and evicts the page furthest from the viewport when the budget tightens. Stops Ghostty from quietly dropping pages out from under us mid-scroll.</p>
+    </div>
+    <div class="feature">
+      <h3><span class="icon">▤</span>Hot-path discipline</h3>
+      <p>Per-frame allocations are hoisted into reusable scratch buffers. Page revisions are O(1) counters, not FNV-hashed signatures. Encoded payloads stream into 12 KB stack chunks instead of allocating a 24 MB intermediate.</p>
+    </div>
+    <div class="feature">
+      <h3><span class="icon">◑</span>Settle vs rapid scroll</h3>
+      <p>The redraw scheduler distinguishes "user is mid-burst" from "burst just ended." Rapid scroll defers cold renders without forcing a redraw; the settle catch-up only fires when input has actually stopped.</p>
+    </div>
+  </div>
+</section>
+
+<section id="dark" aria-labelledby="dark-h">
+  <h2 id="dark-h">Dark mode that doesn't lie about color</h2>
+  <p>Most PDF dark modes are a CSS-style stencil: text inverts, background inverts, embedded images stay <em>as is</em>. You scroll into a chapter and a 1500-pixel-square white photo blasts your eyes. termpdf-rs treats the whole page — text, charts, screenshots, scanned figures — as one pixmap and remaps it together. A dark page is dark, end to end.</p>
+  <p>The remap is <em>luminance-only</em>, not a naive <code>255 - x</code> per-channel invert. Each pixel converts to HSL, the lightness flips around 0.5, and the hue stays put. Result: red errors stay red, blue charts stay blue, syntax-highlighted code still parses — just tonally remapped onto a dark canvas.</p>
+
+  <div class="features">
+    <div class="feature">
+      <h3><span class="icon">▣</span>Whole-page inversion</h3>
+      <p>Embedded images get the same luminance flip the text does. No more bright rectangles ambushing you mid-chapter.</p>
+    </div>
+    <div class="feature">
+      <h3><span class="icon">▦</span>Hue preserved</h3>
+      <p>Naive RGB invert turns red into cyan and blue into orange. termpdf-rs flips lightness in HSL space — saturated colors stay close to where they started.</p>
+    </div>
+    <div class="feature">
+      <h3><span class="icon">▥</span>Grayscale fast path</h3>
+      <p>For body-text PDFs (90%+ grayscale pixels) the algorithm short-circuits to per-channel <code>255-x</code>. Cuts the dark-render cost from ~50 ms to ~12 ms on a typical 1500×1900 page.</p>
+    </div>
+  </div>
+
+  <p>Toggle with <kbd>d</kbd>, or pin via <code>--dark</code> on the command line. The choice persists per PDF — start a paper light at your desk, finish it in bed without re-toggling.</p>
 </section>
 
 <section id="install" aria-labelledby="install-h">
