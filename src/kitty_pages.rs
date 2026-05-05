@@ -46,22 +46,35 @@ use ratatui::layout::Rect;
 
 use crate::app::LayoutKey;
 
-/// Cap on cached pages. Each entry holds metadata + an optional
-/// encoded payload (~250 KB PNG). The terminal-side decoded RGBA is
-/// much larger (~10 MB/page at our render resolution) and Ghostty
-/// internally evicts when its image store fills up. When that happens
-/// any of our placement cells still pointing at the freed image_id
-/// triggers `warning(renderer_image): missing image for virtual
-/// placement` per cell per render-frame.
+/// Cap on cached pages. The dominant constraint until decoded RGBA
+/// per page exceeds ~17 MB (~A4 at high zoom on a hi-DPI display);
+/// past that, the byte budget below takes over.
 ///
-/// 7 = current page ±3, which covers the typical viewport (~2-3
-/// pages), idle-warm prefetch (`MAX_WARMS_PER_IDLE=2` per tick), and
-/// a small scroll-back budget. Under ~70 MB on the terminal side, so
-/// Ghostty's image store has plenty of headroom and never needs to
-/// evict on its own. Scrolling back further than ±3 re-renders the
-/// page (~30 ms), which is the explicit tradeoff for keeping
-/// terminal memory tight.
-const MAX_CACHED_PAGES: usize = 7;
+/// Sized to fit the prefetch window's working set without churn:
+///   - PREFETCH_DEPTH = 8 (idle prefetch looks 8 pages ahead in the
+///     scroll direction, transmitting them eagerly so a held-`j`
+///     burst doesn't pause for pdfium per page)
+///   - viewport routinely shows 2–3 pages
+///   - scroll-back buffer: ~5 pages so a `k` peek doesn't immediately
+///     re-fetch
+///
+/// Total: 8 + 3 + 5 = 16. Earlier value of 7 bottlenecked at the
+/// page-count cap during normal scroll: prefetch added pages 5 ahead
+/// of cursor, eviction killed them on the next draw because 2 visible
+/// + 5 prefetch = 7 already, leaving zero scroll-back budget. Held-`j`
+/// bursts then cycled the same pages through evict→re-fetch→evict
+/// (logged in TERMPDF_DEBUG_LOG as the same page transmitting 6×
+/// in 9 seconds — the unloading-on-scroll regression's actual
+/// in-process trigger, distinct from Ghostty's own image-storage
+/// eviction).
+///
+/// At ~10 MB per page (typical render): 16 × 10 = 160 MB resident,
+/// well under the 280 MB self-budget AND under Ghostty's 320 MB
+/// image-storage-limit. At high zoom (~30 MB/page) the byte budget
+/// (`ghostty_budget_bytes`) takes over and trims the cap to ~9 pages
+/// — still better than 7, and visible pages remain protected by
+/// `visible_range_pin`.
+const MAX_CACHED_PAGES: usize = 16;
 
 /// Soft ceiling on decoded-RGBA bytes that Ghostty currently holds
 /// for OUR images. Verified from `graphics_storage.zig`: Ghostty's
