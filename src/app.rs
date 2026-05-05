@@ -2606,13 +2606,17 @@ impl<'doc> App<'doc> {
         // now (so we can add). Pages in neither set are guaranteed
         // untouched. On a 700-page book with a single new highlight
         // this trims the save from ~7 s to ~50 ms.
-        let now_pages: std::collections::HashSet<usize> =
-            self.highlights.items.iter().map(|h| h.page).collect();
-        let candidate: std::collections::HashSet<usize> = self
-            .prev_highlight_pages
-            .union(&now_pages)
-            .copied()
-            .collect();
+        //
+        // Build `candidate` as prev + new pages in a single pass; the
+        // earlier shape allocated 3 HashSets (now_pages, union iter
+        // intermediate, final candidate) — replaced with 2.
+        let mut candidate: std::collections::HashSet<usize> = self.prev_highlight_pages.clone();
+        let mut now_pages: std::collections::HashSet<usize> =
+            std::collections::HashSet::with_capacity(self.highlights.items.len());
+        for h in &self.highlights.items {
+            candidate.insert(h.page);
+            now_pages.insert(h.page);
+        }
         let result = pdfhighlights::save_to_pdf_filtered(
             &self.document,
             &self.highlights,

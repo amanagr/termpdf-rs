@@ -766,11 +766,18 @@ fn index_one_page_text(app: &mut App<'_>) {
     app.doc_index.add_page(page_idx, text);
 
     // First time the index becomes complete, snapshot it to disk.
-    // Failure is silent (cache is best-effort).
+    // Failure is silent (cache is best-effort). The serialize step
+    // runs on the main thread (it's a memcpy of the index's text
+    // buffer + length-prefix header — no IO); the actual disk write
+    // ships to a fire-and-forget thread so the multi-tens-of-ms write
+    // doesn't hitch the same idle tick that finalised the index.
     if app.doc_index.is_complete() && !app.index_persisted {
         if let Some(dir) = app.cache_dir.as_ref() {
             let p = dir.join("index.bin");
-            let _ = search_index::save(&app.doc_index, &p);
+            let buf = search_index::serialize_to_bytes(&app.doc_index);
+            std::thread::spawn(move || {
+                let _ = search_index::write_serialized(&buf, &p);
+            });
         }
         app.index_persisted = true;
     }

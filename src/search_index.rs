@@ -205,13 +205,37 @@ impl DocIndex {
         if query.is_empty() {
             return Vec::new();
         }
+        // `match_offsets` yields monotonically increasing offsets and
+        // pages are added in monotonic order (idle-warm scheduler picks
+        // lowest unindexed page) — so we can walk a forward cursor
+        // through `page_starts` instead of doing a fresh binary search
+        // per match. Amortised cost: O(matches + total_pages) instead
+        // of O(matches × log total_pages); on a query like "the" over
+        // a long book this is the dominant search cost.
         let mut out = Vec::new();
         let mut last_page: usize = usize::MAX;
+        let mut cursor: usize = 0;
+        let n = self.page_starts.len();
         for offset in self.match_offsets(query, case_sensitive) {
-            let page = self.page_for_offset(offset);
-            if page != usize::MAX && page != last_page {
-                out.push(page);
-                last_page = page;
+            // Advance cursor forward while the NEXT indexed page starts
+            // at or before this offset. NOT_INDEXED entries break the
+            // walk — but in practice pages are filled densely from 0
+            // upward so this only fires past the indexed prefix.
+            while cursor + 1 < n {
+                let next = self.page_starts[cursor + 1];
+                if next == NOT_INDEXED || next > offset {
+                    break;
+                }
+                cursor += 1;
+            }
+            // Confirm cursor actually points at an indexed page that
+            // contains this offset; defensive against edge cases like
+            // an offset before page 0's start (shouldn't happen given
+            // text construction).
+            let start = self.page_starts[cursor];
+            if start != NOT_INDEXED && start <= offset && cursor != last_page {
+                out.push(cursor);
+                last_page = cursor;
             }
         }
         out
@@ -279,26 +303,12 @@ impl DocIndex {
 /// existing on-disk indexes (gracefully — we just rebuild).
 const INDEX_MAGIC: &[u8; 8] = b"TPDFIDX1";
 
-/// Save the index to `path`. Best-effort: any IO failure returns
-/// `Ok(false)` so callers can ignore disk-cache failures.
-///
-/// File layout:
-///   8 bytes   magic "TPDFIDX1"
-///   8 bytes   total_pages (u64 LE)
-///   8 bytes   indexed_count (u64 LE)
-///   8 bytes   text_len (u64 LE)
-///   N×8 bytes page_starts vector (u64 LE per entry)
-///   M bytes   text payload
-pub fn save(index: &DocIndex, path: &std::path::Path) -> std::io::Result<bool> {
-    let parent = match path.parent() {
-        Some(p) => p,
-        None => return Ok(false),
-    };
-    if let Err(e) = std::fs::create_dir_all(parent) {
-        if e.kind() != std::io::ErrorKind::AlreadyExists {
-            return Ok(false);
-        }
-    }
+/// Serialize the index into the on-disk byte layout. Cheap relative
+/// to the disk write — pure memcpy + length-prefix encoding,
+/// dominated by the `text` payload copy. Split out so callers can
+/// build the bytes on the main thread and ship them to a worker for
+/// the actual IO.
+pub fn serialize_to_bytes(index: &DocIndex) -> Vec<u8> {
     let mut buf =
         Vec::with_capacity(8 + 8 + 8 + 8 + index.page_starts.len() * 8 + index.text.len());
     buf.extend_from_slice(INDEX_MAGIC);
@@ -309,7 +319,49 @@ pub fn save(index: &DocIndex, path: &std::path::Path) -> std::io::Result<bool> {
         buf.extend_from_slice(&(p as u64).to_le_bytes());
     }
     buf.extend_from_slice(index.text.as_bytes());
+    buf
+}
 
+/// Atomic write of pre-serialized bytes to `path`. Best-effort: any
+/// IO failure returns `Ok(false)`. Safe to call from a background
+/// thread (no shared state).
+pub fn write_serialized(buf: &[u8], path: &std::path::Path) -> std::io::Result<bool> {
+    let parent = match path.parent() {
+        Some(p) => p,
+        None => return Ok(false),
+    };
+    if let Err(e) = std::fs::create_dir_all(parent) {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Ok(false);
+        }
+    }
+    write_serialized_inner(buf, parent, path)
+}
+
+/// Save the index to `path`. Best-effort: any IO failure returns
+/// `Ok(false)` so callers can ignore disk-cache failures.
+///
+/// File layout:
+///   8 bytes   magic "TPDFIDX1"
+///   8 bytes   total_pages (u64 LE)
+///   8 bytes   indexed_count (u64 LE)
+///   8 bytes   text_len (u64 LE)
+///   N×8 bytes page_starts vector (u64 LE per entry)
+///   M bytes   text payload
+///
+/// Production callers prefer `serialize_to_bytes` + `write_serialized`
+/// so the IO can be ferried to a background thread.
+#[allow(dead_code)]
+pub fn save(index: &DocIndex, path: &std::path::Path) -> std::io::Result<bool> {
+    let buf = serialize_to_bytes(index);
+    write_serialized(&buf, path)
+}
+
+fn write_serialized_inner(
+    buf: &[u8],
+    parent: &std::path::Path,
+    path: &std::path::Path,
+) -> std::io::Result<bool> {
     // Atomic write via rename so a crash mid-write doesn't leave a
     // truncated index that later loads as garbage.
     //
@@ -349,7 +401,7 @@ pub fn save(index: &DocIndex, path: &std::path::Path) -> std::io::Result<bool> {
                 Ok(f) => f,
                 Err(_) => return Ok(false),
             };
-            if f.write_all(&buf).is_err() {
+            if f.write_all(buf).is_err() {
                 let _ = std::fs::remove_file(&tmp);
                 return Ok(false);
             }
