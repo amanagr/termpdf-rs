@@ -202,23 +202,23 @@ pub struct PlaceScratch {
     /// each row; reuse across calls keeps the underlying allocation
     /// from being freed/realloced every page.
     pub symbol: String,
-    /// Placement rectangles emitted during the *previous* frame's
-    /// kitty draw, keyed by page_idx. Used by `clear_page_area` to
-    /// preserve previous-frame placeholder cells whose target page
-    /// is still layout-visible in the current frame — that's how we
-    /// avoid overwriting the kitty placeholders for a page that
-    /// scrolled past `visible_cell_height > 0` for a frame or two
-    /// (page boundary). The `clear` would otherwise emit space
-    /// glyphs that Ghostty interprets as "no placeholder references
-    /// this image anymore", and depending on Ghostty's image-storage
-    /// GC the image silently disappears until something forces a
-    /// re-transmit.
+    /// Last-known placement rectangles for each page that ever got
+    /// drawn while still in the registry. `clear_page_area`
+    /// consults this to preserve placeholder cells for pages that
+    /// (a) are still layout-visible AND (b) were previously placed
+    /// — even if they've now collapsed to 0 cells visible.
     ///
-    /// Pre-frame: the current draw walks this map to decide what to
-    /// preserve. Post-frame: cleared and refilled with this frame's
-    /// placements.
-    prev_placed: std::collections::HashMap<usize, ratatui::layout::Rect>,
-    placed: std::collections::HashMap<usize, ratatui::layout::Rect>,
+    /// **Why the map sticks across frames instead of being swapped
+    /// per-frame:** the cell-clipped state can persist for many
+    /// frames (slow scroll across a page boundary, sub-cell jitter).
+    /// A per-frame `prev/curr` swap would zero the map after the
+    /// first cell-clipped frame, defeating the purpose.
+    ///
+    /// **Cleanup:** `evict_to_budget` removes entries for pages
+    /// that genuinely left the registry; entries for pages still
+    /// in `pages` linger harmlessly (only consulted when the page
+    /// is also in `preserve_pages`).
+    last_placed: std::collections::HashMap<usize, ratatui::layout::Rect>,
 }
 
 /// Distance between a page's image_id and its overlay's image_id. Big
@@ -245,21 +245,6 @@ impl KittyPageRegistry {
     /// it into the placement loop.
     pub fn place_scratch_mut(&mut self) -> &mut PlaceScratch {
         &mut self.place_scratch
-    }
-
-    /// Roll this-frame's placement record into prev-frame, ready for
-    /// the next frame's `clear_page_area` to use it. Must be called
-    /// once per draw, after every `place_page` call has finished
-    /// recording into `placed`. The next frame's clear consults
-    /// `prev_placed`; if it's still pointing at the same map we
-    /// just wrote, preservation logic targets THIS frame's
-    /// placements (which may not match the next frame's layout).
-    pub fn finish_frame(&mut self) {
-        std::mem::swap(
-            &mut self.place_scratch.prev_placed,
-            &mut self.place_scratch.placed,
-        );
-        self.place_scratch.placed.clear();
     }
 
     /// Drop all cached entries. Caller is responsible for sending
@@ -343,6 +328,10 @@ impl KittyPageRegistry {
             if let Some(entry) = self.overlays.remove(v) {
                 freed_ids.push(entry.image_id);
             }
+            // Drop the cached placement rect for evicted pages so
+            // clear_page_area doesn't preserve cells for an image_id
+            // that's already been queued for delete.
+            self.place_scratch.last_placed.remove(v);
         }
         self.lru.retain(|p| !victim_set.contains(p));
         if crate::debug_log::enabled() {
@@ -1023,11 +1012,13 @@ pub fn place_page(
             ),
         );
     }
-    // Record the placement for next frame's clear_page_area. The rect
-    // is in absolute buffer coordinates so a layout-visible page that
-    // collapses to 0 cells next frame still has a known cell footprint
-    // we can ask clear_page_area to preserve.
-    scratch.placed.insert(
+    // Record the placement so future frames' clear_page_area can
+    // preserve these cells if the page collapses to 0 visible cells
+    // at a sub-cell scroll boundary. The rect is in absolute buffer
+    // coordinates; entries linger until the page leaves the registry
+    // (pruned by evict_to_budget) so the preservation survives any
+    // number of consecutive cell-clipped frames.
+    scratch.last_placed.insert(
         page_idx,
         ratatui::layout::Rect {
             x: area.left(),
@@ -1227,7 +1218,7 @@ pub fn clear_page_area(
     // doesn't log "missing image for virtual placement" forever.
     let preserve_rects: Vec<ratatui::layout::Rect> = preserve_pages
         .iter()
-        .filter_map(|p| scratch.prev_placed.get(p).copied())
+        .filter_map(|p| scratch.last_placed.get(p).copied())
         .collect();
     let in_preserved = |x: u16, y: u16| -> bool {
         preserve_rects
@@ -2844,8 +2835,9 @@ mod tests {
         let mut scratch = PlaceScratch::default();
 
         // Frame N: clear (with no preservation — first frame), then
-        // place page 0 at rows 0..3. After this frame, scratch.placed
-        // has the rect; finish_frame promotes it to prev_placed.
+        // place page 0 at rows 0..3. After this frame, scratch
+        // .last_placed has the rect; it sticks until the page is
+        // evicted from the registry.
         clear_page_area(&mut buf, area, &mut scratch, &[]);
         place_page(
             &mut buf,
@@ -2870,10 +2862,6 @@ mod tests {
             placed_symbol.contains('\u{10EEEE}'),
             "frame N must place the kitty placeholder; setup precondition failed"
         );
-        // Promote frame-N placements to prev_placed for the next
-        // frame's clear to consult.
-        std::mem::swap(&mut scratch.prev_placed, &mut scratch.placed);
-        scratch.placed.clear();
 
         // Frame N+1: page 0 is layout-visible (still in
         // preserve_pages) but cell-clipped — no place_page call.
@@ -2923,8 +2911,6 @@ mod tests {
             None,
             &mut scratch2,
         );
-        std::mem::swap(&mut scratch2.prev_placed, &mut scratch2.placed);
-        scratch2.placed.clear();
         clear_page_area(&mut buf2, area, &mut scratch2, &[]);
         let after_clear_unpinned = buf2.cell((0, 0)).unwrap().symbol().to_string();
         assert!(
