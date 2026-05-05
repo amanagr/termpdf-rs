@@ -30,7 +30,14 @@ fn binary_path() -> Option<PathBuf> {
     None
 }
 
-fn pdfium_or_skip() -> Option<pdfium_render::prelude::Pdfium> {
+/// First existing libpdfium.so candidate. Mirrors what setup.sh and
+/// the user's local extracts produce: `vendor/libpdfium.so` (flat,
+/// what setup.sh stages in CI) and `vendor/lib/libpdfium.so` (full
+/// tarball extract layout). Used to seed `TERMPDF_PDFIUM` for the
+/// spawned binary so the test layout matches whichever the env
+/// produced — without this the test hardcoded the lib/-subdir layout
+/// and broke under setup.sh's flat staging.
+fn resolve_pdfium_path() -> Option<String> {
     let candidates = [
         std::env::var("TERMPDF_PDFIUM").ok(),
         Some(format!(
@@ -44,11 +51,14 @@ fn pdfium_or_skip() -> Option<pdfium_render::prelude::Pdfium> {
         Some("/usr/lib64/libpdfium.so".into()),
         Some("/usr/lib/libpdfium.so".into()),
     ];
-    let lib = candidates
+    candidates
         .into_iter()
         .flatten()
-        .find(|p| std::path::Path::new(p).exists());
-    let lib = match lib {
+        .find(|p| std::path::Path::new(p).exists())
+}
+
+fn pdfium_or_skip() -> Option<pdfium_render::prelude::Pdfium> {
+    let lib = match resolve_pdfium_path() {
         Some(p) => p,
         None => {
             eprintln!("skipping: libpdfium not found");
@@ -110,9 +120,12 @@ fn spawn_in_pty(
     cmd.arg("kitty");
     cmd.env("TERM", "xterm-kitty");
     cmd.env_remove("TMUX");
+    // Pass the resolved pdfium path through to the spawned binary —
+    // hardcoding `vendor/lib/libpdfium.so` here breaks under CI where
+    // setup.sh stages the flat `vendor/libpdfium.so` layout.
     cmd.env(
         "TERMPDF_PDFIUM",
-        format!("{}/vendor/lib/libpdfium.so", env!("CARGO_MANIFEST_DIR")),
+        resolve_pdfium_path().expect("pdfium resolved by pdfium_or_skip"),
     );
     cmd.env("TERMPDF_CELL_PX", "8x16");
     // Sandbox the disk cache to a per-test temp dir so test runs
