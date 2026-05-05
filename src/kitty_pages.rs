@@ -74,7 +74,24 @@ use crate::app::LayoutKey;
 /// (`ghostty_budget_bytes`) takes over and trims the cap to ~9 pages
 /// — still better than 7, and visible pages remain protected by
 /// `visible_range_pin`.
-const MAX_CACHED_PAGES: usize = 16;
+///
+/// Overridable at runtime via `TERMPDF_MAX_CACHED_PAGES` (clamped 4–256)
+/// for users on terminals with non-default `image-storage-limit` or
+/// extreme working sets — kept as a knob for the same reason
+/// `TERMPDF_GHOSTTY_BUDGET_MB` exists for the byte cap.
+const DEFAULT_MAX_CACHED_PAGES: usize = 16;
+
+fn max_cached_pages() -> usize {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("TERMPDF_MAX_CACHED_PAGES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|n| n.clamp(4, 256))
+            .unwrap_or(DEFAULT_MAX_CACHED_PAGES)
+    })
+}
 
 /// Soft ceiling on decoded-RGBA bytes that Ghostty currently holds
 /// for OUR images. Verified from `graphics_storage.zig`: Ghostty's
@@ -338,7 +355,7 @@ impl KittyPageRegistry {
             .map(bytes_for)
             .sum();
 
-        let over_pages = self.pages.len().saturating_sub(MAX_CACHED_PAGES);
+        let over_pages = self.pages.len().saturating_sub(max_cached_pages());
         let over_bytes = transmitted_bytes.saturating_sub(budget);
         if over_pages == 0 && over_bytes == 0 {
             return;
@@ -2115,14 +2132,15 @@ mod tests {
             dark: false,
         };
         let bm = RgbaImage::new(16, 16);
+        let cap = max_cached_pages();
         // Fill past cap.
-        for i in 0..(MAX_CACHED_PAGES + 8) {
+        for i in 0..(cap + 8) {
             r.mark_transmitted(i, layout, 0, 16, 16);
             // Also stash a payload so eviction frees something visible.
             r.pre_encode(&bm, i, layout, 0);
         }
         r.evict_to_budget(&[]);
-        assert_eq!(r.pages.len(), MAX_CACHED_PAGES);
+        assert_eq!(r.pages.len(), cap);
         // Pending deletes should free the 8 evicted ids. With the
         // d=R range-coalesce, contiguous-ID evictions collapse to one
         // range escape; here all 8 victims (pages 0..8 with IDs
@@ -2192,14 +2210,15 @@ mod tests {
         // Each page = 4096*4096*4 = 64 MB decoded. 8 pages = 512 MB,
         // far over the 200 MB default — eviction must collapse to
         // page-count cap regardless of budget setting.
-        for i in 0..(MAX_CACHED_PAGES + 8) {
+        let cap = max_cached_pages();
+        for i in 0..(cap + 8) {
             r.mark_transmitted(i, layout, 0, 4096, 4096);
         }
         r.evict_to_budget(&[]);
         // Either cap (page count or byte budget) bounds residency;
         // page count alone caps at MAX_CACHED_PAGES.
         assert!(
-            r.pages.len() <= MAX_CACHED_PAGES,
+            r.pages.len() <= cap,
             "byte budget should not allow exceeding the page-count cap"
         );
     }
@@ -2212,7 +2231,7 @@ mod tests {
             dark: false,
         };
         // Prime LRU: pages 0..N+4 marked, in order. 0..4 are LRU.
-        for i in 0..(MAX_CACHED_PAGES + 4) {
+        for i in 0..(max_cached_pages() + 4) {
             r.mark_transmitted(i, layout, 0, 16, 16);
         }
         // Pin pages 0,1,2,3 as visible — eviction must skip these
@@ -2452,7 +2471,7 @@ mod tests {
             dark: false,
         };
         // Fill past the cap so eviction triggers.
-        for i in 0..(MAX_CACHED_PAGES + 1) {
+        for i in 0..(max_cached_pages() + 1) {
             r.mark_transmitted(i, layout, 0, 16, 16);
         }
         r.evict_to_budget(&[]);
@@ -3224,11 +3243,12 @@ mod registry_proptests {
                             .collect();
                         r.evict_to_budget(pinned);
                         // I2: cache cap respected (allow over-cap by |pinned| since pinned never evict).
+                        let cap = max_cached_pages();
                         prop_assert!(
-                            r.pages.len() <= MAX_CACHED_PAGES + pinned.len(),
+                            r.pages.len() <= cap + pinned.len(),
                             "I2 violated: pages.len()={} > MAX_CACHED_PAGES+|pinned|={}",
                             r.pages.len(),
-                            MAX_CACHED_PAGES + pinned.len()
+                            cap + pinned.len()
                         );
                         for p in resident_pinned {
                             prop_assert!(
