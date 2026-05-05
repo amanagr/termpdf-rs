@@ -1466,8 +1466,19 @@ impl<'doc> App<'doc> {
         // layout for the substring of its char range that's inside
         // the selection. Concatenate with `\n\n` between pages.
         let (lo, hi) = sel.ordered();
-        let mut combined = String::new();
+        // Estimate: the selection spans roughly (hi.idx - lo.idx) chars
+        // when on the same page; on a multi-page yank we widen by 64
+        // bytes per page-separator. Way better than the default
+        // doubling-from-zero, which on a chapter-wide yank reallocs 4-5
+        // times for the same final size.
         let page_span = hi.page.saturating_sub(lo.page) + 1;
+        let cap_estimate = if lo.page == hi.page {
+            hi.idx.saturating_sub(lo.idx).saturating_add(16)
+        } else {
+            // Conservative per-page char estimate for multi-page spans.
+            page_span.saturating_mul(2048)
+        };
+        let mut combined = String::with_capacity(cap_estimate);
         let mut per_page_rects: Vec<(usize, Vec<Rect01>)> = if save {
             Vec::with_capacity(page_span)
         } else {
