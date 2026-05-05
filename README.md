@@ -324,7 +324,7 @@ a session file. By design.
 | `TERMPDF_FAST_LCD`        | unset                              | Re-enable LCD subpixel text on the Fast tier (sharper scroll, more CPU) |
 | `TERMPDF_TRANSMIT_RAW`    | unset                              | Ship raw RGBA instead of PNG (skip terminal-side PNG decode at the cost of larger pty bytes) |
 | `TERMPDF_TRANSMIT_PNG`    | unset                              | Force the legacy `f=100` PNG wire format. Escape hatch for terminals that mishandle the default `f=24,o=z` (raw RGB + zlib). |
-| `TERMPDF_GHOSTTY_BUDGET_MB` | `280`                            | Soft ceiling on the decoded-RGBA bytes that Ghostty currently holds for our **transmitted** images (clamped 32–4096 MB). Below Ghostty's default `image-storage-limit` of 320 MB by a 40 MB safety margin, so we evict ourselves (LRU non-pinned) before Ghostty has to. Pre-encoded-but-unsent prefetch pages don't count toward this budget. Raise in proportion if you bump Ghostty's `image-storage-limit`. |
+| `TERMPDF_GHOSTTY_BUDGET_MB` | `768`                            | Soft ceiling on the decoded-RGBA bytes that Ghostty currently holds for our **transmitted** images (clamped 32–4096 MB). Sized for the README's recommended `image-storage-limit = 1 GiB` Ghostty config (75 % of 1 GiB). Pre-encoded-but-unsent prefetch pages don't count toward this budget. Lower if you're on stock Ghostty (320 MB) AND read at very high zoom — the safety valve only matters when individual pages exceed `~Ghostty cap / MAX_CACHED_PAGES`. |
 | `TERMPDF_MAX_CACHED_PAGES` | `16`                            | Max page bitmaps held in the kitty image registry (clamped 4–256). Default sized to fit the prefetch working set: `PREFETCH_DEPTH(8) + viewport(2-3) + scrollback(5)`. Smaller values mean more pdfium re-renders during long scroll bursts; larger values increase resident memory until the byte budget bites. Increase if you read very long sections in one direction; decrease if memory-constrained. |
 | `TERMPDF_DEBUG_LOG`       | unset                              | Path to a debug log for the kitty graphics state machine (transmits, evictions, deletes). File is opened append-only with `O_NOFOLLOW`. |
 | `TERMPDF_RENDER_SCALE`    | unset                              | Per-PDF render scale override; rarely needed. |
@@ -333,16 +333,22 @@ a session file. By design.
 ### Ghostty users: extending the image-storage budget
 
 Ghostty's default `image-storage-limit` is 320 MB **per screen**, measured in
-*decoded RGBA bytes*. termpdf-rs caps its own resident-page byte total at 200 MB
-by default to leave Ghostty headroom, but if you read at very large zoom on
-high-DPI displays the per-page bitmap can be 30+ MB and the cap bites earlier
-than expected. To raise Ghostty's limit, add this to `~/.config/ghostty/config`:
+*decoded RGBA bytes*. termpdf-rs's default `TERMPDF_GHOSTTY_BUDGET_MB` (768 MB)
+assumes you've raised Ghostty's limit to 1 GiB — without that bump, the byte
+budget never fires and the page-count cap (`TERMPDF_MAX_CACHED_PAGES`, default
+16) is the only constraint. At ~10 MB per page that's ~160 MB resident, well
+under stock Ghostty's 320 MB, so most readers don't need to change anything.
+
+If you read at large zoom on high-DPI displays (per-page bitmap 25+ MB) and
+see pages flicker mid-scroll, raise Ghostty's limit by adding to
+`~/.config/ghostty/config`:
 
 ```
 image-storage-limit = 1073741824
 ```
 
-That's 1 GiB; the protocol caps it at 4 GiB. Set termpdf-rs's
+That's 1 GiB; the protocol caps it at 4 GiB. termpdf-rs's default budget is
+already sized for 1 GiB; if you go higher than 1 GiB, set
 `TERMPDF_GHOSTTY_BUDGET_MB` to ~75 % of whatever you pick.
 
 ### Recovery from a stuck/blank page

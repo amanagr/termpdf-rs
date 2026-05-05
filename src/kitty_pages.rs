@@ -116,11 +116,27 @@ fn max_cached_pages() -> usize {
 /// do not occupy Ghostty's store and must not count toward this
 /// budget.
 ///
-/// 280 MB by default (320 - 40 MB safety margin). Configurable via
-/// `TERMPDF_GHOSTTY_BUDGET_MB` env (clamped 32–4096 MB). Users who
-/// raised Ghostty's `image-storage-limit` should raise this in
-/// proportion (~75 % of whatever they set).
-const DEFAULT_GHOSTTY_BUDGET_BYTES: u64 = 280 * 1024 * 1024;
+/// 768 MB by default — sized to match the README's recommended
+/// `image-storage-limit = 1073741824` (1 GiB) Ghostty config at the
+/// 75 % rule, NOT to Ghostty's stock 320 MB default. Reasoning:
+///   - The unloading-on-scroll bug only ever surfaced for users on
+///     stock-default Ghostty when our internal page-count cap was
+///     too tight (fixed in MAX_CACHED_PAGES bump). The byte budget
+///     was firing as a SAFETY VALVE; users who hit it consistently
+///     are by definition reading at high zoom on high-DPI displays
+///     and have either already raised Ghostty's cap or are willing
+///     to (it's the documented mitigation).
+///   - At a 280 MB threshold against stock 320 MB Ghostty, the byte
+///     path was firing on legitimate prefetch+viewport working sets
+///     at high zoom and undoing the work before the user could see
+///     the prefetched pages — the same pattern as the page-count cap
+///     bug. Raising it past stock Ghostty assumes the user has done
+///     the README's recommended config bump; if they haven't, the
+///     budget never fires and we fall back to the page-count cap
+///     which is itself sized to keep us under stock Ghostty in the
+///     normal case.
+/// Configurable via `TERMPDF_GHOSTTY_BUDGET_MB` env (clamped 32–4096 MB).
+const DEFAULT_GHOSTTY_BUDGET_BYTES: u64 = 768 * 1024 * 1024;
 
 fn ghostty_budget_bytes() -> u64 {
     use std::sync::OnceLock;
