@@ -846,7 +846,7 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     // frame's, not the intermediate writes.
     let kp = app.kitty_pages.as_mut().unwrap();
     let scratch = kp.place_scratch_mut();
-    crate::kitty_pages::clear_page_area(buf, area, scratch);
+    crate::kitty_pages::clear_page_area(buf, area, scratch, &visible_range_pin);
     for (b, t) in blits.iter().zip(combined_prefixes.iter()) {
         if !b.placement_active {
             continue;
@@ -931,6 +931,7 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
         }
     }
     kp.evict_to_budget(&visible_range_pin);
+    kp.finish_frame();
 
     // Link-hint overlay: rendered last so labels sit on top of
     // placeholder cells. Cells we paint here override ratatui's

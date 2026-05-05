@@ -202,6 +202,23 @@ pub struct PlaceScratch {
     /// each row; reuse across calls keeps the underlying allocation
     /// from being freed/realloced every page.
     pub symbol: String,
+    /// Placement rectangles emitted during the *previous* frame's
+    /// kitty draw, keyed by page_idx. Used by `clear_page_area` to
+    /// preserve previous-frame placeholder cells whose target page
+    /// is still layout-visible in the current frame — that's how we
+    /// avoid overwriting the kitty placeholders for a page that
+    /// scrolled past `visible_cell_height > 0` for a frame or two
+    /// (page boundary). The `clear` would otherwise emit space
+    /// glyphs that Ghostty interprets as "no placeholder references
+    /// this image anymore", and depending on Ghostty's image-storage
+    /// GC the image silently disappears until something forces a
+    /// re-transmit.
+    ///
+    /// Pre-frame: the current draw walks this map to decide what to
+    /// preserve. Post-frame: cleared and refilled with this frame's
+    /// placements.
+    prev_placed: std::collections::HashMap<usize, ratatui::layout::Rect>,
+    placed: std::collections::HashMap<usize, ratatui::layout::Rect>,
 }
 
 /// Distance between a page's image_id and its overlay's image_id. Big
@@ -228,6 +245,21 @@ impl KittyPageRegistry {
     /// it into the placement loop.
     pub fn place_scratch_mut(&mut self) -> &mut PlaceScratch {
         &mut self.place_scratch
+    }
+
+    /// Roll this-frame's placement record into prev-frame, ready for
+    /// the next frame's `clear_page_area` to use it. Must be called
+    /// once per draw, after every `place_page` call has finished
+    /// recording into `placed`. The next frame's clear consults
+    /// `prev_placed`; if it's still pointing at the same map we
+    /// just wrote, preservation logic targets THIS frame's
+    /// placements (which may not match the next frame's layout).
+    pub fn finish_frame(&mut self) {
+        std::mem::swap(
+            &mut self.place_scratch.prev_placed,
+            &mut self.place_scratch.placed,
+        );
+        self.place_scratch.placed.clear();
     }
 
     /// Drop all cached entries. Caller is responsible for sending
@@ -991,6 +1023,19 @@ pub fn place_page(
             ),
         );
     }
+    // Record the placement for next frame's clear_page_area. The rect
+    // is in absolute buffer coordinates so a layout-visible page that
+    // collapses to 0 cells next frame still has a known cell footprint
+    // we can ask clear_page_area to preserve.
+    scratch.placed.insert(
+        page_idx,
+        ratatui::layout::Rect {
+            x: area.left(),
+            y: area.top().saturating_add(dst_top_cell),
+            width: width_cells,
+            height: height_cells,
+        },
+    );
     if width_cells as u32 > MAX_COLS {
         // Source col diacritic capacity exceeded; clamp silently.
     }
@@ -1157,16 +1202,44 @@ pub fn clear_page_area(
     buf: &mut ratatui::buffer::Buffer,
     area: ratatui::layout::Rect,
     scratch: &mut PlaceScratch,
+    preserve_pages: &[usize],
 ) {
     use std::fmt::Write;
     if area.width == 0 || area.height == 0 {
         return;
     }
+    // Preservation rects: previous-frame placements for pages that are
+    // STILL layout-visible (i.e. in `preserve_pages`). The rationale —
+    // ratatui-image's invariant is that placeholder cells stay in the
+    // ratatui buffer for the lifetime of the image. Writing spaces over
+    // a cell removes the placeholder reference on the wire; once a
+    // cell-clipped page has zero placeholders pointing at its image_id,
+    // Ghostty's `graphics_storage.zig::deleteIfUnused` predicate flips
+    // true and the image is first in line for eviction the moment any
+    // *new* transmit hits the storage cap. Result: scroll past a page
+    // boundary by sub-cell pixels, the page goes blank, and `is_fresh`
+    // shields the next draw from re-transmitting.
+    //
+    // Fix: skip the wipe for cells covered by a placement we made last
+    // frame for a page still in the layout-visible range. Pages that
+    // genuinely scrolled out (not in `preserve_pages`) get cleared
+    // normally so their stale placeholders go to spaces and Ghostty
+    // doesn't log "missing image for virtual placement" forever.
+    let preserve_rects: Vec<ratatui::layout::Rect> = preserve_pages
+        .iter()
+        .filter_map(|p| scratch.prev_placed.get(p).copied())
+        .collect();
+    let in_preserved = |x: u16, y: u16| -> bool {
+        preserve_rects
+            .iter()
+            .any(|r| x >= r.left() && x < r.right() && y >= r.top() && y < r.bottom())
+    };
     if crate::debug_log::enabled() {
         crate::debug_log::write(
             "clear_area",
             &format!(
-                "x={x} y={y} w={w} h={h}",
+                "x={x} y={y} w={w} h={h} preserved_pages={preserve_pages:?} \
+                 preserved_rects={preserve_rects:?}",
                 x = area.x,
                 y = area.y,
                 w = area.width,
@@ -1198,14 +1271,19 @@ pub fn clear_page_area(
     }
 
     for y in area.top()..area.bottom() {
-        if let Some(cell) = buf.cell_mut((area.left(), y)) {
-            cell.reset();
-            cell.set_symbol(&scratch.cached_row_clear);
+        if !in_preserved(area.left(), y) {
+            if let Some(cell) = buf.cell_mut((area.left(), y)) {
+                cell.reset();
+                cell.set_symbol(&scratch.cached_row_clear);
+            }
         }
         for cx in 1..area.width {
             let x = area.left().saturating_add(cx);
             if x >= area.right() {
                 break;
+            }
+            if in_preserved(x, y) {
+                continue;
             }
             if let Some(cell) = buf.cell_mut((x, y)) {
                 cell.reset();
@@ -2303,7 +2381,7 @@ mod tests {
         let placement_sym = buf.cell((0, 0)).unwrap().symbol().to_string();
         assert!(placement_sym.contains('\u{10EEEE}'));
 
-        clear_page_area(&mut buf, area, &mut scratch);
+        clear_page_area(&mut buf, area, &mut scratch, &[]);
 
         // Column 0: now holds the row-clear escape — non-empty, must
         // NOT carry the placeholder char, must contain spaces.
@@ -2417,8 +2495,8 @@ mod tests {
         let mut buf_b = Buffer::empty(area);
         let mut scratch_a = PlaceScratch::default();
         let mut scratch_b = PlaceScratch::default();
-        clear_page_area(&mut buf_a, area, &mut scratch_a);
-        clear_page_area(&mut buf_b, area, &mut scratch_b);
+        clear_page_area(&mut buf_a, area, &mut scratch_a, &[]);
+        clear_page_area(&mut buf_b, area, &mut scratch_b, &[]);
         for y in 0..area.height {
             for x in 0..area.width {
                 let a = buf_a.cell((x, y)).unwrap();
@@ -2445,7 +2523,7 @@ mod tests {
         };
         let mut buf = Buffer::empty(area);
         let mut scratch = PlaceScratch::default();
-        clear_page_area(&mut buf, area, &mut scratch);
+        clear_page_area(&mut buf, area, &mut scratch, &[]);
         // Snapshot the cached bytes + capacity so we can detect a
         // re-build (which would re-allocate or rewrite the string).
         let cached_first = scratch.cached_row_clear.clone();
@@ -2456,7 +2534,7 @@ mod tests {
 
         // Same area on a fresh buffer — must reuse the cached string.
         let mut buf2 = Buffer::empty(area);
-        clear_page_area(&mut buf2, area, &mut scratch);
+        clear_page_area(&mut buf2, area, &mut scratch, &[]);
         assert_eq!(
             scratch.cached_row_clear, cached_first,
             "string content changed"
@@ -2481,7 +2559,7 @@ mod tests {
             height: 8,
         };
         let mut buf3 = Buffer::empty(resized);
-        clear_page_area(&mut buf3, resized, &mut scratch);
+        clear_page_area(&mut buf3, resized, &mut scratch, &[]);
         assert_eq!(
             scratch.cached_row_clear_dims,
             (resized.width, resized.height)
@@ -2609,7 +2687,7 @@ mod tests {
         // is clear → place, but the cells inside the placement region
         // at the END of the frame have placement state. We mimic that
         // end-of-frame state here.)
-        clear_page_area(&mut buf_prev, area, &mut scratch);
+        clear_page_area(&mut buf_prev, area, &mut scratch, &[]);
         place_page(
             &mut buf_prev,
             area,
@@ -2629,7 +2707,7 @@ mod tests {
         );
 
         // Frame N+1: page scrolled away, clear only — no place.
-        clear_page_area(&mut buf_curr, area, &mut scratch);
+        clear_page_area(&mut buf_curr, area, &mut scratch, &[]);
 
         // Diff: at least one cell that held a placement in frame N
         // must now appear in the diff so ratatui actually emits the
@@ -2681,7 +2759,7 @@ mod tests {
         let mut buf = Buffer::empty(img_area);
         let mut scratch = PlaceScratch::default();
 
-        clear_page_area(&mut buf, img_area, &mut scratch);
+        clear_page_area(&mut buf, img_area, &mut scratch, &[]);
 
         // Post-fix design: clear_page_area leaves cols 1..N as
         // skip=false (Cell::EMPTY default after reset) so that
@@ -2731,6 +2809,127 @@ mod tests {
         assert!(
             !cell.skip,
             "placement col-0 must have skip=false so ratatui emits it; was skip=true → blank-page bug",
+        );
+    }
+
+    /// Regression for the boundary-scroll blank-page bug. Frame N
+    /// places page 0 at rows 0..3. Frame N+1, the page is still
+    /// layout-visible but cell-clipped (no place_page call) — the
+    /// real-app scenario when a page boundary sits sub-cell at the
+    /// viewport edge. Previously `clear_page_area` wrote spaces over
+    /// every cell of the image area; ratatui's diff would then emit
+    /// clearing escapes that erased the placeholder cells from the
+    /// terminal's grid. With zero placeholders pointing at the
+    /// page's image_id, Ghostty's `deleteIfUnused` predicate flips
+    /// true and the image is first in line for eviction; on the
+    /// next frame where the page returns to ≥1 cell visible, the
+    /// fresh placement APC references a freed image_id → blank.
+    ///
+    /// Fix: pass the layout-visible page set as `preserve_pages`.
+    /// Cells inside the previous frame's placement rect for a
+    /// still-visible page are skipped — placeholders stay in the
+    /// buffer, ratatui's diff sees no change, no clearing escapes
+    /// hit the wire.
+    #[test]
+    fn clear_preserves_placeholders_for_layout_visible_clipped_pages() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 4,
+        };
+        let mut buf = Buffer::empty(area);
+        let mut scratch = PlaceScratch::default();
+
+        // Frame N: clear (with no preservation — first frame), then
+        // place page 0 at rows 0..3. After this frame, scratch.placed
+        // has the rect; finish_frame promotes it to prev_placed.
+        clear_page_area(&mut buf, area, &mut scratch, &[]);
+        place_page(
+            &mut buf,
+            area,
+            /*page_idx*/ 0,
+            /*image_id*/ 42,
+            /*pixel_w*/ 80,
+            /*pixel_h*/ 60,
+            /*cell_w_px*/ 10,
+            /*cell_h_px*/ 20,
+            /*dst_top_cell*/ 0,
+            /*dst_height_cells*/ 3,
+            /*src_top_cell*/ 0,
+            /*src_left_cell*/ 0,
+            /*width_cells*/ 8,
+            /*prefix*/ None,
+            &mut scratch,
+        );
+        // Snapshot the placeholder symbol before frame N+1 runs.
+        let placed_symbol = buf.cell((0, 0)).unwrap().symbol().to_string();
+        assert!(
+            placed_symbol.contains('\u{10EEEE}'),
+            "frame N must place the kitty placeholder; setup precondition failed"
+        );
+        // Promote frame-N placements to prev_placed for the next
+        // frame's clear to consult.
+        std::mem::swap(&mut scratch.prev_placed, &mut scratch.placed);
+        scratch.placed.clear();
+
+        // Frame N+1: page 0 is layout-visible (still in
+        // preserve_pages) but cell-clipped — no place_page call.
+        // clear must NOT wipe page 0's previous placement cells.
+        clear_page_area(&mut buf, area, &mut scratch, &[0]);
+        let after_clear = buf.cell((0, 0)).unwrap().symbol().to_string();
+        assert_eq!(
+            after_clear, placed_symbol,
+            "preserved cell symbol must be byte-identical to the previous \
+             frame's placement; got {after_clear:?}"
+        );
+        // Cells 1..N of the placement carry skip=true and a default
+        // " " symbol — that's how ratatui-image's diff renderer
+        // suppresses per-cell emit so col 0's row escape paints the
+        // whole row in one shot. Preservation just means we don't
+        // turn that " "+skip=true state into the row-clear escape.
+        for cx in 1..3u16 {
+            let cell = buf.cell((cx, 0)).unwrap();
+            assert!(
+                cell.skip,
+                "cell ({cx}, 0) lost its skip=true after preservation \
+                 — diff renderer would emit a clear over col 0's escape"
+            );
+        }
+
+        // Frame N+1 (variant): page 0 is NOT in preserve_pages
+        // (genuinely scrolled out of view). clear MUST wipe the
+        // cells so stale placeholders don't keep referencing a
+        // freed image_id and flood Ghostty's "missing image" log.
+        let mut buf2 = Buffer::empty(area);
+        let mut scratch2 = PlaceScratch::default();
+        clear_page_area(&mut buf2, area, &mut scratch2, &[]);
+        place_page(
+            &mut buf2,
+            area,
+            0,
+            42,
+            80,
+            60,
+            10,
+            20,
+            0,
+            3,
+            0,
+            0,
+            8,
+            None,
+            &mut scratch2,
+        );
+        std::mem::swap(&mut scratch2.prev_placed, &mut scratch2.placed);
+        scratch2.placed.clear();
+        clear_page_area(&mut buf2, area, &mut scratch2, &[]);
+        let after_clear_unpinned = buf2.cell((0, 0)).unwrap().symbol().to_string();
+        assert!(
+            !after_clear_unpinned.contains('\u{10EEEE}'),
+            "unpinned page must have its placeholder wiped; got {after_clear_unpinned:?}"
         );
     }
 }
