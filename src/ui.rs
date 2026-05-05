@@ -33,6 +33,51 @@ use crate::dark;
 use crate::highlight::{rgb_from_hex, Rect01, HIGHLIGHT_COLORS};
 use crate::pdf;
 
+/// Per-page placement plan inside `draw_pages_kitty`. Hoisted to
+/// module scope so it can live inside `DrawScratch` and avoid a
+/// per-frame Vec re-alloc.
+pub(crate) struct PageBlit {
+    pub page_idx: usize,
+    pub image_id: u32,
+    pub pixel_w: u32,
+    pub pixel_h: u32,
+    pub revision: u64,
+    pub need_transmit: bool,
+    pub dst_top_cell: u16,
+    pub dst_left_cell: u16,
+    pub height_cells: u16,
+    pub src_top_cell: u16,
+    pub src_left_cell: u16,
+    pub width_cells: u16,
+    /// False when the rapid-burst defer chose to skip this page's
+    /// kitty placement. The blit still carries its original geometry
+    /// so we can paint a "loading…" indicator over the cleared area.
+    pub placement_active: bool,
+}
+
+/// Reusable per-frame scratch buffers for `draw_pages_kitty`. Held by
+/// `App` and taken via `mem::take` at the top of the draw, restored
+/// at the bottom — keeps the underlying allocations alive across
+/// frames so the per-frame Vec churn (8+ allocations per draw at
+/// 60-120 Hz during scroll) drops to `Vec::clear()` calls.
+#[derive(Default)]
+pub(crate) struct DrawScratch {
+    pub visible: Vec<usize>,
+    pub visible_range_pin: Vec<usize>,
+    pub blits: Vec<PageBlit>,
+    pub triples: Vec<(bool, usize, bool)>,
+    pub transmits: Vec<Option<String>>,
+    /// Sorted Vec of placed page indices (replacement for a
+    /// per-frame `HashSet<usize>`). The set has ≤ visible.len() ≤ ~8
+    /// entries so a sorted-Vec `binary_search` membership test is
+    /// faster than a HashMap probe in the hot path.
+    pub placed: Vec<usize>,
+    /// Debug-only — tells `TERMPDF_DEBUG_LOG` which layout-visible
+    /// pages got dropped by the cell-quantize filter. Allocated only
+    /// when the log path is active.
+    pub dropped: Vec<usize>,
+}
+
 /// Cap on `fit_width_px`. At extreme zoom on a 4K terminal
 /// `viewport_w * zoom` runs into the tens of thousands; pdfium
 /// happily produces gigantic pixmaps that stall every render. We
@@ -400,6 +445,21 @@ fn ensure_image(app: &mut App<'_>, area: Rect) -> Result<()> {
 /// jumps, line scroll) this is invisible. See `kitty_pages` module
 /// docs for the protocol details.
 fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> {
+    // Take the per-frame scratch out of `app` so every &mut-app borrow
+    // inside the body can run unconflicted. The wrapper restores
+    // `app.draw_scratch` on every return path (success or error).
+    let mut scratch = std::mem::take(&mut app.draw_scratch);
+    let result = draw_pages_kitty_inner(f, app, area, &mut scratch);
+    app.draw_scratch = scratch;
+    result
+}
+
+fn draw_pages_kitty_inner(
+    f: &mut Frame,
+    app: &mut App<'_>,
+    area: Rect,
+    scratch: &mut DrawScratch,
+) -> Result<()> {
     let (cell_w_u8, cell_h_u8) = app.picker.font_size();
     let cell_w = cell_w_u8 as u32;
     let cell_h = cell_h_u8 as u32;
@@ -422,35 +482,34 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     // + transmit cost for a page the user can't even see. Common at
     // the inter-page gap when the user lands a scroll between two
     // page boundaries.
-    let visible: Vec<usize> = visible_range
-        .clone()
-        .filter(|&pi| {
-            visible_cell_height(
-                &app.layout,
-                app.scroll_y_px,
-                area.height,
-                pi,
-                app.picker.font_size().1 as u32,
-            ) > 0
-        })
-        .collect();
+    scratch.visible.clear();
+    scratch.visible.extend(visible_range.clone().filter(|&pi| {
+        visible_cell_height(
+            &app.layout,
+            app.scroll_y_px,
+            area.height,
+            pi,
+            app.picker.font_size().1 as u32,
+        ) > 0
+    }));
     if crate::debug_log::enabled() {
+        scratch.dropped.clear();
+        scratch
+            .dropped
+            .extend(visible_range.clone().filter(|p| !scratch.visible.contains(p)));
         let layout_visible: Vec<usize> = visible_range.clone().collect();
-        let dropped: Vec<usize> = layout_visible
-            .iter()
-            .copied()
-            .filter(|p| !visible.contains(p))
-            .collect();
         crate::debug_log::write(
             "visible",
             &format!(
-                "scroll_y={sy} layout_visible={layout_visible:?} placed={visible:?} \
-                 dropped_by_cell_filter={dropped:?}",
-                sy = app.scroll_y_px
+                "scroll_y={sy} layout_visible={layout_visible:?} placed={vis:?} \
+                 dropped_by_cell_filter={drop:?}",
+                sy = app.scroll_y_px,
+                vis = scratch.visible,
+                drop = scratch.dropped,
             ),
         );
     }
-    if visible.is_empty() {
+    if scratch.visible.is_empty() {
         return Ok(());
     }
 
@@ -479,7 +538,7 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     let mut deferred_for_budget = false;
     {
         let _s = crate::profile::span(crate::profile::Phase::EnsureRendered);
-        for &pi in &visible {
+        for &pi in &scratch.visible {
             let is_cached = app.page_cache.contains_key(&pi);
             match plan_cold_render(is_cached, rapid, cold_budget) {
                 ColdRenderDecision::AlreadyCached => {}
@@ -498,22 +557,23 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
 
     // Materialize visible_range once so the kitty registry's
     // evict_to_budget at the end of the frame can pin LAYOUT-visible
-    // pages, not just the cell-filtered `visible` Vec. A page whose
-    // cell-quantized height rounds to 0 (sub-cell scroll position at
-    // a page boundary, page_h not divisible by cell_h) falls out of
-    // `visible` but is still layout-visible and still has placeholder
-    // cells in ratatui's buffer from prior frames. If it falls out of
-    // pinning, the LRU evicts its image_id and queues a `_Ga=d` to
-    // Ghostty; the placeholder cells suddenly reference a freed image
-    // and the page renders blank until something forces a re-transmit
-    // (revision flip, layout change, click).
-    let visible_range_pin: Vec<usize> = visible_range.clone().collect();
+    // pages, not just the cell-filtered `scratch.visible` Vec. A page
+    // whose cell-quantized height rounds to 0 (sub-cell scroll position
+    // at a page boundary, page_h not divisible by cell_h) falls out of
+    // `scratch.visible` but is still layout-visible and still has
+    // placeholder cells in ratatui's buffer from prior frames. If it
+    // falls out of pinning, the LRU evicts its image_id and queues a
+    // `_Ga=d` to Ghostty; the placeholder cells suddenly reference a
+    // freed image and the page renders blank until something forces a
+    // re-transmit (revision flip, layout change, click).
+    scratch.visible_range_pin.clear();
+    scratch.visible_range_pin.extend(visible_range.clone());
     app.evict_far_pages(visible_range.clone());
     app.enforce_byte_budget(page_cache_budget_bytes(), visible_range);
 
     {
         let _s = crate::profile::span(crate::profile::Phase::EnsureOverlay);
-        for &pi in &visible {
+        for &pi in &scratch.visible {
             // ensure_overlay early-returns when page_cache is missing,
             // so the rapid-scroll skip above propagates here for free.
             ensure_overlay(app, pi, layout_key);
@@ -527,32 +587,14 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     // into a Vec so the read-only borrows on overlay_cache and
     // kitty_pages can be released before we mutate the registry +
     // ratatui buffer in the second pass below.
-    struct PageBlit {
-        page_idx: usize,
-        image_id: u32,
-        pixel_w: u32,
-        pixel_h: u32,
-        revision: u64,
-        need_transmit: bool,
-        dst_top_cell: u16,
-        dst_left_cell: u16,
-        height_cells: u16,
-        src_top_cell: u16,
-        src_left_cell: u16,
-        width_cells: u16,
-        /// False when the rapid-burst defer chose to skip this page's
-        /// kitty placement. The blit still carries its original geometry
-        /// so we can paint a "loading…" indicator over the cleared area.
-        placement_active: bool,
-    }
-
     let scroll_y = app.scroll_y_px;
     let scroll_x = app.scroll_x;
     let area_width_cells = area.width;
     let area_height_cells = area.height;
 
-    let mut blits: Vec<PageBlit> = Vec::with_capacity(visible.len());
-    for &page_idx in &visible {
+    scratch.blits.clear();
+    scratch.blits.reserve(scratch.visible.len());
+    for &page_idx in &scratch.visible {
         // Read dims from the highlights-baked tier when present, else
         // fall back to page_cache. Pages with no highlights / search
         // hits don't get a baked entry (saves the ~6 MB clone) and
@@ -620,7 +662,7 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
         let need_transmit = !kp.is_fresh(page_idx, layout_key, revision, pixel_w, pixel_h);
         let image_id = kp.image_id(page_idx);
 
-        blits.push(PageBlit {
+        scratch.blits.push(PageBlit {
             page_idx,
             image_id,
             pixel_w,
@@ -645,7 +687,7 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     // SETTLE_MS in main.rs::run_loop) so the deferred pages render
     // the moment the user lets up.
     if app.is_rapid_scrolling() {
-        for b in blits.iter_mut() {
+        for b in scratch.blits.iter_mut() {
             if !b.need_transmit {
                 continue;
             }
@@ -693,22 +735,27 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     // them up next iteration.
     {
         let kp_ref = app.kitty_pages.as_ref().unwrap();
-        let triples: Vec<(bool, usize, bool)> = blits
-            .iter()
-            .map(|b| {
-                (
-                    b.need_transmit,
-                    b.page_idx,
-                    kp_ref.has_prior_transmit(b.page_idx),
-                )
-            })
-            .collect();
+        scratch.triples.clear();
+        scratch.triples.extend(scratch.blits.iter().map(|b| {
+            (
+                b.need_transmit,
+                b.page_idx,
+                kp_ref.has_prior_transmit(b.page_idx),
+            )
+        }));
         let current_page = app.current_page();
-        let to_defer = plan_transmit_deferrals(&triples, current_page, MAX_TRANSMITS_PER_DRAW);
+        // plan_transmit_deferrals still returns a fresh Vec — its
+        // caller-friendly signature is hard to scratch; the Vec is
+        // tiny (≤ blits.len() ≤ ~8 entries) and the alloc rarely
+        // fires (only when the per-frame transmit cap is breached).
+        let to_defer =
+            plan_transmit_deferrals(&scratch.triples, current_page, MAX_TRANSMITS_PER_DRAW);
         if !to_defer.is_empty() {
             if crate::debug_log::enabled() {
-                let deferred_pages: Vec<usize> =
-                    to_defer.iter().map(|&i| blits[i].page_idx).collect();
+                let deferred_pages: Vec<usize> = to_defer
+                    .iter()
+                    .map(|&i| scratch.blits[i].page_idx)
+                    .collect();
                 crate::debug_log::write(
                     "budget_defer",
                     &format!(
@@ -718,7 +765,7 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
                 );
             }
             for i in to_defer {
-                blits[i].need_transmit = false;
+                scratch.blits[i].need_transmit = false;
             }
             // Trigger a follow-up frame so the deferred pages catch
             // up; same mechanism the cold-render staggering uses.
@@ -738,22 +785,23 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     let baked_cache = &app.highlights_baked_cache;
     let page_cache = &app.page_cache;
     let kp = app.kitty_pages.as_mut().unwrap();
-    let mut transmits: Vec<Option<String>> = blits
-        .iter()
-        .map(|b| {
-            if !b.need_transmit {
-                return None;
-            }
-            let bm: &RgbaImage = if let Some((bm, _)) = overlay_cache.get(&b.page_idx) {
-                bm
-            } else if let Some((bm, _)) = baked_cache.get(&b.page_idx) {
-                bm
-            } else {
-                page_cache.get(&b.page_idx)?.as_rgba8()?
-            };
+    scratch.transmits.clear();
+    scratch.transmits.reserve(scratch.blits.len());
+    for b in scratch.blits.iter() {
+        let entry = if !b.need_transmit {
+            None
+        } else if let Some((bm, _)) = overlay_cache.get(&b.page_idx) {
             Some(kp.build_transmit(bm, b.page_idx, layout_key, b.revision))
-        })
-        .collect();
+        } else if let Some((bm, _)) = baked_cache.get(&b.page_idx) {
+            Some(kp.build_transmit(bm, b.page_idx, layout_key, b.revision))
+        } else {
+            page_cache
+                .get(&b.page_idx)
+                .and_then(|d| d.as_rgba8())
+                .map(|bm| kp.build_transmit(bm, b.page_idx, layout_key, b.revision))
+        };
+        scratch.transmits.push(entry);
+    }
 
     // Drain any pending kitty `a=d,d=I,i=ID` deletes from prior
     // evictions and ride them in on the first transmit of this frame.
@@ -761,11 +809,11 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     // inside the `term.draw` window and avoids a second pty round-trip.
     let kp = app.kitty_pages.as_mut().unwrap();
     if let Some(mut deletes) = kp.take_pending_deletes() {
-        if let Some(i) = transmits.iter().position(|t| t.is_some()) {
-            let existing = transmits[i].take().unwrap();
+        if let Some(i) = scratch.transmits.iter().position(|t| t.is_some()) {
+            let existing = scratch.transmits[i].take().unwrap();
             deletes.reserve(existing.len());
             deletes.push_str(&existing);
-            transmits[i] = Some(deletes);
+            scratch.transmits[i] = Some(deletes);
         } else {
             // No transmits this frame — stash the deletes for next.
             // Cheap to write back; eviction is rare relative to draws.
@@ -776,7 +824,6 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     // The per-blit prefix passed to `place_page` IS the per-page
     // transmit string (or None for fresh pages). The pre-bake design
     // had a separate overlay payload concatenated here; that's gone.
-    let combined_prefixes: Vec<Option<String>> = transmits;
 
     drop(_compose);
 
@@ -803,7 +850,7 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     // ratatui's diff compares the buffer's *final* state to the prior
     // frame's, not the intermediate writes.
     let kp = app.kitty_pages.as_mut().unwrap();
-    let scratch = kp.place_scratch_mut();
+    let place_scratch = kp.place_scratch_mut();
     // Preserve placeholders for ALL pinned-visible pages, including
     // those being re-placed this frame at the same rect. Reason: if
     // we DO clear those cells, the wire briefly carries spaces (no
@@ -815,8 +862,8 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     // click on page 226, page 225 vanishes). When a page's rect
     // legitimately moves, place_page handles the (old - new) cell
     // strip explicitly so the OLD position doesn't ghost.
-    crate::kitty_pages::clear_page_area(buf, area, scratch, &visible_range_pin);
-    for (b, t) in blits.iter().zip(combined_prefixes.iter()) {
+    crate::kitty_pages::clear_page_area(buf, area, place_scratch, &scratch.visible_range_pin);
+    for (b, t) in scratch.blits.iter().zip(scratch.transmits.iter()) {
         if !b.placement_active {
             continue;
         }
@@ -841,7 +888,7 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
             b.src_left_cell,
             b.width_cells,
             t.as_deref(),
-            scratch,
+            place_scratch,
         );
     }
 
@@ -857,15 +904,21 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     // Paint a centered "loading page N…" line into the cleared area
     // so the user sees pending work, not a glitch.
     {
-        use std::collections::HashSet;
-        let placed: HashSet<usize> = blits
-            .iter()
-            .filter(|b| b.placement_active)
-            .map(|b| b.page_idx)
-            .collect();
+        // Sorted Vec of placed page indices (replaces a per-frame
+        // HashSet alloc). Visible.len() is ≤ 8 in realistic layouts
+        // so binary_search membership is faster than a HashMap probe.
+        scratch.placed.clear();
+        scratch.placed.extend(
+            scratch
+                .blits
+                .iter()
+                .filter(|b| b.placement_active)
+                .map(|b| b.page_idx),
+        );
+        scratch.placed.sort_unstable();
         let scroll_y = app.scroll_y_px;
-        for &page_idx in &visible {
-            if placed.contains(&page_idx) {
+        for &page_idx in &scratch.visible {
+            if scratch.placed.binary_search(&page_idx).is_ok() {
                 continue;
             }
             paint_loading_indicator(
@@ -889,14 +942,14 @@ fn draw_pages_kitty(f: &mut Frame, app: &mut App<'_>, area: Rect) -> Result<()> 
     // out on the next frame's first transmit (see take_pending_deletes
     // above).
     let kp = app.kitty_pages.as_mut().unwrap();
-    for b in &blits {
+    for b in &scratch.blits {
         if b.need_transmit {
             kp.mark_transmitted(b.page_idx, layout_key, b.revision, b.pixel_w, b.pixel_h);
         }
     }
     // The overlay_marks loop that used to live here was dead after
     // the selection-bake-into-page switch (commit f83931e); deleted.
-    kp.evict_to_budget(&visible_range_pin);
+    kp.evict_to_budget(&scratch.visible_range_pin);
 
     // Link-hint overlay: rendered last so labels sit on top of
     // placeholder cells. Cells we paint here override ratatui's

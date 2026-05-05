@@ -246,6 +246,11 @@ pub struct App<'doc> {
     /// unicode-placeholder cells. Drops the per-frame Draw cost from
     /// ~150 ms (full canvas re-encode + pty write) to ~5 ms.
     pub kitty_pages: Option<crate::kitty_pages::KittyPageRegistry>,
+    /// Reusable scratch buffers for `ui::draw_pages_kitty` so the
+    /// per-frame Vec allocations (visible, blits, transmits, etc.)
+    /// drop to `clear()` calls between frames. Taken via
+    /// `mem::take` at the top of the draw and restored at the bottom.
+    pub draw_scratch: crate::ui::DrawScratch,
     /// Most recent input event time. Used by `is_rapid_scrolling` to
     /// detect a sustained autorepeat / mouse-wheel burst so the kitty
     /// draw path can defer cold-page transmits until the burst ends.
@@ -570,6 +575,7 @@ impl<'doc> App<'doc> {
             pages_in_flight: std::collections::HashSet::new(),
             image_proto: None,
             kitty_pages,
+            draw_scratch: crate::ui::DrawScratch::default(),
             last_input_at: None,
             input_burst_count: 0,
             last_scroll_applied_at: None,
