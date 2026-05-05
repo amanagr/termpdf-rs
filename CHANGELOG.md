@@ -11,9 +11,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `Ctrl-L` to manually re-transmit all visible pages — recovery
   hatch for the rare case where Ghostty / tmux drop a cached image
   and the screen goes blank.
-- Idle auto-refresh: after 60 s of no input, all visible page
-  transmits are silently re-issued. Paired with the 30 s post-input
-  guard so it never fires during active reading.
 - `f=24,o=z` (RGB + zlib) page-transmit format: 40–90% smaller wire
   bytes than the prior PNG path, with comparable encode time at
   zlib level 1. Falls back to PNG via `TERMPDF_TRANSMIT_PNG=1`.
@@ -48,8 +45,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - Pages going blank after long scroll bursts in Ghostty + tmux —
-  four-layer mitigation (visible-range pin, Ctrl-L manual refresh,
-  idle auto-refresh, smaller wire-byte transmits).
+  three-layer mitigation (visible-range pin, Ctrl-L manual refresh,
+  smaller wire-byte transmits via f=24,o=z).
+
+### Removed
+- Idle auto-refresh — re-transmitted all visible pages every 60 s
+  of inactivity as a blanket "in case the terminal lost an image"
+  hatch. In practice it caused visible flicker for any reader who
+  paused to think for 30 s, and never fired during the active-
+  scrolling case where the blank-page bug actually shows up.
+  Ctrl-L is the explicit recovery hatch.
 - Resurrection clobber in pending-delete state machine: when a
   page was evicted then re-rendered before the queued `a=d` rode
   out, the stale image_id could cancel a different page's

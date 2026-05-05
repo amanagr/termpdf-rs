@@ -114,9 +114,13 @@ PDF emits effectively zero bytes:
 - **Active** (recent input): full per-frame rendering, MIN_FRAME_INTERVAL.
 - **Settling** (just finished a burst): one or two more frames to
   let prefetch fill the cache, then transition to idle.
-- **Idle** (no input for ~30 s): no draws, no transmits. Single
-  60 s heartbeat re-issues all visible page transmits as a
-  recovery hatch (Ghostty / tmux occasionally drop cached images).
+- **Idle** (no input for ~30 s): no draws, no transmits. If a
+  cached image is silently evicted by Ghostty's
+  `image-storage-limit` LRU, the user can press `Ctrl-L` to mark
+  every page stale and force a full re-transmit on the next draw.
+  We previously fired this on a 60 s heartbeat automatically;
+  removed because the implicit re-render caused visible flicker
+  during long reads without solving the active-scrolling case.
 
 ### Selection → bitmap path (post-bake)
 
