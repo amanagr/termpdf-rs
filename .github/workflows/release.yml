@@ -1,0 +1,118 @@
+name: Release
+
+# Tag-driven release. Pushing `vX.Y.Z` builds a release artifact
+# for Linux x86_64, attaches it to a GitHub Release with the
+# matching tag, and includes a snapshot of the third-party
+# license summary.
+#
+# Tagging procedure:
+#   1. Update CHANGELOG.md — move [Unreleased] entries under a
+#      new [X.Y.Z] section, set the date.
+#   2. Bump `version` in Cargo.toml to match.
+#   3. Commit, tag (`git tag -s vX.Y.Z`), push the tag.
+#
+# This workflow does NOT publish to crates.io — `pdfium-render`
+# requires a runtime libpdfium.so, which makes a `cargo install`
+# install path painful. Pre-built binaries via Releases is the
+# supported install path.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  # Allow dry-run from the Actions UI for sanity-checking before
+  # cutting a real tag.
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create the Release + upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  build-linux:
+    name: Build (linux x86_64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rust toolchain
+        run: rustup default stable
+      - name: Cache vendor (pdfium)
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: vendor-pdfium-${{ hashFiles('setup.sh') }}
+      - name: setup.sh
+        run: ./setup.sh
+      - name: Build release binary
+        run: cargo build --release
+      - name: Stage release artifact
+        # Bundle the binary, the runtime libpdfium.so, the upstream
+        # pdfium license, and a top-level README pointer. Tarball
+        # layout matches what users who untar into ~/.local/bin
+        # expect.
+        run: |
+          set -e
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGE="termpdf-rs-${VERSION}-linux-x86_64"
+          mkdir -p "$STAGE"
+          cp target/release/termpdf "$STAGE/"
+          cp vendor/libpdfium.so "$STAGE/"
+          cp vendor/LICENSE.txt "$STAGE/PDFIUM_LICENSE.txt" || true
+          cp LICENSE "$STAGE/"
+          cp README.md "$STAGE/"
+          cp CHANGELOG.md "$STAGE/"
+          cp THIRD_PARTY_LICENSES.md "$STAGE/"
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+          sha256sum "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: |
+            termpdf-rs-*-linux-x86_64.tar.gz
+            termpdf-rs-*-linux-x86_64.tar.gz.sha256
+
+  release:
+    name: Publish release
+    runs-on: ubuntu-24.04
+    needs: [build-linux]
+    # Only publish on actual tag pushes — workflow_dispatch is for
+    # build-only dry runs.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Extract changelog section for this tag
+        # Pull the `## [X.Y.Z]` section out of CHANGELOG.md to use
+        # as the release body. If the section isn't present, fall
+        # back to a generic message — better than failing the
+        # workflow on a missing-changelog typo.
+        run: |
+          set -e
+          VERSION="${GITHUB_REF_NAME#v}"
+          if grep -q "^## \[${VERSION}\]" CHANGELOG.md; then
+            awk -v v="${VERSION}" '
+              $0 ~ "^## \\[" v "\\]" { found=1; next }
+              found && /^## \[/ { exit }
+              found
+            ' CHANGELOG.md > release_body.md
+          else
+            echo "Release ${VERSION}. See CHANGELOG.md for details." > release_body.md
+          fi
+          echo "RELEASE_BODY<<EOF" >> "$GITHUB_ENV"
+          cat release_body.md >> "$GITHUB_ENV"
+          echo "EOF" >> "$GITHUB_ENV"
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file release_body.md \
+            dist/linux-x86_64/*
