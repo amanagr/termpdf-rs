@@ -5,7 +5,6 @@ edition = "2021"
 description = "Terminal PDF reader with Kitty graphics + dark mode"
 license = "MIT"
 repository = "https://github.com/amanagr/termpdf-rs"
-default-run = "termpdf"
 
 [[bin]]
 name = "termpdf"
@@ -40,18 +39,23 @@ crossterm = "0.29"
 # Color-aware dark mode + on-the-wire PNG encode + cached page
 # decode. We only ever encode/decode PNG (page bitmap → kitty
 # transmit; cached page bitmap on disk). image's default features
-# pull in the entire codec stack including rav1e/ravif (AV1) and a
-# wasm toolchain — ~50 transitive crates of build.rs / unsafe C-like
-# code that we never call into. default-features = false + just
-# "png" trims that supply-chain surface. Also drops the
-# unmaintained `paste 1.0.15` (RUSTSEC-2024-0436) which arrives
-# transitively through ravif → rav1e.
+# pull in the AV1 codec stack — rav1e/ravif and the unmaintained
+# `paste 1.0.15` (RUSTSEC-2024-0436) which arrives transitively
+# through ravif → rav1e. default-features = false + just "png"
+# avoids those.
+#
+# Heads up on what feature-unification still pulls in: pdfium-render's
+# `image_latest` forces `image/jpeg` (→ zune-jpeg/zune-core), and
+# ratatui-image's sixel encoder pulls `quantette` which also wants
+# jpeg. So zune-jpeg ends up in the build regardless of our flag —
+# Cargo unifies features across the dep graph. We can't drop it
+# without forking pdfium-render or losing sixel from ratatui-image.
 image = { version = "0.25", default-features = false, features = ["png"] }
 palette = { version = "0.7", default-features = false, features = ["std"] }
 
 # CLI parsing + JSON for highlight persistence.
 # clap: wrap_help gives sensible long-help wrapping on narrow terms.
-clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+clap = { version = "4.6", features = ["derive", "env", "wrap_help"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
@@ -67,6 +71,14 @@ base64 = "0.22"
 # without PNG's filtering pass, so encode is ~3× faster and Ghostty
 # decodes to RGB directly (no PNG parser, no alpha plane).
 flate2 = "1"
+
+# OS signal cleanup. Already in the tree transitively (via
+# crossterm → signal-hook-mio); promoted to a direct dep so
+# `main.rs::install_signal_cleanup` can spawn a watcher thread that
+# restores terminal modes (raw / alt screen / DECSET 2026 / bracketed
+# paste / cursor) on SIGTERM / SIGHUP / SIGQUIT and re-raises the
+# signal. Without this a `kill <pid>` strands the user's terminal.
+signal-hook = "0.3"
 
 [dev-dependencies]
 # PTY-driven integration tests. Spawns the built `termpdf` binary

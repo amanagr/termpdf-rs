@@ -1068,36 +1068,43 @@ fn build_transmit_string(
     // protocol cooperating.
     for (i, chunk) in payload.chunks(RAW_PER_CHUNK).enumerate() {
         data.push_str(start);
-        write!(data, "{escape}_Gq=2,").unwrap();
         if i == 0 {
-            // q=2 suppresses kitty responses; t=d = direct transmit
-            // (data inline); a=T = transmit-and-store (no immediate
-            // placement); U=1 = mark for unicode placeholder use.
-            // f=32 raw RGBA / f=24 raw RGB (s/v required) or f=100 PNG
-            // (decoder reads dims from PNG header but we send s/v
-            // anyway — kitty accepts and uses them as a hint).
-            // o=z (zlib) only emitted when the encode path zlib-deflated
-            // the raw bytes (page bitmaps via encode_rgb_zlib); PNG and
-            // uncompressed raw paths leave it off — PNG carries its own
-            // zlib stream inside the container, double-deflate is wasted
-            // work and Ghostty rejects it.
+            // q=1 suppresses kitty's OK reply (we never read responses,
+            // so the per-image OK was just landing on stdin and being
+            // discarded by crossterm's parser; in tmux passthrough
+            // setups it would leak through). q=2 — which we used to
+            // emit — is the WRONG direction per spec: it suppresses
+            // *failure* responses and lets OK through. Errors flowing
+            // through with q=1 is the right tradeoff for our case
+            // (rare, and crossterm discards them too).
+            //
+            // t=d = direct transmit (data inline); a=T = transmit-
+            // and-store (no immediate placement); U=1 = mark for
+            // unicode placeholder use. f=32 raw RGBA / f=24 raw RGB
+            // (s/v required) or f=100 PNG (decoder reads dims from
+            // PNG header but we send s/v anyway — kitty accepts and
+            // uses them as a hint). o=z (zlib) only emitted when the
+            // encode path zlib-deflated the raw bytes (page bitmaps
+            // via encode_rgb_zlib); PNG and uncompressed raw paths
+            // leave it off — PNG carries its own zlib stream inside
+            // the container, double-deflate is wasted work and
+            // Ghostty rejects it.
             write!(
                 data,
-                "i={id},a=T,U=1,f={format_code},t=d,s={pixel_w},v={pixel_h},"
+                "{escape}_Gq=1,i={id},a=T,U=1,f={format_code},t=d,s={pixel_w},v={pixel_h},"
             )
             .unwrap();
             if compression == b'z' {
                 write!(data, "o=z,").unwrap();
             }
         } else {
-            // Continuation chunks MUST carry `i={id}` per the kitty
-            // graphics protocol, so the terminal can route the chunk
-            // to the correct in-progress upload. Both kitty and
-            // current Ghostty also accept the omission (they fall
-            // back to "last active chunked upload for this client"),
-            // but a future stricter parser would silently drop the
-            // chunk → blank page.
-            write!(data, "i={id},").unwrap();
+            // Continuation chunks: spec says only `m=` and optionally
+            // `q=` are allowed — every other key MUST be omitted.
+            // We used to emit `i={id},m={more}` here, which both kitty
+            // and Ghostty tolerate today by routing on "last active
+            // chunked upload" but is technically out-of-spec and
+            // a stricter parser would reject it.
+            write!(data, "{escape}_G").unwrap();
         }
         let more = u8::from(chunk_count > i + 1);
         write!(data, "m={more};").unwrap();
@@ -1110,9 +1117,11 @@ fn build_transmit_string(
     // (and a no-op-cost on kitty) — without it, Ghostty floods its log
     // with `missing image for virtual placement, ignoring image_id=…`
     // for every placeholder cell, eventually starving the renderer.
-    // No c/r → use the image's natural cell dimensions.
+    // No c/r → the placement size is determined by the placeholder
+    // cells we write later (spec: `c=`/`r=` default to 0 = auto under
+    // unicode-placeholder placements).
     data.push_str(start);
-    write!(data, "{escape}_Ga=p,U=1,i={id},q=2;{escape}\\").unwrap();
+    write!(data, "{escape}_Ga=p,U=1,i={id},q=1;{escape}\\").unwrap();
     data.push_str(end);
     data
 }
@@ -1650,11 +1659,14 @@ fn serialize_pending_deletes(ids: &mut Vec<u32>, is_tmux: bool) -> String {
             j += 1;
         }
         if j == i {
-            // Singleton: `a=d,d=I,i=ID,q=2`. q=2 suppresses the
-            // OK reply since we never read responses anyway.
+            // Singleton: `a=d,d=I,i=ID,q=1`. q=1 suppresses the
+            // per-delete OK reply (we never read responses; OK
+            // bytes leaking onto stdin would be discarded by
+            // crossterm's parser at best, treated as keystrokes
+            // at worst).
             write!(
                 out,
-                "{start}{escape}_Ga=d,d=I,i={id},q=2;{escape}\\{end}",
+                "{start}{escape}_Ga=d,d=I,i={id},q=1;{escape}\\{end}",
                 id = ids[i]
             )
             .unwrap();
@@ -1664,7 +1676,7 @@ fn serialize_pending_deletes(ids: &mut Vec<u32>, is_tmux: bool) -> String {
             // only — we want both).
             write!(
                 out,
-                "{start}{escape}_Ga=d,d=R,x={lo},y={hi},q=2;{escape}\\{end}",
+                "{start}{escape}_Ga=d,d=R,x={lo},y={hi},q=1;{escape}\\{end}",
                 lo = ids[i],
                 hi = ids[j]
             )

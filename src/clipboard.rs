@@ -19,11 +19,13 @@ use std::process::{Command, Stdio};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 
-/// Soft cap on the bytes we'll attempt to copy. Kitty's OSC 52
-/// ceiling is ~8 MB; tmux's is much lower depending on
-/// `set-clipboard` config. Academic-paper selections are typically
-/// well under 2 KB; anything past 75 KB pre-encode is almost
-/// certainly a runaway and not what the user wanted to copy.
+/// Soft cap on the bytes we'll attempt to copy. Kitty's
+/// `clipboard_max_size` default is 512 MB so we're nowhere near it;
+/// the binding constraint is actually tmux, whose `set-clipboard
+/// external` mode caps OSC 52 payloads at a few KB by default. Our
+/// 75 KB cap is comfortably above any realistic academic-paper
+/// selection (typically <2 KB) and below the budget where we'd
+/// suspect a runaway selection that wasn't what the user intended.
 pub const MAX_COPY_BYTES: usize = 75 * 1024;
 
 #[derive(Debug, Default)]

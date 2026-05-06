@@ -187,12 +187,14 @@ fn twoway_contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Count occurrences of the kitty transmit header (`\x1b_G…f=…`).
-/// Each transmit chunk starts with `\x1b_G`, so this is an upper
-/// bound on transmit-chunks; for our usage (pages much smaller than
-/// one chunk) it's equivalent to "number of transmits sent".
+/// Count occurrences of a first-chunk kitty transmit header. Each
+/// FIRST chunk of an image starts with `\x1b_Gq=1,i=…,a=T,…`; later
+/// chunks of the same image carry only `\x1b_Gm=…`. We count the
+/// `q=1,i=` prefix because it appears once per image and not on the
+/// continuation chunks. (The byte signature is what changed when we
+/// flipped q=2 → q=1; q=2 was wrong-direction per the kitty spec.)
 fn count_kitty_transmit_headers(haystack: &[u8]) -> usize {
-    let needle = b"\x1b_Gq=2,";
+    let needle = b"\x1b_Gq=1,i=";
     if needle.len() > haystack.len() {
         return 0;
     }

@@ -47,12 +47,14 @@ use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches, Parser};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyEventKind,
+    Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
-use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, BeginSynchronizedUpdate,
+    EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use crossterm::{execute, queue};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use ratatui_image::picker::{Picker, ProtocolType};
@@ -319,6 +321,7 @@ fn main() -> Result<()> {
 
     setup_terminal()?;
     install_decset_panic_hook();
+    install_signal_cleanup();
     let res = run_loop(&mut app);
     // Persist BEFORE teardown_terminal? returns its result. The
     // earlier order — `teardown_terminal()?` then persist — meant a
@@ -345,6 +348,14 @@ fn main() -> Result<()> {
     res
 }
 
+/// Tracks whether `setup_terminal` successfully pushed the Kitty
+/// Keyboard Protocol enhancement flags. Restore paths (teardown,
+/// panic hook, signal cleanup) check this so we only emit
+/// `PopKeyboardEnhancementFlags` if we actually pushed — avoids
+/// shrinking the terminal's flag stack below zero on terminals that
+/// declined the push.
+static KKP_PUSHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn setup_terminal() -> Result<()> {
     enable_raw_mode()?;
     // Hide the terminal's blinking cursor. We're a viewer, not an
@@ -365,6 +376,26 @@ fn setup_terminal() -> Result<()> {
         EnableBracketedPaste,
         crossterm::cursor::Hide,
     )?;
+    // Kitty Keyboard Protocol — `REPORT_EVENT_TYPES` is what makes
+    // crossterm fill in `KeyEvent.kind` on Unix (Windows always
+    // populates it). Without this push, every autorepeat from a held
+    // key arrives as `KeyEventKind::Press`, and the `Repeat`-gated
+    // motion-allowlist in `dispatch_event` is unreachable — held
+    // motions either don't autorepeat (under terminals that emit
+    // discrete Press per autorepeat) or fire every dispatched key
+    // (commands like `d` flipping dark mode 30×/sec). Probe first so
+    // we don't push flags into a terminal that doesn't speak the
+    // protocol; pushing into a non-speaker is harmless on the wire
+    // but the matching Pop on teardown then has nothing to undo.
+    if supports_keyboard_enhancement().unwrap_or(false)
+        && execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES),
+        )
+        .is_ok()
+    {
+        KKP_PUSHED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     Ok(())
 }
 
@@ -373,10 +404,9 @@ fn teardown_terminal() -> Result<()> {
     // run-loop's per-frame ESU didn't run (e.g. an early return path
     // was added later that bypassed it), make sure we're not leaving
     // the user's terminal in DECSET 2026 sync mode.
-    use std::io::Write as _;
     let mut out = io::stdout();
-    let _ = write!(out, "\x1b[?2026l");
-    let _ = out.flush();
+    let _ = execute!(out, EndSynchronizedUpdate);
+    pop_kkp_if_pushed(&mut out);
     execute!(
         out,
         crossterm::cursor::Show,
@@ -388,35 +418,85 @@ fn teardown_terminal() -> Result<()> {
     Ok(())
 }
 
+/// Pop the Kitty Keyboard Protocol enhancement flags we pushed in
+/// `setup_terminal`. Idempotent: only pops if we actually pushed and
+/// hasn't already been popped (matters because the panic hook and
+/// teardown both call this — whichever runs first wins the swap).
+fn pop_kkp_if_pushed(out: &mut std::io::Stdout) {
+    if KKP_PUSHED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        let _ = execute!(out, PopKeyboardEnhancementFlags);
+    }
+}
+
+/// Best-effort terminal restore for the panic + signal cleanup paths.
+/// Ignores all errors — by the time we reach this we just want as
+/// much cleanup as possible before exit. Mirrors `teardown_terminal`
+/// minus the result-propagation. ESU goes out first because if BSU
+/// fired but ESU didn't, the screen stays frozen in sync mode and
+/// the user can't see the rest of the cleanup anyway.
+fn restore_terminal_best_effort() {
+    let mut out = io::stdout();
+    let _ = execute!(out, EndSynchronizedUpdate);
+    pop_kkp_if_pushed(&mut out);
+    let _ = execute!(
+        out,
+        crossterm::cursor::Show,
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+    );
+    let _ = disable_raw_mode();
+}
+
 /// Wrap the default panic hook so a panic during `term.draw` or any
 /// other tight render path doesn't leave the user's terminal stuck
 /// in DECSET 2026 sync mode (output buffered, screen frozen). Writes
-/// ESU directly to stdout — bypasses any BufWriter that might still
-/// hold the BSU we paired it with, since by panic time the unwinder
-/// hasn't run our normal cleanup. Also clears alt-screen + raw mode
+/// directly to stdout — bypasses any BufWriter that might still hold
+/// the BSU we paired it with, since by panic time the unwinder
+/// hasn't run our normal cleanup. Also pops KKP flags, clears
+/// bracketed-paste/mouse/alt-screen, and restores cooked input mode
 /// so the user's shell prompt is reachable.
 fn install_decset_panic_hook() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        use std::io::Write as _;
-        let mut out = io::stdout();
-        let _ = write!(out, "\x1b[?2026l");
-        let _ = out.flush();
-        // Best-effort tty restore; if we can't (e.g. stdout already
-        // closed) the default hook still runs and the user can fix
-        // the terminal with `reset`. Show the cursor explicitly —
-        // setup_terminal hid it; without an unhide here the user's
-        // recovered shell prompt is invisible until they `tput cnorm`
-        // or restart their emulator.
-        let _ = execute!(
-            out,
-            crossterm::cursor::Show,
-            DisableMouseCapture,
-            LeaveAlternateScreen
-        );
-        let _ = disable_raw_mode();
+        restore_terminal_best_effort();
         prev(info);
     }));
+}
+
+/// Spawn a watcher thread that restores terminal modes if the process
+/// receives SIGTERM, SIGHUP, or SIGQUIT — the kill / hang-up / quit
+/// signals that the panic hook does NOT cover (Rust panics fire the
+/// hook; OS signals don't). Without this, `kill <pid>` or a parent
+/// shell exiting while we're alive strands the terminal in raw mode +
+/// alt screen + bracketed paste + DECSET 2026 + KKP flags pushed +
+/// cursor hidden — recoverable only with `reset(1)`.
+///
+/// SIGINT is intentionally NOT in the set: in raw mode crossterm
+/// delivers Ctrl-C as a `KeyCode::Char('c')` with `KeyModifiers::CONTROL`
+/// rather than as a signal, and the keys.rs path translates that to
+/// "quit" cleanly through the normal teardown.
+///
+/// Best-effort: if the signal-hook setup itself fails we silently
+/// proceed without a handler (the panic-hook safety net is still
+/// installed; only the kill-from-outside case is uncovered).
+fn install_signal_cleanup() {
+    use signal_hook::consts::{SIGHUP, SIGQUIT, SIGTERM};
+    let Ok(mut signals) = signal_hook::iterator::Signals::new([SIGTERM, SIGHUP, SIGQUIT]) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        if let Some(sig) = signals.forever().next() {
+            restore_terminal_best_effort();
+            // Re-raise so the kernel produces the conventional exit
+            // code for this signal (128 + sig). emulate_default_handler
+            // unregisters our hook and resends the signal; if that
+            // somehow fails (signal-hook itself errored), fall through
+            // to an explicit exit so we don't hang the process.
+            let _ = signal_hook::low_level::emulate_default_handler(sig);
+            std::process::exit(128 + sig);
+        }
+    });
 }
 
 /// Headless render path used by `--probe`. Builds a fake Picker with an
@@ -535,12 +615,16 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
             // Panics inside ui::draw are caught by the panic hook
             // installed in main(), which writes ESU directly to
             // stdout before the default handler runs.
+            //
+            // queue! (not execute!) to avoid two flushes per frame —
+            // BSU + draw + ESU all accumulate in the BufWriter and
+            // drain in one syscall via the explicit flush below.
             use std::io::Write as _;
-            let _ = write!(term.backend_mut(), "\x1b[?2026h");
+            let _ = queue!(term.backend_mut(), BeginSynchronizedUpdate);
             // Discard CompletedFrame's borrow on term immediately —
             // we need term back to write ESU. Result -> Result<(),_>.
             let draw_res = term.draw(|f| ui::draw(f, app)).map(|_| ());
-            let _ = write!(term.backend_mut(), "\x1b[?2026l");
+            let _ = queue!(term.backend_mut(), EndSynchronizedUpdate);
             let _ = term.backend_mut().flush();
             draw_res?;
             drop(_draw);

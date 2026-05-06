@@ -402,7 +402,7 @@ unsafe fn libc_sysconf_clk_tck() -> i64 {
 // Output parsing
 // ===========================================================================
 
-/// Count occurrences of `\x1b_Gq=2,...,a=T,...` (transmit) and
+/// Count occurrences of `\x1b_Gq=1,...,a=T,...` (transmit) and
 /// `\x1b_Ga=p,...` (placement) escapes in a byte stream. Both forms
 /// also appear wrapped in tmux-passthrough DCS, but we run the binary
 /// with TMUX env removed so the unwrapped form is what hits the wire.
