@@ -108,6 +108,35 @@ pub const MAX_COLD_RENDERS_PER_DRAW: usize = 1;
 /// render phase is the upstream guard for those.
 pub const MAX_TRANSMITS_PER_DRAW: usize = 2;
 
+/// Multiplier on `viewport_h_px` past which a frame-to-frame scroll
+/// delta counts as a "long jump" and triggers a kitty transmit
+/// invalidation (force re-transmit of visible pages). Sized so the
+/// common smooth-scroll patterns DON'T trigger:
+///   - held-`j`/`k`: rate-limited to ~1 page/frame ≈ 1 viewport_h.
+///   - Space / `b`: 1 viewport_h per press.
+///   - Ctrl-d / Ctrl-u: ½ viewport_h per press.
+/// And the deliberate-jump patterns DO:
+///   - `:N`, `100G`, search next, mark jump: typically many viewport_h.
+///   - 5j on a typical page: ≈ 5 viewport_h.
+///
+/// The reason invalidation matters: visible pages may still be in our
+/// kitty registry (`is_fresh = true`), but Ghostty's
+/// image-storage-limit may have evicted them under unrelated transmit
+/// pressure during the gap. Forcing re-transmit guarantees the next
+/// frame's placement cells point at images Ghostty actually holds.
+const LONG_JUMP_VIEWPORT_MULTIPLIER: u64 = 2;
+
+/// True if the scroll delta between consecutive draws is large enough
+/// to count as a long jump. Pure helper so the threshold is unit-
+/// testable without a Frame / Picker dependency.
+pub(crate) fn is_long_jump(prev_y: i64, curr_y: i64, viewport_h_px: i64) -> bool {
+    if viewport_h_px <= 0 {
+        return false;
+    }
+    let delta = curr_y.saturating_sub(prev_y).unsigned_abs();
+    delta > (viewport_h_px as u64).saturating_mul(LONG_JUMP_VIEWPORT_MULTIPLIER)
+}
+
 /// What to do with a single page on a kitty draw, given the cache
 /// hit/miss and the current rapid-scroll + budget state. Pulled out
 /// as a pure function so the staggering logic is unit-testable.
@@ -250,17 +279,37 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
             img_area,
         );
     } else if app.kitty_pages.is_some() {
-        // Popup just closed: every kitty placeholder cell was painted
-        // over by the popup's `Clear`, so Ghostty saw the page images
-        // as "unused" while the popup was open and may have evicted
-        // them under image-storage pressure. Our `is_fresh` cache
-        // doesn't know that — same revision/layout would skip the
-        // retransmit and the placeholder cells would point at freed
-        // image_ids → blank pages on close. Forcing a one-shot
-        // re-transmit on the close transition guarantees the next
-        // frame ships fresh data without re-encoding (cached_payload
-        // stays).
-        if app.popup_open_prev {
+        // Two kitty-cache invalidation triggers, both addressing the
+        // same root failure: Ghostty's image-storage-limit may have
+        // silently evicted images while we weren't refreshing their
+        // placement cells. Our `is_fresh` cache doesn't observe that
+        // — placement on the next frame would point at a freed
+        // image_id → blank page. Both triggers force the next draw to
+        // re-transmit (cached_payload stays, so no re-encode cost).
+        //
+        // (1) **Popup close transition.** Every kitty placeholder cell
+        //     was painted over by the popup's `Clear`, so Ghostty saw
+        //     the page images as "unused" while the popup was open.
+        //
+        // (2) **Scroll discontinuity (long jump).** `:N`, counted-`G`,
+        //     search next/prev (`n`/`N`), mark jump (`'a`), link
+        //     follow, etc. all change `scroll_y_px` by many viewports
+        //     in one go. Pages we land on may still be in our
+        //     registry (transmitted long ago, never evicted by our
+        //     LRU because the cap wasn't reached), but Ghostty's
+        //     image-storage-limit could have churned through them
+        //     under unrelated transmit pressure since. Threshold of
+        //     2× viewport_h fires only on real jumps — Space/`b`
+        //     (≈ 1× viewport_h), Ctrl-d/u (≈ ½× viewport_h), and
+        //     held-`j`/`k` (rate-limited to ≈ 1 page/frame) stay
+        //     under it. Sized so smooth reading never re-transmits
+        //     but explicit jumps always do.
+        let viewport_h_px =
+            (img_area.height as i64).saturating_mul(app.picker.font_size().1 as i64);
+        let long_jump = app
+            .last_drawn_scroll_y_px
+            .is_some_and(|prev_y| is_long_jump(prev_y, app.scroll_y_px, viewport_h_px));
+        if app.popup_open_prev || long_jump {
             if let Some(kp) = app.kitty_pages.as_mut() {
                 kp.invalidate_all_transmits();
             }
@@ -328,6 +377,11 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
     // Track popup state for the next frame's open→close transition
     // detection in the kitty branch above.
     app.popup_open_prev = popup_open;
+    // Track scroll for the next frame's discontinuity check (long-jump
+    // re-transmit). Updated on every frame — popup branches included —
+    // so the next post-popup frame sees the OLD pre-popup scroll
+    // position, not a None that would skip the check.
+    app.last_drawn_scroll_y_px = Some(app.scroll_y_px);
 }
 
 // The selection-overlay cell-styling helpers used to live here.
@@ -2635,6 +2689,81 @@ mod cold_render_plan_tests {
         // window-vanish hazard.
         const _: () = assert!(MAX_COLD_RENDERS_PER_DRAW >= 1);
         const _: () = assert!(MAX_COLD_RENDERS_PER_DRAW <= 2);
+    }
+}
+
+#[cfg(test)]
+mod long_jump_tests {
+    use super::{is_long_jump, LONG_JUMP_VIEWPORT_MULTIPLIER};
+
+    // Pretend a typical-ish reading viewport: 60 cells * 16 px/cell = 960 px.
+    const VIEWPORT_H_PX: i64 = 960;
+
+    #[test]
+    fn no_prev_no_jump() {
+        // No previous draw — first frame must NOT trigger invalidation
+        // (caller short-circuits via Option::is_some_and; this just
+        // covers the boundary value).
+        assert!(!is_long_jump(0, 0, VIEWPORT_H_PX));
+    }
+
+    #[test]
+    fn smooth_scroll_one_page_does_not_trigger() {
+        // j key advances by ~1 viewport_h on a typical reading page.
+        // Below the 2x threshold → no invalidate.
+        assert!(!is_long_jump(0, VIEWPORT_H_PX, VIEWPORT_H_PX));
+    }
+
+    #[test]
+    fn space_key_one_screen_does_not_trigger() {
+        // Space scrolls by viewport_h. Threshold is strict-greater than
+        // 2x → exactly 1x is fine.
+        assert!(!is_long_jump(1000, 1000 + VIEWPORT_H_PX, VIEWPORT_H_PX));
+    }
+
+    #[test]
+    fn ctrl_d_half_screen_does_not_trigger() {
+        assert!(!is_long_jump(0, VIEWPORT_H_PX / 2, VIEWPORT_H_PX));
+    }
+
+    #[test]
+    fn boundary_at_threshold_does_not_trigger() {
+        // delta == 2 * viewport_h must NOT trigger (strict >).
+        let threshold = (VIEWPORT_H_PX as u64) * LONG_JUMP_VIEWPORT_MULTIPLIER;
+        assert!(!is_long_jump(0, threshold as i64, VIEWPORT_H_PX));
+    }
+
+    #[test]
+    fn just_past_threshold_triggers() {
+        let threshold = (VIEWPORT_H_PX as u64) * LONG_JUMP_VIEWPORT_MULTIPLIER;
+        assert!(is_long_jump(0, threshold as i64 + 1, VIEWPORT_H_PX));
+    }
+
+    #[test]
+    fn long_jump_forward_triggers() {
+        // `:500` from page 5 — many viewport_h forward.
+        assert!(is_long_jump(0, 100 * VIEWPORT_H_PX, VIEWPORT_H_PX));
+    }
+
+    #[test]
+    fn long_jump_backward_triggers() {
+        // Mark jump or Ctrl-O can leap backward by many screens.
+        assert!(is_long_jump(100 * VIEWPORT_H_PX, 0, VIEWPORT_H_PX));
+    }
+
+    #[test]
+    fn zero_viewport_height_never_triggers() {
+        // Defensive: don't divide-by-zero / over-fire on a 0-height
+        // viewport (terminal still being sized, headless test).
+        assert!(!is_long_jump(0, i64::MAX, 0));
+        assert!(!is_long_jump(0, i64::MAX, -1));
+    }
+
+    #[test]
+    fn extreme_delta_does_not_panic() {
+        // Saturating math on the boundary: scrolling from min to max
+        // i64 must not overflow even at silly viewport sizes.
+        assert!(is_long_jump(i64::MIN, i64::MAX, VIEWPORT_H_PX));
     }
 }
 

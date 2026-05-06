@@ -146,6 +146,18 @@ pub struct App<'doc> {
     /// `invalidate_all_transmits` so the next frame ships fresh image
     /// data even when revision/layout are unchanged.
     pub popup_open_prev: bool,
+    /// `scroll_y_px` from the previous frame's draw. Used by the kitty
+    /// branch to detect a scroll discontinuity (long jump) — `:N`,
+    /// counted-`G`, search next/prev, mark jump, link follow, etc. all
+    /// land on far pages without going through the popup_open_prev
+    /// trigger, but Ghostty's image-storage-limit may still have
+    /// evicted those pages while we were elsewhere. `is_fresh` would
+    /// stay true and the placement cells would reference a freed
+    /// image_id → blank pages. On a delta past the discontinuity
+    /// threshold we re-issue invalidate_all_transmits so the next
+    /// frame ships fresh image data even for pages our registry
+    /// believes are still resident.
+    pub last_drawn_scroll_y_px: Option<i64>,
     pub zoom: f32,
 
     /// Vertical scroll position in pixels from the top of the
@@ -564,6 +576,7 @@ impl<'doc> App<'doc> {
             status: String::new(),
             show_help: false,
             popup_open_prev: false,
+            last_drawn_scroll_y_px: None,
             zoom: zoom.clamp(0.25, 8.0),
             scroll_y_px: 0,
             scroll_x: 0.0,
