@@ -286,6 +286,17 @@ fn main() -> Result<()> {
     } else {
         0.0
     };
+    // Horizontal pan: same CLI-overrides-session policy as vertical.
+    // `--page` resets both axes (the user wanted "open at THIS page",
+    // not "open at the same point in this page"). NaN-guarded; the
+    // App constructor also clamps so this is belt-and-braces.
+    let start_scroll_x = if page_explicit {
+        0.0
+    } else if saved.scroll_x.is_finite() {
+        saved.scroll_x
+    } else {
+        0.0
+    };
     // Sanitize saved zoom — a corrupted session.json with `"zoom": "huge"`
     // or NaN would otherwise produce `1.0 * NaN = NaN` after clamp (which
     // is identity on NaN), and downstream `viewport_w as f32 * NaN = NaN`
@@ -303,6 +314,7 @@ fn main() -> Result<()> {
         safe_zoom,
         saved.marks.clone(),
         start_scroll_in_page,
+        start_scroll_x,
         picker,
     )?;
     // Restore the user's last-used highlight color so they don't have

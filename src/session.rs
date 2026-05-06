@@ -35,6 +35,15 @@ pub struct Session {
     /// landing at page top, matching pre-feature behaviour.
     #[serde(default)]
     pub scroll_in_page: f32,
+    /// Fraction `0.0..=1.0` of horizontal pan within the zoomed page
+    /// (0.0 = page's left edge against viewport-left, 1.0 = page's
+    /// right edge against viewport-right). Only meaningful when zoom
+    /// makes the page wider than the viewport; at zoom ≤ 1.0 it has
+    /// no visible effect. Stored as a fraction (matches App.scroll_x's
+    /// in-memory representation) so a terminal-width change between
+    /// sessions doesn't shift the restored view.
+    #[serde(default)]
+    pub scroll_x: f32,
     /// Last-used highlight color index (0..HIGHLIGHT_COLORS.len()).
     /// Persisted so the user's preferred color survives a reopen
     /// instead of resetting to 0 every session.
@@ -54,6 +63,7 @@ impl Default for Session {
             zoom: 1.0,
             marks: std::collections::BTreeMap::new(),
             scroll_in_page: 0.0,
+            scroll_x: 0.0,
             selection_color_idx: 0,
         }
     }
@@ -197,6 +207,7 @@ mod tests {
             zoom: 2.5,
             marks,
             scroll_in_page: 0.37,
+            scroll_x: 0.62,
             selection_color_idx: 3,
         };
         s.save(&pdf).unwrap();
@@ -207,6 +218,7 @@ mod tests {
         assert_eq!(loaded.marks.get(&'a'), Some(&12));
         assert_eq!(loaded.marks.get(&'z'), Some(&99));
         assert!((loaded.scroll_in_page - 0.37).abs() < 1e-6);
+        assert!((loaded.scroll_x - 0.62).abs() < 1e-6);
         assert_eq!(loaded.selection_color_idx, 3);
         // Cleanup
         let _ = std::fs::remove_file(Session::store_path(&pdf).unwrap());
@@ -229,6 +241,7 @@ mod tests {
         assert!((s.zoom - 1.0).abs() < 1e-6);
         assert!(s.marks.is_empty());
         assert_eq!(s.scroll_in_page, 0.0);
+        assert_eq!(s.scroll_x, 0.0);
     }
 
     #[test]
@@ -259,6 +272,9 @@ mod tests {
         // scroll_in_page is the newest field; legacy sessions get 0.0
         // (top of page) so reopens from old saves don't surprise users.
         assert_eq!(s.scroll_in_page, 0.0);
+        // scroll_x is also missing in legacy sessions → default 0.0
+        // (page's left edge), matching pre-feature behaviour.
+        assert_eq!(s.scroll_x, 0.0);
         let _ = std::fs::remove_file(&store);
         let _ = std::fs::remove_file(&pdf);
     }

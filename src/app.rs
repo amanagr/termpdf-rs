@@ -477,6 +477,7 @@ impl<'doc> App<'doc> {
         zoom: f32,
         marks: std::collections::BTreeMap<char, usize>,
         scroll_in_page: f32,
+        scroll_x: f32,
         picker: Picker,
     ) -> Result<Self> {
         let page_count = document.pages().len() as usize;
@@ -579,7 +580,20 @@ impl<'doc> App<'doc> {
             last_drawn_scroll_y_px: None,
             zoom: zoom.clamp(0.25, 8.0),
             scroll_y_px: 0,
-            scroll_x: 0.0,
+            // Horizontal pan is meaningful only when zoom makes the
+            // page wider than the viewport. Setting the saved fraction
+            // even at zoom ≤ 1.0 is harmless: the render math is
+            // `(fit_width - vw) * scroll_x`, which is 0 when there's
+            // no overflow. If the user then zooms in, `zoom_set`
+            // doesn't touch a non-1.0 zoom restored from session, so
+            // the saved scroll_x takes effect from the first zoomed
+            // frame. NaN-guard on the input — corrupted session JSON
+            // could deserialise as NaN and `clamp` is identity on NaN.
+            scroll_x: if scroll_x.is_finite() {
+                scroll_x.clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
             viewport_px: (0, 0),
             image_area: Rect::default(),
             cell_size_px: picker.font_size(),
@@ -2795,6 +2809,13 @@ impl<'doc> App<'doc> {
             zoom: self.zoom,
             marks: self.marks.clone(),
             scroll_in_page,
+            // Horizontal pan is already a 0..=1 fraction in memory,
+            // so save it verbatim. At zoom ≤ 1.0 the user can't
+            // produce a non-zero value (scroll_x_by gates on
+            // overflow > 0), and zoom_set zeroes it on transitions
+            // back to 1.0 — so the value here is always meaningful
+            // for the saved zoom.
+            scroll_x: self.scroll_x,
             selection_color_idx: self.selection_color_idx,
         }
         .save(&self.path)
