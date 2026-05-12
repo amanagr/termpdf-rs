@@ -126,6 +126,18 @@ pub const MAX_TRANSMITS_PER_DRAW: usize = 2;
 /// frame's placement cells point at images Ghostty actually holds.
 const LONG_JUMP_VIEWPORT_MULTIPLIER: u64 = 2;
 
+/// Milliseconds since the last scroll change after which the kitty
+/// branch fires one `invalidate_all_transmits` to recover from the
+/// smooth-scroll eviction case `is_long_jump` deliberately misses.
+/// During a burst, every frame's `scroll_changed = true` resets the
+/// timer — fires at most once per scroll burst, on the catch-up draw
+/// scheduled by `SETTLE_MS=120` in `main.rs::run_loop`. Sized
+/// strictly under SETTLE_MS so the catch-up draw is the first frame
+/// to elapse the threshold; nudging closer to SETTLE_MS would risk
+/// the catch-up draw arriving 1 ms early and missing the trigger
+/// entirely.
+const POST_SCROLL_SETTLE_MS: u128 = 100;
+
 /// True if the scroll delta between consecutive draws is large enough
 /// to count as a long jump. Pure helper so the threshold is unit-
 /// testable without a Frame / Picker dependency.
@@ -135,6 +147,20 @@ pub(crate) fn is_long_jump(prev_y: i64, curr_y: i64, viewport_h_px: i64) -> bool
     }
     let delta = curr_y.saturating_sub(prev_y).unsigned_abs();
     delta > (viewport_h_px as u64).saturating_mul(LONG_JUMP_VIEWPORT_MULTIPLIER)
+}
+
+/// True if enough idle time has elapsed since the last scroll change
+/// to fire the once-per-burst post-scroll invalidate. Pure helper
+/// mirroring `is_long_jump` so the gating logic is unit-testable
+/// without the run-loop scaffolding. The single-`Option` design
+/// encodes both "burst pending" (Some) and "already fired / no
+/// burst" (None) — no separate latch needed.
+pub(crate) fn should_post_scroll_settle(
+    pending_post_scroll_invalidate: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    pending_post_scroll_invalidate
+        .is_some_and(|t| now.saturating_duration_since(t).as_millis() >= POST_SCROLL_SETTLE_MS)
 }
 
 /// What to do with a single page on a kitty draw, given the cache
@@ -279,12 +305,12 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
             img_area,
         );
     } else if app.kitty_pages.is_some() {
-        // Two kitty-cache invalidation triggers, both addressing the
+        // Three kitty-cache invalidation triggers, all addressing the
         // same root failure: Ghostty's image-storage-limit may have
         // silently evicted images while we weren't refreshing their
         // placement cells. Our `is_fresh` cache doesn't observe that
         // — placement on the next frame would point at a freed
-        // image_id → blank page. Both triggers force the next draw to
+        // image_id → blank page. Each trigger forces the next draw to
         // re-transmit (cached_payload stays, so no re-encode cost).
         //
         // (1) **Popup close transition.** Every kitty placeholder cell
@@ -302,17 +328,50 @@ pub fn draw(f: &mut Frame, app: &mut App<'_>) {
         //     2× viewport_h fires only on real jumps — Space/`b`
         //     (≈ 1× viewport_h), Ctrl-d/u (≈ ½× viewport_h), and
         //     held-`j`/`k` (rate-limited to ≈ 1 page/frame) stay
-        //     under it. Sized so smooth reading never re-transmits
-        //     but explicit jumps always do.
+        //     under it.
+        //
+        // (3) **Post-scroll settle.** Smooth scroll bursts (held-j/k,
+        //     mouse wheel) don't trip (2) — each frame's delta is
+        //     small — but their cumulative transmits can still push
+        //     Ghostty past its image-storage cap. Visible-but-not-
+        //     just-transmitted pages (e.g. the page we kept on
+        //     screen while prefetching ahead) become eviction
+        //     candidates and Ghostty's `evictImage` will pick them
+        //     when unused images don't cover the deficit. Repro from
+        //     log: page 142 last transmitted at t=60518, kept being
+        //     placed via the same image_id while pages 138/137
+        //     prefetched into Ghostty's store, no popup, delta per
+        //     frame ≪ 2× viewport_h → blank on the next placement.
+        //     Fix: track scroll_y_px changes; when no change has
+        //     happened for POST_SCROLL_SETTLE_MS, fire one
+        //     invalidate. `pending_post_scroll_invalidate` is `Some`
+        //     while a burst is in flight and `None` once the
+        //     invalidate fires — single field is enough; no separate
+        //     latch needed. The SETTLE_MS=120 catch-up draw in
+        //     main.rs::run_loop is the frame this typically lands on.
+        let now = std::time::Instant::now();
+        let scroll_changed = app
+            .last_drawn_scroll_y_px
+            .is_some_and(|prev_y| prev_y != app.scroll_y_px);
+        if scroll_changed {
+            app.pending_post_scroll_invalidate = Some(now);
+        }
+        let post_scroll_settle = should_post_scroll_settle(app.pending_post_scroll_invalidate, now);
+
         let viewport_h_px =
             (img_area.height as i64).saturating_mul(app.picker.font_size().1 as i64);
         let long_jump = app
             .last_drawn_scroll_y_px
             .is_some_and(|prev_y| is_long_jump(prev_y, app.scroll_y_px, viewport_h_px));
-        if app.popup_open_prev || long_jump {
+        if app.popup_open_prev || long_jump || post_scroll_settle {
             if let Some(kp) = app.kitty_pages.as_mut() {
                 kp.invalidate_all_transmits();
             }
+            // Clear the pending burst regardless of which trigger
+            // actually fired — popup_open_prev / long_jump already
+            // dispatch fresh transmits, and we don't want a second
+            // redundant invalidate at the SETTLE_MS catch-up.
+            app.pending_post_scroll_invalidate = None;
         }
         // Per-page kitty placements bypass ratatui-image: each page
         // becomes its own kitty image, transmitted once. Steady scroll
@@ -734,7 +793,20 @@ fn draw_pages_kitty_inner(
             .kitty_pages
             .as_ref()
             .expect("kitty_pages should be Some on this draw path");
-        let need_transmit = !kp.is_fresh(page_idx, layout_key, revision, pixel_w, pixel_h);
+        // Per-page eviction-risk gate, parallel to is_fresh: even when
+        // the local registry believes a page is fresh, if cumulative
+        // bytes have flowed through Ghostty since this page's last
+        // transmit exceeding Ghostty's image-storage cap, Ghostty has
+        // statistically likely evicted the image. Re-transmit pre-
+        // emptively. Cheaper than the blanket post_scroll_settle
+        // invalidate (re-ships exactly the at-risk pages, not all
+        // visible) and catches eviction during sustained scroll
+        // bursts WITHOUT waiting for settle. The threshold uses the
+        // same `ghostty_budget_bytes()` value the self-eviction
+        // budget uses — both represent the same per-screen cap.
+        let at_risk = kp.is_eviction_at_risk(page_idx, crate::kitty_pages::ghostty_budget_bytes());
+        let need_transmit =
+            !kp.is_fresh(page_idx, layout_key, revision, pixel_w, pixel_h) || at_risk;
         let image_id = kp.image_id(page_idx);
 
         scratch.blits.push(PageBlit {
@@ -1927,6 +1999,16 @@ pub(crate) fn ensure_overlay(app: &mut App<'_>, page_idx: usize, layout: LayoutK
 /// both of which used to run on every Visual-mode keystroke. Now
 /// they only run when the highlights/search state itself changes.
 fn ensure_highlights_baked(app: &mut App<'_>, page_idx: usize, layout: LayoutKey) {
+    // Load this page's link annotations BEFORE the no-overlay short-
+    // circuit decision: a page that has only links (no highlights, no
+    // search hits) still needs the bake so the always-on link
+    // underline gets painted. Cheap on cache hit (HashMap probe),
+    // amortizes cleanly across re-bakes during scroll. Static for the
+    // life of the document, so no revision tracking — once loaded,
+    // `link_count` is a stable cache key contributor.
+    app.ensure_page_links_loaded(page_idx);
+    let link_count = app.page_links_cache.get(&page_idx).map_or(0, |v| v.len());
+
     let (search_revision, has_search_hits, current_hit_on_this_page) = match &app.search {
         Some(s) => {
             let any = s.page_has_hits(page_idx);
@@ -1938,16 +2020,17 @@ fn ensure_highlights_baked(app: &mut App<'_>, page_idx: usize, layout: LayoutKey
     let highlight_revision = app.highlights.page_revision(page_idx);
 
     // Cold-page no-overlay fast path: if this page has nothing painted
-    // (no highlights, no search hits, no current-hit outline), the
-    // bake would just clone the page bitmap and return. Skip the
-    // ~6 MB clone and leave the cache empty for this page; consumers
-    // (`draw_pages_kitty`, the warm tick) have a fallback to
-    // `page_cache.as_rgba8()` for pages without a baked entry.
+    // (no highlights, no search hits, no current-hit outline, AND no
+    // links to underline), the bake would just clone the page bitmap
+    // and return. Skip the ~6 MB clone and leave the cache empty for
+    // this page; consumers (`draw_pages_kitty`, the warm tick) have a
+    // fallback to `page_cache.as_rgba8()` for pages without a baked
+    // entry.
     //
     // Net win on `scroll_casual_large`: every cold page hits this
-    // branch (the test PDF has no highlights / search) so the per-
-    // scroll RGBA clone disappears. cpu_ms drops accordingly.
-    let no_overlays = highlight_revision == 0 && !has_search_hits;
+    // branch (the test PDF has no highlights / search / links) so the
+    // per-scroll RGBA clone disappears. cpu_ms drops accordingly.
+    let no_overlays = highlight_revision == 0 && !has_search_hits && link_count == 0;
     if no_overlays {
         // Drop any stale entry (e.g. user just deleted the last
         // highlight on this page) so consumers fall through to
@@ -1966,6 +2049,11 @@ fn ensure_highlights_baked(app: &mut App<'_>, page_idx: usize, layout: LayoutKey
         search_revision,
         has_search_hits,
         current_hit_on_this_page,
+        // Link count: static for the document, but pinning it in the
+        // key means a bake that happened BEFORE links were loaded
+        // (link_count=0) gets re-baked once links populate, instead
+        // of caching a no-underlines image forever.
+        link_count,
     };
     if app
         .highlights_baked_cache
@@ -2023,6 +2111,47 @@ fn ensure_highlights_baked(app: &mut App<'_>, page_idx: usize, layout: LayoutKey
                     outline_rect(&mut img, rect, (255, 80, 0), 3);
                 }
             }
+        }
+    }
+
+    // Always-on link underlines — paint a faint blue stripe at the
+    // bottom of each link rect so the user can SEE that links exist
+    // before mousing over. Drawn LAST so highlight + search hit fills
+    // sit underneath; an underline atop a yellow highlight is more
+    // legible than a yellow fill atop an underline. Color (64, 132,
+    // 220) at alpha 0.43 was picked to read on both light (240, 240,
+    // 240) and dark (20, 20, 20) page backgrounds — eyeballed, not
+    // measured. If a future change introduces a contrast test, gate
+    // the choice on it; until then the value can drift if it stops
+    // looking right on a real PDF.
+    //
+    // Underline thickness scales with image height (1 px at 1080p,
+    // 2 px at 4K) so it's visible at every zoom without becoming a
+    // distracting bar at low zoom. Capped at 2 px to avoid covering
+    // descenders on small text.
+    if let Some(links) = app.page_links_cache.get(&page_idx) {
+        let underline_thickness = (img.height() / 1100).clamp(1, 2);
+        for link in links {
+            let (lx, ly, lw, lh) = norm_to_pixels(
+                Rect01 {
+                    x: link.rect.x,
+                    y: link.rect.y,
+                    w: link.rect.w,
+                    h: link.rect.h,
+                },
+                img.width(),
+                img.height(),
+            );
+            // Underline sits at the bottom edge of the link rect,
+            // inside the rect (saturating subtraction handles the
+            // 1-px rect edge case where the underline IS the link).
+            let uy = ly.saturating_add(lh.saturating_sub(underline_thickness));
+            fill_rect_blend(
+                &mut img,
+                (lx, uy, lw, underline_thickness),
+                (64, 132, 220),
+                0.43,
+            );
         }
     }
 
@@ -2385,6 +2514,39 @@ fn status_line(app: &App<'_>) -> Paragraph<'static> {
                 format!("[{}] ", app.pending),
                 Style::default().fg(Color::Yellow),
             ));
+        }
+        // Hover-link preview — `app.hover_link = Some((page, idx))`
+        // means the cursor is currently inside a link rect. Render
+        // the destination so the user knows what a click would do
+        // BEFORE committing. URLs truncated to keep the status
+        // bar compact; long URLs get a `…` suffix. The span sits
+        // BEFORE the ephemeral `app.status` slot so a fresh status
+        // message (e.g. "yanked 2 pages") doesn't get pushed off
+        // the visible status row by a hovered URL.
+        if let Some((page_idx, link_idx)) = app.hover_link {
+            if let Some(link) = app
+                .page_links_cache
+                .get(&page_idx)
+                .and_then(|v| v.get(link_idx))
+            {
+                let preview = match &link.action {
+                    crate::links::LinkAction::GoToPage(p) => format!("→ p.{}  ", p + 1),
+                    crate::links::LinkAction::Url(u) => {
+                        let safe = crate::term_safe::safe_for_stderr(u);
+                        let truncated = if safe.chars().count() > 60 {
+                            let head: String = safe.chars().take(57).collect();
+                            format!("{head}…")
+                        } else {
+                            safe
+                        };
+                        format!("→ {truncated}  ")
+                    }
+                    crate::links::LinkAction::Other => String::new(),
+                };
+                if !preview.is_empty() {
+                    spans.push(Span::styled(preview, Style::default().fg(Color::Cyan)));
+                }
+            }
         }
         if !app.status.is_empty() {
             spans.push(Span::styled(
@@ -2764,6 +2926,74 @@ mod long_jump_tests {
         // Saturating math on the boundary: scrolling from min to max
         // i64 must not overflow even at silly viewport sizes.
         assert!(is_long_jump(i64::MIN, i64::MAX, VIEWPORT_H_PX));
+    }
+}
+
+#[cfg(test)]
+mod post_scroll_settle_tests {
+    use super::{should_post_scroll_settle, POST_SCROLL_SETTLE_MS};
+    use std::time::{Duration, Instant};
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn no_pending_invalidate_does_not_fire() {
+        // First-frame state OR already-fired state: no burst pending.
+        // `None` → no fire, regardless of `now`.
+        let now = Instant::now();
+        assert!(!should_post_scroll_settle(None, now));
+    }
+
+    #[test]
+    fn within_burst_window_does_not_fire() {
+        // Mid-burst: scroll changed 50 ms ago, threshold is 100 ms.
+        // Active scroll frames must NOT fire — they'd cause per-frame
+        // re-transmits and tank scroll perf.
+        let now = Instant::now();
+        let recent = now - ms(50);
+        assert!(!should_post_scroll_settle(Some(recent), now));
+    }
+
+    #[test]
+    fn at_settle_threshold_fires() {
+        // Catch-up draw arrives just at threshold. Strict-≥ keeps the
+        // SETTLE_MS=120 catch-up draw from missing the trigger.
+        let now = Instant::now();
+        let recent = now - ms(POST_SCROLL_SETTLE_MS as u64);
+        assert!(should_post_scroll_settle(Some(recent), now));
+    }
+
+    #[test]
+    fn past_settle_threshold_fires() {
+        // SETTLE_MS catch-up at 120 ms; threshold at 100 ms.
+        let now = Instant::now();
+        let recent = now - ms(120);
+        assert!(should_post_scroll_settle(Some(recent), now));
+    }
+
+    #[test]
+    fn cleared_after_fire_does_not_re_fire() {
+        // After firing, caller sets the field to None. Even on a long
+        // idle stretch the helper must not re-fire — the next scroll
+        // change is what re-arms it (sets it back to Some).
+        let now = Instant::now();
+        assert!(!should_post_scroll_settle(None, now));
+    }
+
+    #[test]
+    fn threshold_below_settle_ms_so_catch_up_draw_catches_it() {
+        // Compile-time guard: POST_SCROLL_SETTLE_MS must stay strictly
+        // below SETTLE_MS=120 in main.rs::run_loop, so the catch-up
+        // draw scheduled at SETTLE_MS reliably elapses the threshold.
+        // Nudging it up to SETTLE_MS would risk the catch-up arriving
+        // 1 ms early (timer jitter) and the trigger never firing.
+        const _: () = assert!(POST_SCROLL_SETTLE_MS < 120);
+        // And keep it well above 0 so micro-jitter between consecutive
+        // active-scroll frames (16 ms at 60 Hz) can't accidentally
+        // satisfy the threshold.
+        const _: () = assert!(POST_SCROLL_SETTLE_MS > 50);
     }
 }
 

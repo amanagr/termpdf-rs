@@ -65,6 +65,13 @@ pub struct HighlightsBakedKey {
     pub search_revision: u64,
     pub has_search_hits: bool,
     pub current_hit_on_this_page: bool,
+    /// Number of link annotations on this page; static for the life
+    /// of the document but pinning it in the key bursts the cache
+    /// from a pre-link-load bake (count=0) to a post-link-load bake
+    /// (count=N) on the same page. Without this, the first
+    /// `ensure_highlights_baked` call could cache a no-underline
+    /// image and the always-on underlines would never appear.
+    pub link_count: usize,
 }
 
 /// Cache key for the *per-page overlay* tier. The composited
@@ -97,6 +104,48 @@ pub struct PageOverlayKey {
     /// page (0 = none). Hash of (lo_idx, hi_idx, mode, color_idx),
     /// stable across frames that don't change the selection.
     pub selection_sig: u64,
+}
+
+/// Click-versus-drag discrimination state for left-mouse-button
+/// presses on link rects. Captured on `Down(Left)`, cleared if the
+/// cursor moves more than `LINK_DRAG_SLOP` cells before `Up(Left)`,
+/// activated otherwise. The slop threshold means a tiny hand
+/// twitch during a click doesn't accidentally start a highlight
+/// drag, and a deliberate drag from a link starting position is
+/// still treated as a drag (no false link follow).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingLinkClick {
+    /// Page that contained the link rect at click time.
+    pub page_idx: usize,
+    /// Index into `page_links_cache[page_idx]`.
+    pub link_idx: usize,
+    /// Cell column where the click started.
+    pub start_col: u16,
+    /// Cell row where the click started.
+    pub start_row: u16,
+}
+
+/// Cells of mouse motion permitted between `Down` and `Up` before a
+/// link-click candidate is downgraded to a highlight drag. Two cells
+/// is roughly one character on most terminals — small enough that an
+/// accidental click won't slip through, large enough to absorb
+/// trackpad jitter and a single-cell hand wobble.
+pub const LINK_DRAG_SLOP: i32 = 2;
+
+/// One slot in the jumplist. Captures both the page index AND the
+/// within-page fraction so `<C-o>` returns the user to the EXACT
+/// scroll position they were at — not the top of the source page.
+/// Storing the fraction (0..=1 of page height) instead of an
+/// absolute pixel offset keeps the slot meaningful across zoom /
+/// dark-mode flips: the record and the restore can run under
+/// different layouts and the relative position is preserved.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JumpPoint {
+    pub page: usize,
+    /// 0.0 = page top, 1.0 = page bottom. Clamped at insert time so
+    /// a fresh layout's clamp_scroll path can't push the value out
+    /// of range.
+    pub frac_in_page: f32,
 }
 
 /// Cache key for the *compose* tier (stitch visible pages into a
@@ -158,6 +207,34 @@ pub struct App<'doc> {
     /// frame ships fresh image data even for pages our registry
     /// believes are still resident.
     pub last_drawn_scroll_y_px: Option<i64>,
+    /// `Some(t)` while a post-scroll invalidate is pending, where `t`
+    /// is the wall-clock time of the most recent draw frame that
+    /// observed a `scroll_y_px` change; `None` once that invalidate
+    /// has fired (or no scroll burst is in flight). Fires one
+    /// `invalidate_all_transmits` after a scroll burst settles —
+    /// catches the smooth-scroll eviction case `is_long_jump`
+    /// deliberately misses: each frame's delta is small but
+    /// cumulative transmits during the burst can push Ghostty past
+    /// its image-storage cap, evicting visible-but-coldest pages.
+    /// The settle catch-up draw at `SETTLE_MS=120` (see
+    /// `main.rs::run_loop`) then sees a stale-but-not-yet-acted-on
+    /// scroll change and ships fresh transmits using `cached_payload`
+    /// (no re-encode). Single field instead of an (Option, bool)
+    /// pair: Some = pending, None = done. Cleared when the invalidate
+    /// fires; re-set to `Some(now)` on the next observed scroll
+    /// change.
+    pub pending_post_scroll_invalidate: Option<std::time::Instant>,
+    /// Signal from `warm_next_uncached` (idle-warm path) back to the
+    /// run-loop: "the page I just transmitted pushed cumulative
+    /// bytes past the eviction-risk threshold for at least one
+    /// currently-visible page; please force a redraw so the per-page
+    /// at-risk check in the kitty draw branch fires and re-transmits
+    /// the visible page before it goes blank." Without this, the
+    /// next draw is gated on user input and the user could see
+    /// blanks during pure idle (idle-warm transmits silently push
+    /// over the cap). Cleared in run_loop after the dirty=true
+    /// promotion.
+    pub idle_warm_pushed_visible_at_risk: bool,
     pub zoom: f32,
 
     /// Vertical scroll position in pixels from the top of the
@@ -250,6 +327,40 @@ pub struct App<'doc> {
     /// here instead of from `page_cache`, skipping the per-highlight
     /// blend loop.
     pub highlights_baked_cache: HashMap<usize, (RgbaImage, HighlightsBakedKey)>,
+    /// Per-page link annotations (hyperlinks, GoToPage). Populated
+    /// lazily on first access via `ensure_page_links_loaded` —
+    /// pdfium's `page.links()` enumeration is cheap (~hundreds of µs
+    /// on dense pages) but firing it every frame would still add up
+    /// across visible+prefetch pages. Static for the lifetime of the
+    /// document so no revision tracking. Three readers:
+    ///   1. **Always-on underline** — `ui::ensure_highlights_baked`
+    ///      paints a faint blue stripe under each link rect so the
+    ///      user can SEE that links exist before mousing over.
+    ///   2. **Click hit-test** — `keys::dispatch_mouse` checks the
+    ///      click position against this list to decide link-follow
+    ///      vs. highlight-drag.
+    ///   3. **Hover preview** — `MouseEventKind::Moved` looks up the
+    ///      link under the cursor for the status-line preview.
+    /// Cleared on `clear_caches` (zoom flip, dark toggle) since the
+    /// underline bake follows layout changes via the same key.
+    pub page_links_cache: HashMap<usize, Vec<crate::links::LinkOnPage>>,
+    /// Set on `Down(Left)` if the click landed inside a link rect;
+    /// activated on `Up(Left)` if the cursor hasn't moved more than
+    /// `LINK_DRAG_SLOP` cells in the meantime. Cleared on any Drag
+    /// past the slop. `None` when no link-click is pending. Lets
+    /// the mouse handler discriminate "link click" (small motion)
+    /// from "highlight drag" (any meaningful motion) without a mode
+    /// toggle, per the UX plan: drag past slop = drag, drag within
+    /// slop = link.
+    pub pending_link_click: Option<PendingLinkClick>,
+    /// `Some((page_idx, link_idx))` while the mouse cursor is hovering
+    /// over a link annotation. Updated on every `MouseEventKind::Moved`
+    /// where the lookup result changes — equality-debounced so steady
+    /// in-link hover doesn't trigger per-frame redraws. The status
+    /// line consults this to render the `→ p.42` / `→ url…` preview;
+    /// `None` clears the preview span. Reset on `clear_caches` is
+    /// unnecessary — the next Moved event re-derives it.
+    pub hover_link: Option<(usize, usize)>,
     /// Background page-render worker (`None` if it failed to spawn —
     /// falls back to fully synchronous rendering). Used only for
     /// prefetch: visible-page rendering on cold cache stays sync so
@@ -413,10 +524,19 @@ pub struct App<'doc> {
     /// Vim-style named marks `m{a..z}` → page index. Persisted via
     /// `Session` so a reopened document still has its marks.
     pub marks: std::collections::BTreeMap<char, usize>,
-    /// Jumplist of recently-visited pages. `<C-o>` walks backwards,
-    /// `<C-i>` (Tab) walks forward; same model as vim. Cursor sits
-    /// at `jump_idx`.
-    pub jumplist: Vec<usize>,
+    /// Jumplist of recently-visited PRECISE positions (page +
+    /// within-page fraction). `<C-o>` walks backwards, `<C-i>` /
+    /// Tab walks forward; same model as vim. Cursor sits at
+    /// `jump_idx`. The fraction is stored layout-independently
+    /// (0..=1 of the page's height) so a zoom or dark-mode flip
+    /// between record and restore re-projects the offset onto the
+    /// new layout — without it, zooming after recording a jump
+    /// would land at a meaningless pixel offset (or get clamped to
+    /// the page top). Earlier versions stored only `usize` page
+    /// indices; user-facing bug was that Ctrl+O after a link click
+    /// landed at the top of the source page rather than where the
+    /// user was reading.
+    pub jumplist: Vec<JumpPoint>,
     pub jump_idx: usize,
     /// True after typing `m`, awaiting the mark name. Mirrors the
     /// `g`-pending pattern in `keys.rs`.
@@ -578,6 +698,8 @@ impl<'doc> App<'doc> {
             show_help: false,
             popup_open_prev: false,
             last_drawn_scroll_y_px: None,
+            pending_post_scroll_invalidate: None,
+            idle_warm_pushed_visible_at_risk: false,
             zoom: zoom.clamp(0.25, 8.0),
             scroll_y_px: 0,
             // Horizontal pan is meaningful only when zoom makes the
@@ -614,6 +736,9 @@ impl<'doc> App<'doc> {
             failed_pages: std::collections::HashSet::new(),
             overlay_cache: HashMap::new(),
             highlights_baked_cache: HashMap::new(),
+            page_links_cache: HashMap::new(),
+            pending_link_click: None,
+            hover_link: None,
             render_worker: None, // populated by main after construction
             pages_in_flight: std::collections::HashSet::new(),
             image_proto: None,
@@ -1146,9 +1271,12 @@ impl<'doc> App<'doc> {
         // but only on a "big" jump — sequential j/k stepping would
         // otherwise drown the jumplist in adjacent pages. ≥ 2-page
         // delta matches vim's heuristic for what counts as a jump.
-        let from = self.current_page();
+        // Snapshot BEFORE we mutate scroll, so the recorded
+        // `frac_in_page` reflects where the user was reading, not
+        // where we just jumped to.
+        let from = self.current_jump_point();
         let p = page.min(self.page_count.saturating_sub(1));
-        if from.abs_diff(p) >= 2 {
+        if from.page.abs_diff(p) >= 2 {
             self.push_jump(from);
         }
         self.goto_page_no_record(p);
@@ -1224,8 +1352,8 @@ impl<'doc> App<'doc> {
         self.goto_page(target);
     }
     pub fn first_page(&mut self) {
-        let from = self.current_page();
-        if from >= 2 {
+        let from = self.current_jump_point();
+        if from.page >= 2 {
             self.push_jump(from);
         }
         self.scroll_y_px = 0;
@@ -1235,9 +1363,9 @@ impl<'doc> App<'doc> {
     /// Matches `:N` and counted `NG` semantics so all "go to page p"
     /// paths agree on where p starts.
     pub fn last_page(&mut self) {
-        let from = self.current_page();
+        let from = self.current_jump_point();
         let last = self.page_count.saturating_sub(1);
-        if from.abs_diff(last) >= 2 {
+        if from.page.abs_diff(last) >= 2 {
             self.push_jump(from);
         }
         self.scroll_y_px = self
@@ -1732,6 +1860,167 @@ impl<'doc> App<'doc> {
                 self.status = format!("search error: {safe}");
                 self.invalidate_compose();
             }
+        }
+    }
+
+    /// Populate `page_links_cache[page_idx]` if absent. Cheap pdfium
+    /// call (~hundreds of µs); skipped on cache hit. Static for the
+    /// life of the document — links don't change on zoom / dark
+    /// flip / scroll. Two call sites:
+    ///   1. `ui::ensure_highlights_baked` — needs the link list to
+    ///      paint always-on underlines into the baked bitmap.
+    ///   2. `keys::dispatch_mouse` — needs the list for click hit-
+    ///      test and hover preview.
+    /// `enter_link_hint_mode` does NOT route through here today —
+    /// it calls `crate::links::enumerate` directly and builds its
+    /// own `HintEntry` list. Folding it into this cache is a
+    /// sensible cleanup but out of scope for the click feature;
+    /// leaving the divergence noted so future readers don't assume
+    /// the cache is the only enumeration path.
+    pub fn ensure_page_links_loaded(&mut self, page_idx: usize) {
+        if self.page_links_cache.contains_key(&page_idx) {
+            return;
+        }
+        let pages = self.document.pages();
+        let Ok(page) = pages.get(page_idx as i32) else {
+            // Insert empty so we don't retry every frame on a busted
+            // page (pdfium failures are usually permanent for the
+            // life of the document handle).
+            self.page_links_cache.insert(page_idx, Vec::new());
+            return;
+        };
+        let Some(metrics) = self.page_metrics.get(page_idx) else {
+            return;
+        };
+        let links = crate::links::enumerate(&page, metrics);
+        self.page_links_cache.insert(page_idx, links);
+    }
+
+    /// Hit-test a screen cell against link rects on the page under
+    /// the cursor. Returns `(page_idx, link_idx)` or `None`. Wraps
+    /// `cell_to_page_coord` + `link_at_norm` so the mouse handler
+    /// has one call site for both. Loads the link list lazily —
+    /// hover preview + click hit-test both call this on every
+    /// mouse event; the cache hit on the second call is a HashMap
+    /// probe.
+    pub fn link_at_screen(&mut self, col: u16, row: u16) -> Option<(usize, usize)> {
+        let (page, nx, ny) = self.cell_to_page_coord(col, row)?;
+        self.ensure_page_links_loaded(page);
+        // Sub-cell hit precision. `cell_to_page_coord` collapses the
+        // ~16×8 px square of one terminal cell to a single (nx, ny)
+        // point at the cell's top-left corner — fine for selection-
+        // start hit-tests where the user can drag to refine, but
+        // catastrophic for link clicks: a typical PDF link is 15-20
+        // px tall (≈ 0.018 normalised on a 11" page), and a single
+        // cell of vertical quantisation (16 px ≈ 0.019 normalised)
+        // can push the click coord just outside the link rect. We'd
+        // return None even though the user's pointer is visibly on
+        // the link. Inflate the rect being hit-tested by half a
+        // cell in each axis so the click is treated as "anywhere
+        // inside the clicked cell hits any link the cell overlaps."
+        // The half-cell tolerance is the smallest value that
+        // recovers boundary-case clicks without making adjacent
+        // links overlap into each other (a full-cell inflation
+        // would).
+        let layout = &self.layout;
+        let (cell_w, cell_h) = self.cell_size_px;
+        let fit_w = layout.fit_width_px.max(1) as f32;
+        let page_h = layout.page_h(page).max(1) as f32;
+        let half_cell_nx = (cell_w as f32 * 0.5) / fit_w;
+        let half_cell_ny = (cell_h as f32 * 0.5) / page_h;
+        let links = self.page_links_cache.get(&page)?;
+        let link_idx = link_at_norm_with_slop(links, nx, ny, half_cell_nx, half_cell_ny)?;
+        Some((page, link_idx))
+    }
+
+    /// Activate a link by `(page_idx, link_idx)` — both mouse-click
+    /// and `f`-mode hint dispatch route through this single
+    /// activator so the jumplist record / status-line message /
+    /// scheme allow-list logic lives in one place. The previous
+    /// `follow_link_action` path took an owned `LinkAction`; the
+    /// fixture is now keyed on the registry index so the cache
+    /// stays the source of truth and we don't double-clone the URL
+    /// string per click.
+    ///
+    /// Records the source page on the jumplist for `Ctrl+O` round-
+    /// trip on EVERY GoToPage link click, even within the same
+    /// page span. Bypasses `goto_page`'s ≥2-page-delta guard
+    /// because clicks are always intentional and worth a jumplist
+    /// slot — same heuristic the UX plan locked in.
+    pub fn activate_link(&mut self, page_idx: usize, link_idx: usize) {
+        let action = match self
+            .page_links_cache
+            .get(&page_idx)
+            .and_then(|v| v.get(link_idx))
+        {
+            Some(link) => link.action.clone(),
+            None => {
+                if crate::debug_log::enabled() {
+                    crate::debug_log::write(
+                        "activate_link",
+                        &format!("page={page_idx} link_idx={link_idx} MISS_IN_CACHE"),
+                    );
+                }
+                return;
+            }
+        };
+        if crate::debug_log::enabled() {
+            crate::debug_log::write(
+                "activate_link",
+                &format!("page={page_idx} link_idx={link_idx} action={action:?}"),
+            );
+        }
+        match action {
+            LinkAction::GoToPage(target) => {
+                let from = self.current_jump_point();
+                let target = target.min(self.page_count.saturating_sub(1));
+                // Always record — every link click is a jumplist
+                // slot. Skips the de-duplication that goto_page
+                // applies to small deltas (sequential j/k), so a
+                // footnote-link round-trip works even when source
+                // and target are on the same page. Snapshot BEFORE
+                // navigating so the recorded `frac_in_page` is the
+                // user's reading position at click time, which is
+                // what `<C-o>` should restore. Without the precise
+                // frac, Ctrl+O after a link click landed at the
+                // top of the source page (visible bug; user
+                // reported "doesn't work precisely").
+                if from.page != target {
+                    self.push_jump(from);
+                }
+                self.goto_page_no_record(target);
+                self.status = self.format_link_status(&format!("→ p.{}", target + 1));
+            }
+            LinkAction::Url(_) | LinkAction::Other => {
+                // Defer to the existing URL-handling path — it owns
+                // the scheme allow-list + xdg-open dispatch + status
+                // composition. We pull a fresh clone from the cache
+                // because follow_link_action takes ownership.
+                if let Some(link) = self
+                    .page_links_cache
+                    .get(&page_idx)
+                    .and_then(|v| v.get(link_idx))
+                {
+                    let action = link.action.clone();
+                    self.follow_link_action(action);
+                }
+            }
+        }
+    }
+
+    /// Format a status-line message that includes the jumplist
+    /// position (`jump 3/7`) when the user is mid-walk. Empty span
+    /// when the jumplist is empty or untouched. Builds on the same
+    /// status-line slot the rest of the app uses.
+    fn format_link_status(&self, prefix: &str) -> String {
+        if self.jumplist.is_empty() {
+            prefix.to_string()
+        } else {
+            format!(
+                "{prefix} (jump {idx}/{len})",
+                idx = self.jump_idx,
+                len = self.jumplist.len()
+            )
         }
     }
 
@@ -2930,13 +3219,59 @@ impl<'doc> App<'doc> {
         }
     }
 
-    /// Append `from` to the jumplist (truncating any forward history),
-    /// then position the cursor at the end. Mirrors vim semantics:
-    /// after a fresh jump, `<C-i>` redo is gone.
-    pub fn push_jump(&mut self, from: usize) {
+    /// Snapshot of the current scroll position as a layout-
+    /// independent jump point. Reads `current_page()` for the page
+    /// index and the in-page offset / page-height ratio for the
+    /// fraction. Cheap (no pdfium calls). Safe at any point after
+    /// `ensure_layout` has run; before that, `viewport_px.1 == 0`
+    /// and the page heights might not be set, so the fraction
+    /// degrades to `0.0` — equivalent to "page top," which is what
+    /// every pre-fix call site assumed anyway.
+    pub fn current_jump_point(&self) -> JumpPoint {
+        let page = self.current_page();
+        let page_y = self.layout.page_y(page);
+        let page_h = self.layout.page_h(page) as i64;
+        let frac = if page_h > 0 {
+            ((self.scroll_y_px - page_y) as f32 / page_h as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        JumpPoint {
+            page,
+            frac_in_page: frac,
+        }
+    }
+
+    /// Restore a jumplist entry: scroll so `point.page` is in view,
+    /// THEN add the within-page offset that `point.frac_in_page`
+    /// represents on the CURRENT layout (so a zoom flip between
+    /// record and restore re-projects the offset to the new page
+    /// height instead of landing at a stale pixel position).
+    /// Clamped to the doc's scroll range so a fraction near 1.0 on
+    /// the last page doesn't try to scroll past the document end.
+    pub fn goto_jump_point(&mut self, point: JumpPoint) {
+        let p = point.page.min(self.page_count.saturating_sub(1));
+        let page_y = self.layout.page_y(p);
+        let page_h = self.layout.page_h(p) as i64;
+        let offset_px = (point.frac_in_page * page_h as f32) as i64;
+        let raw = page_y.saturating_add(offset_px);
+        self.scroll_y_px = self.layout.clamp_scroll(raw, self.viewport_px.1);
+        self.invalidate_compose();
+    }
+
+    /// Append `point` to the jumplist (truncating any forward
+    /// history), then position the cursor at the end. Mirrors vim
+    /// semantics: after a fresh jump, `<C-i>` redo is gone.
+    /// De-duplicates against the immediate-prior slot so multiple
+    /// rapid jumps from the same position only record once
+    /// (otherwise a `:N` followed by a Ctrl-O / Ctrl-I dance would
+    /// leave `here` in the list twice).
+    pub fn push_jump(&mut self, point: JumpPoint) {
         self.jumplist
             .truncate(self.jump_idx.min(self.jumplist.len()));
-        self.jumplist.push(from);
+        if self.jumplist.last().copied() != Some(point) {
+            self.jumplist.push(point);
+        }
         self.jump_idx = self.jumplist.len();
         // Bound the list so a long session doesn't grow without limit.
         const MAX_JUMPS: usize = 100;
@@ -2948,7 +3283,7 @@ impl<'doc> App<'doc> {
     }
 
     /// Walk backwards (`<C-o>`) through the jumplist. The first
-    /// invocation pushes the current page so `<C-i>` can return.
+    /// invocation pushes the current position so `<C-i>` can return.
     pub fn jump_back(&mut self) {
         if self.jumplist.is_empty() {
             self.status = "jumplist empty".into();
@@ -2956,8 +3291,11 @@ impl<'doc> App<'doc> {
         }
         // On first walk-back, snapshot where we are now so <C-i> can
         // come back. Detect "first walk" by jump_idx == jumplist.len().
+        // Snapshot the FULL position (page + frac), not just the
+        // page — otherwise Ctrl+I would land at the page top
+        // instead of the click site the user just left.
         if self.jump_idx == self.jumplist.len() {
-            let here = self.current_page();
+            let here = self.current_jump_point();
             if self.jumplist.last().copied() != Some(here) {
                 self.jumplist.push(here);
                 // Don't bump jump_idx — we're about to step back from
@@ -2970,8 +3308,17 @@ impl<'doc> App<'doc> {
         }
         self.jump_idx -= 1;
         let target = self.jumplist[self.jump_idx];
-        self.goto_page_no_record(target);
-        self.status = format!("jump back → page {}", target + 1);
+        self.goto_jump_point(target);
+        // Append jumplist position so the user can see WHERE they are
+        // mid-walk without an extra UI surface. `jump idx/len` reads
+        // 1-based externally to match how every other position
+        // indicator works in this app (`page 5/200`, `5/12 hits`).
+        self.status = format!(
+            "jump back → page {} (jump {idx}/{len})",
+            target.page + 1,
+            idx = self.jump_idx + 1,
+            len = self.jumplist.len()
+        );
     }
 
     /// Walk forward (`<C-i>`) through the jumplist.
@@ -2982,8 +3329,13 @@ impl<'doc> App<'doc> {
         }
         self.jump_idx += 1;
         let target = self.jumplist[self.jump_idx];
-        self.goto_page_no_record(target);
-        self.status = format!("jump forward → page {}", target + 1);
+        self.goto_jump_point(target);
+        self.status = format!(
+            "jump forward → page {} (jump {idx}/{len})",
+            target.page + 1,
+            idx = self.jump_idx + 1,
+            len = self.jumplist.len()
+        );
     }
 
     /// Yank the active selection as a Markdown blockquote with a
@@ -3318,6 +3670,66 @@ pub(crate) fn truncate_for_status(s: &str, max_chars: usize) -> String {
     out
 }
 
+/// Index of the link under `(x, y)` in `links`, or None. Tie-break
+/// on overlap = smallest-area link wins (the innermost / most
+/// specific match), with first-in-list as the secondary tie-break
+/// for determinism. Inclusive on all four edges so a point exactly
+/// at the link boundary still counts. The exact hit-test
+/// (`slop=0`) is exposed via this thin alias so unit tests can pin
+/// the geometry rules without rewriting against the slop variant
+/// every release.
+#[cfg(test)]
+pub(crate) fn link_at_norm_pure(
+    links: &[crate::links::LinkOnPage],
+    x: f32,
+    y: f32,
+) -> Option<usize> {
+    link_at_norm_with_slop(links, x, y, 0.0, 0.0)
+}
+
+/// Same as `link_at_norm_pure` but inflates each link rect by
+/// `(slop_x, slop_y)` in normalized coords before hit-testing. The
+/// click hot path uses this with `slop = half_cell / fit_dim` to
+/// absorb terminal-cell quantisation: `cell_to_page_coord` collapses
+/// the ~16×8 px square of one terminal cell to the cell's TOP-LEFT
+/// point, but a real click could be anywhere inside the cell. A
+/// thin link rect (≈ 0.018 normalised; smaller than one cell on a
+/// fit-width-rendered PDF) ends up with most of its body inside the
+/// clicked cell yet the cell's top-left coord lies just outside
+/// the rect — `link_at_norm_pure` returned None and the user saw
+/// "click does nothing." Half a cell of slop is the smallest value
+/// that recovers boundary-case clicks without fusing adjacent
+/// links into one another.
+pub(crate) fn link_at_norm_with_slop(
+    links: &[crate::links::LinkOnPage],
+    x: f32,
+    y: f32,
+    slop_x: f32,
+    slop_y: f32,
+) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+    for (i, link) in links.iter().enumerate() {
+        let r = link.rect;
+        if x >= r.x - slop_x
+            && x <= r.x + r.w + slop_x
+            && y >= r.y - slop_y
+            && y <= r.y + r.h + slop_y
+        {
+            // Tie-break on the ORIGINAL (un-inflated) area so the
+            // smallest-link-wins rule still picks the right link
+            // when two overlap; otherwise the slop would change
+            // ranking on borderline ties.
+            let area = r.w * r.h;
+            match best {
+                None => best = Some((i, area)),
+                Some((_, prev_area)) if area < prev_area => best = Some((i, area)),
+                _ => {}
+            }
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
 /// Compact byte-count formatter for `:info`. Picks the largest unit
 /// that keeps the number ≤ 1024 and prints to 1 decimal (omitted for
 /// bytes). 1234567 → "1.2 MB"; 999 → "999 B".
@@ -3564,6 +3976,110 @@ pub fn toc_row_to_display_idx(
 mod tests {
     use super::*;
     use crate::pdf::PageMetrics;
+
+    use crate::highlight::Rect01;
+    use crate::links::{LinkAction, LinkOnPage};
+
+    fn mk_link(x: f32, y: f32, w: f32, h: f32) -> LinkOnPage {
+        LinkOnPage {
+            rect: Rect01 { x, y, w, h },
+            action: LinkAction::GoToPage(0),
+        }
+    }
+
+    #[test]
+    fn link_at_norm_returns_none_when_no_links() {
+        assert_eq!(link_at_norm_pure(&[], 0.5, 0.5), None);
+    }
+
+    #[test]
+    fn link_at_norm_returns_none_outside_any_rect() {
+        let links = vec![mk_link(0.1, 0.1, 0.2, 0.05)];
+        assert_eq!(link_at_norm_pure(&links, 0.5, 0.5), None);
+        assert_eq!(link_at_norm_pure(&links, 0.0, 0.0), None);
+    }
+
+    #[test]
+    fn link_at_norm_inclusive_at_rect_edges() {
+        // A click exactly at the boundary should still register —
+        // sub-cell precision in terminal coords means the boundary
+        // is the most likely click position for a small link.
+        let links = vec![mk_link(0.1, 0.2, 0.3, 0.05)];
+        assert_eq!(link_at_norm_pure(&links, 0.1, 0.2), Some(0)); // top-left corner
+        assert_eq!(link_at_norm_pure(&links, 0.4, 0.25), Some(0)); // bottom-right corner
+    }
+
+    #[test]
+    fn link_at_norm_overlap_picks_smallest_area() {
+        // UX plan: most-specific link wins. A wide link that
+        // visually contains a smaller inner link (e.g. "click here
+        // for more details" with "more details" being its own
+        // sub-link) should activate the inner link, not the outer.
+        let links = vec![
+            mk_link(0.0, 0.0, 1.0, 1.0), // big — area 1.0
+            mk_link(0.4, 0.4, 0.2, 0.2), // small — area 0.04
+        ];
+        assert_eq!(link_at_norm_pure(&links, 0.5, 0.5), Some(1));
+    }
+
+    #[test]
+    fn link_at_norm_first_in_list_wins_equal_area_tie() {
+        // Two coincident equal-area links: deterministic tie-break
+        // on first-in-list. Otherwise hover preview + click
+        // activation could disagree across consecutive clicks.
+        let links = vec![mk_link(0.1, 0.1, 0.2, 0.2), mk_link(0.1, 0.1, 0.2, 0.2)];
+        assert_eq!(link_at_norm_pure(&links, 0.2, 0.2), Some(0));
+    }
+
+    /// Sub-cell hit-precision regression. A click on a thin link
+    /// (the height of one terminal cell or less) lands at the
+    /// CELL's TOP-LEFT in normalised coords, which can be just
+    /// outside the link rect. Without slop, the user clicks on a
+    /// visible link and gets nothing back. The half-cell slop
+    /// recovers these clicks.
+    ///
+    /// Layout for this test: a fit-width-rendered page where one
+    /// cell is ~0.019 in normalised height. A link 0.018 tall at
+    /// y=0.349 lands the click coord at y=0.343 (cell top-left,
+    /// just above the link) — exact match returns None, slop=0.01
+    /// (≈ half cell) returns Some.
+    #[test]
+    fn link_at_norm_with_slop_recovers_thin_link_at_cell_boundary() {
+        let links = vec![mk_link(0.143, 0.349, 0.714, 0.018)];
+        // Exact hit-test: 0.343 is OUTSIDE [0.349, 0.367].
+        assert_eq!(link_at_norm_pure(&links, 0.5, 0.343), None);
+        // Half-cell slop in y (~0.01) inflates the link to
+        // y=[0.339, 0.377]. The same click now hits.
+        assert_eq!(
+            link_at_norm_with_slop(&links, 0.5, 0.343, 0.0, 0.01),
+            Some(0)
+        );
+    }
+
+    /// Slop tie-break: when a click would hit two links only
+    /// because slop inflates both into reach, the smaller-area link
+    /// still wins (using ORIGINAL un-inflated area, not inflated
+    /// area). Otherwise slop could flip ranking on borderline ties
+    /// and the hover preview / click would point at different
+    /// links than the user expected.
+    #[test]
+    fn link_at_norm_with_slop_uses_original_area_for_tiebreak() {
+        let links = vec![
+            mk_link(0.0, 0.0, 0.3, 0.3),     // big   — area 0.09
+            mk_link(0.31, 0.31, 0.05, 0.05), // small — area 0.0025
+        ];
+        // Click at (0.305, 0.305) — outside the big rect [0, 0.3]
+        // by 0.005, outside the small rect [0.31, 0.36] by 0.005.
+        // Without slop, no link is hit.
+        assert_eq!(link_at_norm_pure(&links, 0.305, 0.305), None);
+        // With slop=0.01, big inflates to [-0.01, 0.31] (just
+        // contains the click) and small inflates to [0.30, 0.37]
+        // (also contains it). Both hit; smallest-area wins → idx 1.
+        assert_eq!(
+            link_at_norm_with_slop(&links, 0.305, 0.305, 0.01, 0.01),
+            Some(1)
+        );
+    }
 
     /// PDF link annotations are attacker-controlled; only http(s) and
     /// mailto: are safe to dispatch through xdg-open. file://,

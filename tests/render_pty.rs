@@ -400,3 +400,280 @@ fn dump_printable(bytes: &[u8], n: usize) -> String {
         })
         .collect()
 }
+
+/// Scroll-time cursor visibility audit. Spawns the binary, scrolls
+/// through several pages with `j`, captures every byte the renderer
+/// writes to the pty, and counts cursor-show (`\e[?25h`) versus
+/// cursor-hide (`\e[?25l`) emissions. User reported "flashing
+/// cursor everywhere" during scroll; the bytes themselves are the
+/// authoritative answer to "did we actually emit a Show that the
+/// terminal would honour?"
+///
+/// Prints the counts via `--nocapture` so the diagnostic is
+/// readable in the test output. The assertion is loose (zero
+/// Show is the goal but a transient one isn't a regression
+/// blocker) — the value is in the printed counts during triage.
+#[test]
+fn cursor_visibility_during_scroll() {
+    let Some(pdfium) = pdfium_or_skip() else {
+        return;
+    };
+    let pdf = make_multi_page_pdf(&pdfium);
+    let (mut child, mut writer, rx) = spawn_in_pty_with_protocol(&pdf, "kitty");
+
+    let mut buf = Vec::new();
+    drain_until(&rx, &mut buf, Duration::from_secs(8), |b| {
+        twoway_contains(b, b"1/1")
+    });
+
+    // Capture how many show/hide events were already emitted during
+    // first-paint setup; the regression is about scroll-time
+    // emissions, not setup.
+    let baseline_shows = count_subseq(&buf, b"\x1b[?25h");
+    let baseline_hides = count_subseq(&buf, b"\x1b[?25l");
+    eprintln!(
+        "cursor-audit: setup phase — Show={baseline_shows} Hide={baseline_hides}"
+    );
+    let setup_len = buf.len();
+
+    std::thread::sleep(Duration::from_millis(200));
+    for _ in 0..6 {
+        writer.write_all(b"j").expect("write j");
+        writer.flush().ok();
+        std::thread::sleep(Duration::from_millis(80));
+    }
+    drain_until(&rx, &mut buf, Duration::from_millis(800), |_| false);
+
+    let scroll_bytes = &buf[setup_len..];
+    let scroll_shows = count_subseq(scroll_bytes, b"\x1b[?25h");
+    let scroll_hides = count_subseq(scroll_bytes, b"\x1b[?25l");
+    let scroll_bsu = count_subseq(scroll_bytes, b"\x1b[?2026h");
+    let scroll_esu = count_subseq(scroll_bytes, b"\x1b[?2026l");
+    let save_csi = count_subseq(scroll_bytes, b"\x1b[s");
+    let restore_csi = count_subseq(scroll_bytes, b"\x1b[u");
+    let save_decsc = count_subseq(scroll_bytes, b"\x1b7");
+    let restore_decrc = count_subseq(scroll_bytes, b"\x1b8");
+    // U+10EEEE = F4 8E BB AE in UTF-8; this is the kitty-placeholder
+    // character we put in every placement cell.
+    let placeholders = count_subseq(scroll_bytes, b"\xf4\x8e\xbb\xae");
+    let loading_text = count_subseq(scroll_bytes, b"loading page");
+    // Cursor blink / DECTCEM probes
+    let blink_on = count_subseq(scroll_bytes, b"\x1b[?12h");
+    let blink_off = count_subseq(scroll_bytes, b"\x1b[?12l");
+    eprintln!(
+        "cursor-audit: scroll phase — Show={scroll_shows} Hide={scroll_hides} \
+         BSU={scroll_bsu} ESU={scroll_esu} bytes={n}\n  \
+         CSI s={save_csi} CSI u={restore_csi} ESC 7={save_decsc} ESC 8={restore_decrc}\n  \
+         placeholders={placeholders} 'loading page'={loading_text} \
+         blink_on={blink_on} blink_off={blink_off}",
+        n = scroll_bytes.len()
+    );
+
+    // **Regression guard.** Every scroll-time write to the pty must
+    // sit inside a DECSET 2026 (BSU/ESU) bracket. Anything outside —
+    // typically a kitty image transmit emitted by the idle-warm
+    // prefetch path — Ghostty processes immediately on arrival, and
+    // the multi-KB APC payload defers ratatui's queued cursor-hide
+    // long enough that the user sees the cursor flash at whatever
+    // cell the prior frame's last write left it in.
+    //
+    // Compute the largest unsynchronized region (after each ESU,
+    // before the next BSU). If anything > a few control bytes lands
+    // outside, fail loudly with a printable head — keeps the fix
+    // in place and surfaces any future code path that tries to
+    // bypass term.draw without bracketing its writes.
+    let max_unsynced = {
+        let mut esu_ends = Vec::new();
+        let mut idx = 0;
+        while let Some(off) = scroll_bytes[idx..]
+            .windows(b"\x1b[?2026l".len())
+            .position(|w| w == b"\x1b[?2026l")
+        {
+            esu_ends.push(idx + off + b"\x1b[?2026l".len());
+            idx = idx + off + b"\x1b[?2026l".len();
+        }
+        let mut bsu_starts = Vec::new();
+        let mut idx = 0;
+        while let Some(off) = scroll_bytes[idx..]
+            .windows(b"\x1b[?2026h".len())
+            .position(|w| w == b"\x1b[?2026h")
+        {
+            bsu_starts.push(idx + off);
+            idx = idx + off + b"\x1b[?2026h".len();
+        }
+        let mut max_len = 0usize;
+        let mut max_at = 0usize;
+        for &esu_end in &esu_ends {
+            let next_bsu = bsu_starts.iter().copied().find(|&b| b >= esu_end);
+            let region_end = next_bsu.unwrap_or(scroll_bytes.len());
+            let len = region_end - esu_end;
+            if len > max_len {
+                max_len = len;
+                max_at = esu_end;
+            }
+        }
+        eprintln!(
+            "cursor-audit: BSU pairs ok ({} BSU / {} ESU); largest unsynced region = {} bytes",
+            bsu_starts.len(),
+            esu_ends.len(),
+            max_len
+        );
+        if max_len > 64 {
+            let end = max_at + max_len.min(200);
+            let mut s = String::new();
+            for &b in &scroll_bytes[max_at..end] {
+                if (0x20..=0x7e).contains(&b) {
+                    s.push(b as char);
+                } else if b == 0x1b {
+                    s.push_str("\\E");
+                } else {
+                    s.push_str(&format!("\\x{b:02x}"));
+                }
+            }
+            eprintln!("cursor-audit: unsynced region head:\n{s}");
+        }
+        max_len
+    };
+
+    // Show emissions during scroll = cursor flickers visibly. With
+    // ratatui's try_draw + frame.cursor_position = None, every draw
+    // emits Hide and zero Shows. If this assertion fires, find the
+    // emitter via grep — it's a regression somewhere new.
+    assert_eq!(
+        scroll_shows, 0,
+        "cursor Show emitted {scroll_shows} times during scroll; expected zero. \
+         Hide count = {scroll_hides}. First 200 bytes after a Show:\n{}",
+        first_window_after(scroll_bytes, b"\x1b[?25h", 200)
+    );
+
+    // Anything > 64 bytes outside BSU/ESU is a regression — the
+    // idle-warm transmit was the historical offender and ships
+    // ~50 KB of APC graphics payload per fire. Threshold sits at
+    // 64 to allow for trailing line clears or small probe bytes
+    // without false positives.
+    assert!(
+        max_unsynced <= 64,
+        "scroll wrote {max_unsynced} bytes OUTSIDE any BSU/ESU bracket; \
+         a code path is bypassing synchronized output and Ghostty will \
+         flash the cursor at the unsynced bytes' location. The historical \
+         offender is the idle-warm transmit in main.rs::warm_next_uncached \
+         — make sure all write_all calls outside term.draw wrap their \
+         payload in `\\x1b[?2026h` and `\\x1b[?2026l`."
+    );
+
+    writer.write_all(b"q").ok();
+    let _ = child.wait();
+}
+
+fn count_subseq(haystack: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return 0;
+    }
+    haystack.windows(needle.len()).filter(|w| *w == needle).count()
+}
+
+fn first_window_after(haystack: &[u8], needle: &[u8], window: usize) -> String {
+    let Some(pos) = haystack.windows(needle.len()).position(|w| w == needle) else {
+        return String::from("<no match>");
+    };
+    let end = (pos + window).min(haystack.len());
+    haystack[pos..end]
+        .iter()
+        .map(|b| {
+            if (0x20..=0x7e).contains(b) {
+                *b as char
+            } else if *b == 0x1b {
+                'E'
+            } else {
+                '.'
+            }
+        })
+        .collect()
+}
+
+/// 8-page test PDF for scroll-time diagnostics — `make_test_pdf`'s
+/// single page makes `j` a no-op, which defeats the purpose of a
+/// scroll audit.
+fn make_multi_page_pdf(pdfium: &pdfium_render::prelude::Pdfium) -> PathBuf {
+    use pdfium_render::prelude::*;
+    let mut path = std::env::temp_dir();
+    path.push(format!("termpdf-multi-pty-{}.pdf", std::process::id()));
+    let mut doc = pdfium.create_new_pdf().expect("create pdf");
+    for i in 0..8 {
+        let mut page = doc
+            .pages_mut()
+            .create_page_at_end(PdfPagePaperSize::a4())
+            .expect("create page");
+        let font = doc.fonts_mut().helvetica();
+        let mut object = PdfPageTextObject::new(
+            &doc,
+            format!("page {}", i + 1),
+            font,
+            PdfPoints::new(36.0),
+        )
+        .expect("text object");
+        object
+            .translate(PdfPoints::new(72.0), PdfPoints::new(700.0))
+            .expect("translate");
+        page.objects_mut().add_text_object(object).expect("add");
+    }
+    doc.save_to_file(&path).expect("save");
+    path
+}
+
+/// Same as `spawn_in_pty` but with the protocol parameter exposed
+/// so the cursor-audit test can pin kitty mode (the user's actual
+/// runtime) without changing the existing tests' halfblocks
+/// fallback.
+fn spawn_in_pty_with_protocol(
+    pdf: &std::path::Path,
+    protocol: &str,
+) -> (
+    Box<dyn portable_pty::Child + Send + Sync>,
+    Box<dyn Write + Send>,
+    mpsc::Receiver<Vec<u8>>,
+) {
+    let bin = binary_path().expect("binary built");
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 30,
+            cols: 100,
+            pixel_width: 800,
+            pixel_height: 600,
+        })
+        .expect("openpty");
+    let mut cmd = CommandBuilder::new(bin);
+    cmd.arg(pdf);
+    cmd.arg("--protocol");
+    cmd.arg(protocol);
+    cmd.env("TERM", "xterm-kitty");
+    cmd.env_remove("TMUX");
+    cmd.env(
+        "TERMPDF_PDFIUM",
+        resolve_pdfium_path().expect("pdfium resolved by pdfium_or_skip"),
+    );
+    cmd.env("TERMPDF_CELL_PX", "8x16");
+    let tmp_cache =
+        std::env::temp_dir().join(format!("termpdf-test-cache-pty-{}", std::process::id()));
+    cmd.env("XDG_CACHE_HOME", &tmp_cache);
+    let child = pair.slave.spawn_command(cmd).expect("spawn");
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().expect("reader");
+    let writer = pair.master.take_writer().expect("writer");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(chunk[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    (child, writer, rx)
+}

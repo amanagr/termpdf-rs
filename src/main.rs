@@ -46,9 +46,9 @@ use anyhow::{Context, Result};
 use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches, Parser};
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyEventKind, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, BeginSynchronizedUpdate,
@@ -105,6 +105,28 @@ struct Args {
     /// or for sanity-checking pdfium + dark inversion without a TTY.
     #[arg(long, value_name = "PNG", value_hint = clap::ValueHint::FilePath)]
     probe: Option<PathBuf>,
+    /// Link diagnostic: walk every page, dump the raw link-annotation
+    /// structure (action vs destination, target page, URI) to stdout.
+    /// Useful when "links don't work" — shows whether pdfium sees
+    /// them at all and which resolution path each link takes. Limit
+    /// via `--probe-links-pages N` (default 30).
+    #[arg(long)]
+    probe_links: bool,
+    /// Cap on pages dumped by `--probe-links`. Some PDFs have 1000+
+    /// pages with dense link annotations on every one — left
+    /// unbounded the dump would scroll forever.
+    #[arg(long, default_value_t = 30)]
+    probe_links_pages: usize,
+    /// Click diagnostic: load the PDF in a synthetic 80×24 cell
+    /// terminal, find the first GoToPage link in the document
+    /// (skipping URL links so we can assert page navigation),
+    /// compute its center cell coords, simulate Down + Up mouse
+    /// events through `dispatch_mouse`, and report the resulting
+    /// `current_page()` + status. Lets the click pipeline be
+    /// exercised end-to-end without a real terminal so a "links
+    /// don't work" report can be triaged from a headless shell.
+    #[arg(long)]
+    probe_click: bool,
     /// Zoom factor for `--probe` only (1.0 = fit; >1 = zoomed pixmap).
     /// Lets the rendering path under zoom be exercised headlessly.
     #[arg(long, default_value_t = 1.0)]
@@ -268,6 +290,12 @@ fn main() -> Result<()> {
     if let Some(out) = args.probe {
         return probe(&document, start_page, start_dark, args.probe_zoom, &out);
     }
+    if args.probe_links {
+        return probe_links(&document, args.probe_links_pages);
+    }
+    if args.probe_click {
+        return probe_click(document, &args.path, start_page, start_dark);
+    }
 
     tmux_passthrough_hint();
     // Trim oldest disk-cache entries above the byte budget. Runs in
@@ -386,6 +414,15 @@ fn setup_terminal() -> Result<()> {
         // events (each commits a partial line), and a paste in
         // Normal mode can fire `q` mid-stream and quit the app.
         EnableBracketedPaste,
+        // Focus reporting — Ghostty's image-storage cap is shared
+        // across screens, and pages we transmitted earlier may have
+        // been evicted under pressure from another tmux pane / app
+        // while we were unfocused. On `FocusGained` we
+        // `invalidate_all_transmits` so the next draw re-ships visible
+        // pages. Belt-and-braces alongside the long-jump and
+        // post-scroll-settle triggers in `ui::draw`. Terminals that
+        // don't support focus reporting silently ignore the DECSET.
+        EnableFocusChange,
         crossterm::cursor::Hide,
     )?;
     // Kitty Keyboard Protocol — `REPORT_EVENT_TYPES` is what makes
@@ -423,6 +460,7 @@ fn teardown_terminal() -> Result<()> {
         out,
         crossterm::cursor::Show,
         DisableBracketedPaste,
+        DisableFocusChange,
         DisableMouseCapture,
         LeaveAlternateScreen,
     )?;
@@ -454,6 +492,7 @@ fn restore_terminal_best_effort() {
         out,
         crossterm::cursor::Show,
         DisableBracketedPaste,
+        DisableFocusChange,
         DisableMouseCapture,
         LeaveAlternateScreen,
     );
@@ -509,6 +548,326 @@ fn install_signal_cleanup() {
             std::process::exit(128 + sig);
         }
     });
+}
+
+/// Headless link-annotation diagnostic: walk every page (capped at
+/// `max_pages`), enumerate link annotations, and print the raw
+/// pdfium view of each one. Reports BOTH `link.action()` (PDF /A
+/// key) and `link.destination()` (PDF /Dest key) so a future
+/// "links don't work" report can be triaged without staring at
+/// hex-dumps. Output format is grep-friendly: one link per line,
+/// fixed columns. Exits 0 even on individual link failures so a
+/// single malformed annotation doesn't break the dump.
+fn probe_links(document: &pdfium_render::prelude::PdfDocument<'_>, max_pages: usize) -> Result<()> {
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let pages = document.pages();
+    let n = (pages.len() as usize).min(max_pages);
+    let mut total_links = 0usize;
+    let mut total_resolved = 0usize;
+    let mut by_kind: std::collections::HashMap<&'static str, usize> =
+        std::collections::HashMap::new();
+    for pi in 0..n {
+        let Ok(page) = pages.get(pi as i32) else {
+            writeln!(out, "page={pi:4} pdfium_get_page=ERR")?;
+            continue;
+        };
+        let links = page.links();
+        let mut count_on_page = 0usize;
+        for link in links.iter() {
+            count_on_page += 1;
+            total_links += 1;
+            // Action (/A) view.
+            let act_view = match link.action() {
+                None => "/A=none".to_string(),
+                Some(a) => {
+                    if let Some(uri) = a.as_uri_action() {
+                        let u = uri.uri().unwrap_or_else(|_| "<unreadable>".to_string());
+                        format!("/A=uri({u})")
+                    } else if let Some(d) = a.as_local_destination_action() {
+                        match d.destination().and_then(|dd| dd.page_index()) {
+                            Ok(p) => format!("/A=goto(p{})", p),
+                            Err(e) => format!("/A=goto(unresolved:{e:?})"),
+                        }
+                    } else if a.as_remote_destination_action().is_some() {
+                        "/A=remote".to_string()
+                    } else if a.as_embedded_destination_action().is_some() {
+                        "/A=embedded".to_string()
+                    } else if a.as_launch_action().is_some() {
+                        "/A=launch".to_string()
+                    } else {
+                        format!("/A=type={:?}", a.action_type())
+                    }
+                }
+            };
+            // Destination (/Dest) view.
+            let dest_view = match link.destination() {
+                None => "/Dest=none".to_string(),
+                Some(d) => match d.page_index() {
+                    Ok(p) => format!("/Dest=p{}", p),
+                    Err(e) => format!("/Dest=unresolved:{e:?}"),
+                },
+            };
+            // Rect.
+            let rect_view = match link.rect() {
+                Ok(r) => format!(
+                    "rect=({:.1},{:.1},{:.1},{:.1})",
+                    r.left().value,
+                    r.bottom().value,
+                    r.right().value,
+                    r.top().value
+                ),
+                Err(e) => format!("rect=ERR({e:?})"),
+            };
+            // Combined "would current logic resolve?" verdict.
+            let resolved = match crate::links::test_resolve_link(&link) {
+                Some(crate::links::LinkAction::GoToPage(p)) => {
+                    *by_kind.entry("GoToPage").or_default() += 1;
+                    format!("RESOLVED=GoToPage(p{p})")
+                }
+                Some(crate::links::LinkAction::Url(u)) => {
+                    *by_kind.entry("Url").or_default() += 1;
+                    format!("RESOLVED=Url({u})")
+                }
+                Some(crate::links::LinkAction::Other) => {
+                    *by_kind.entry("Other").or_default() += 1;
+                    "RESOLVED=Other".to_string()
+                }
+                None => {
+                    *by_kind.entry("DROPPED").or_default() += 1;
+                    "RESOLVED=None(DROPPED)".to_string()
+                }
+            };
+            if matches!(resolved.as_str(), "RESOLVED=GoToPage(p" | "RESOLVED=Url(")
+                || resolved.starts_with("RESOLVED=GoToPage")
+                || resolved.starts_with("RESOLVED=Url")
+            {
+                total_resolved += 1;
+            }
+            writeln!(
+                out,
+                "page={pi:4} link {act_view:<40} {dest_view:<24} {rect_view:<40} {resolved}"
+            )?;
+        }
+        if count_on_page > 0 {
+            writeln!(out, "page={pi:4} ── {count_on_page} link(s) on this page")?;
+        }
+    }
+    writeln!(out, "─────────────────────────────")?;
+    writeln!(
+        out,
+        "scanned {n} pages; {total_links} link annotations; {total_resolved} resolved by current logic"
+    )?;
+    let mut kinds: Vec<_> = by_kind.iter().collect();
+    kinds.sort_by_key(|(k, _)| *k);
+    for (k, v) in kinds {
+        writeln!(out, "  {k:>10}: {v}")?;
+    }
+    Ok(())
+}
+
+/// Headless click-pipeline diagnostic. Walks every page until it
+/// finds the first GoToPage link, then synthesizes Down → Up mouse
+/// events at the link rect's center cell and reports what
+/// `dispatch_mouse` did with them. End-to-end coverage of the
+/// pipeline that the user can't manually exercise: hit-test,
+/// pending-click candidate, drag-end, activate_link, jumplist,
+/// status. Used when "clicking links does nothing" needs triage
+/// from a headless shell.
+#[allow(clippy::too_many_lines)]
+fn probe_click<'doc>(
+    document: pdfium_render::prelude::PdfDocument<'doc>,
+    path: &std::path::Path,
+    start_page: usize,
+    start_dark: bool,
+) -> Result<()> {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::layout::Rect;
+
+    // Synthetic 80×24 cell terminal at 8×16 px/cell — same proportions
+    // the existing `--probe` flag uses. Realistic enough that the
+    // layout math goes through real code paths.
+    let cell_px = (8u16, 16u16);
+    let term_cols = 80u16;
+    let term_rows = 24u16;
+    let img_rows = term_rows - 1; // status bar takes one row
+    let viewport_w_px = (term_cols as u32) * (cell_px.0 as u32);
+    let viewport_h_px = (img_rows as u32) * (cell_px.1 as u32);
+
+    let picker = pick_protocol(ProtocolChoice::Halfblocks);
+    let mut app = App::new(
+        document,
+        path,
+        start_page,
+        start_dark,
+        1.0,
+        std::collections::BTreeMap::new(),
+        0.0,
+        0.0,
+        picker,
+    )?;
+
+    // Hand-set the terminal-geometry fields the draw path normally
+    // populates. Without these, `cell_to_page_coord` returns None
+    // (image_area is zero-sized → all clicks miss).
+    app.image_area = Rect::new(0, 0, term_cols, img_rows);
+    app.cell_size_px = cell_px;
+    app.viewport_px = (viewport_w_px, viewport_h_px);
+    app.ensure_layout(viewport_w_px, viewport_h_px);
+
+    // Walk pages until we find a GoToPage link. Skip URL links — they
+    // dispatch xdg-open which would either open a browser or fail
+    // headlessly; either way it's a different code path from the
+    // navigation case the user is debugging.
+    let n_pages = app.page_count;
+    let mut found: Option<(usize, usize)> = None;
+    for p in 0..n_pages {
+        app.ensure_page_links_loaded(p);
+        if let Some(links) = app.page_links_cache.get(&p) {
+            for (idx, l) in links.iter().enumerate() {
+                if matches!(l.action, crate::links::LinkAction::GoToPage(_)) {
+                    found = Some((p, idx));
+                    break;
+                }
+            }
+        }
+        if found.is_some() {
+            break;
+        }
+    }
+    let Some((page_with_link, link_idx)) = found else {
+        println!("probe-click: no GoToPage link found in document; nothing to click.");
+        return Ok(());
+    };
+    let (link_action, link_rect) = {
+        let link = &app.page_links_cache[&page_with_link][link_idx];
+        (link.action.clone(), link.rect)
+    };
+    println!(
+        "probe-click: target = page {p} link {i} action={a:?} rect=({rx:.4},{ry:.4},{rw:.4},{rh:.4})",
+        p = page_with_link,
+        i = link_idx,
+        a = link_action,
+        rx = link_rect.x,
+        ry = link_rect.y,
+        rw = link_rect.w,
+        rh = link_rect.h,
+    );
+
+    // Navigate so the link's page is in view. After goto_page_no_record
+    // the scroll_y_px sits at the page's TOP — fine for links in the
+    // upper half of the page, but a footnote near the bottom may sit
+    // BELOW the synthetic 23-row viewport (368 px on stock cell size).
+    // Re-position so the link's vertical center is in the middle of
+    // the viewport: a real user would have scrolled down to read the
+    // link before clicking it. Without this, the probe would
+    // synthesise a click at a row outside img_area, and the click
+    // would land on whatever happens to be at the clamped row —
+    // probably nothing.
+    let page_y = app.layout.page_y(page_with_link);
+    let page_h = app.layout.page_h(page_with_link) as i64;
+    let link_center_doc_y =
+        page_y + (link_rect.y * page_h as f32 + link_rect.h * page_h as f32 * 0.5) as i64;
+    app.scroll_y_px = (link_center_doc_y - viewport_h_px as i64 / 2).max(0);
+    // Re-clamp via ensure_layout's clamp_scroll path. (clamp_scroll is
+    // private; ensure_layout re-runs it for the same key as a no-op
+    // re-clamp.)
+    app.ensure_layout(viewport_w_px, viewport_h_px);
+    println!(
+        "probe-click: positioned page {p} with link center at viewport middle (scroll_y_px={s}, page_top_doc_y={py}, link_center_doc_y={lcy})",
+        p = page_with_link,
+        s = app.scroll_y_px,
+        py = page_y,
+        lcy = link_center_doc_y,
+    );
+
+    // Compute the link's center in screen-cell coords. Mirror what
+    // `cell_to_page_coord_pure` would invert: page top in pixel
+    // space relative to viewport, then convert through cell size.
+    let page_top_screen_px = page_y - app.scroll_y_px;
+    let cx_norm = link_rect.x + link_rect.w / 2.0;
+    let cy_norm = link_rect.y + link_rect.h / 2.0;
+    // Horizontal centering offset — same math `cell_to_page_coord_pure`
+    // uses in the inverse direction.
+    let fit_w = app.layout.fit_width_px;
+    let h_offset_px = if fit_w <= viewport_w_px {
+        ((viewport_w_px - fit_w) / 2) as i64
+    } else {
+        0
+    };
+    let click_px_x = h_offset_px + (cx_norm * fit_w as f32) as i64;
+    let click_px_y = page_top_screen_px + (cy_norm * page_h as f32) as i64;
+    let click_col = (click_px_x / cell_px.0 as i64)
+        .max(0)
+        .min(term_cols as i64 - 1) as u16;
+    let click_row = (click_px_y / cell_px.1 as i64)
+        .max(0)
+        .min(img_rows as i64 - 1) as u16;
+    println!(
+        "probe-click: synthesised click at col={click_col} row={click_row} (px ~ {click_px_x},{click_px_y})"
+    );
+
+    // Sanity-check via the same hit-test the dispatch path uses.
+    let hit = app.link_at_screen(click_col, click_row);
+    println!("probe-click: link_at_screen verdict = {hit:?}");
+
+    // Synthesize Down + Up events through dispatch_mouse. Same code
+    // path that runs on a real click in the TUI.
+    let mk_event = |kind: MouseEventKind| MouseEvent {
+        kind,
+        column: click_col,
+        row: click_row,
+        modifiers: KeyModifiers::empty(),
+    };
+    let before_page = app.current_page();
+    let before_scroll = app.scroll_y_px;
+    keys::dispatch_mouse(&mut app, mk_event(MouseEventKind::Down(MouseButton::Left)))?;
+    println!(
+        "probe-click: after Down — pending_link_click={pc:?}",
+        pc = app.pending_link_click
+    );
+    keys::dispatch_mouse(&mut app, mk_event(MouseEventKind::Up(MouseButton::Left)))?;
+    let after_page = app.current_page();
+    let after_scroll = app.scroll_y_px;
+    println!(
+        "probe-click: after Up — current_page: {before_page} → {after_page}, scroll_y_px: {before_scroll} → {after_scroll}"
+    );
+    println!("probe-click: status = {:?}", app.status);
+    println!("probe-click: jumplist = {:?}", app.jumplist);
+
+    if let crate::links::LinkAction::GoToPage(target) = link_action {
+        if after_page == target {
+            println!("probe-click: PASS — landed on expected page {target}");
+        } else {
+            println!(
+                "probe-click: FAIL — expected page {target}, got {after_page}; click did NOT navigate"
+            );
+        }
+    }
+
+    // Ctrl+O round-trip: back-jump should restore the EXACT scroll
+    // position we were at when we clicked, not just the page top.
+    // Without `goto_jump_point`'s frac-based restore this would
+    // land at `page_y(before_page)` (page top), which the user
+    // reported as "doesn't work precisely."
+    println!("probe-click: --- testing Ctrl+O back-jump ---");
+    app.jump_back();
+    let back_page = app.current_page();
+    let back_scroll = app.scroll_y_px;
+    println!(
+        "probe-click: after Ctrl+O — current_page: {after_page} → {back_page}, scroll_y_px: {after_scroll} → {back_scroll}"
+    );
+    if back_page == before_page && back_scroll == before_scroll {
+        println!(
+            "probe-click: PASS — Ctrl+O restored exact pre-click position (page {before_page}, scroll {before_scroll})"
+        );
+    } else {
+        println!(
+            "probe-click: FAIL — expected (page {before_page}, scroll {before_scroll}), got (page {back_page}, scroll {back_scroll})"
+        );
+    }
+    Ok(())
 }
 
 /// Headless render path used by `--probe`. Builds a fake Picker with an
@@ -713,6 +1072,20 @@ fn run_loop(app: &mut App<'_>) -> Result<()> {
             if action != IdleAction::Skip {
                 let _s = profile::span(profile::Phase::IdleWarm);
                 let _ = warm_one_idle(app, action);
+                // Idle-warm transmits ship bytes to Ghostty WITHOUT
+                // running the kitty draw branch's per-page at-risk
+                // check. If the warm just pushed a currently-visible
+                // page over the eviction-risk threshold, force a
+                // redraw — without this, the next draw is gated on
+                // user input and the user could see blank visible
+                // pages during pure idle. Cheap (cached_payload
+                // re-used; the `at_risk` check in draw_pages_kitty
+                // is what actually re-transmits).
+                if app.idle_warm_pushed_visible_at_risk {
+                    app.idle_warm_pushed_visible_at_risk = false;
+                    last_draw = std::time::Instant::now() - MIN_FRAME_INTERVAL;
+                    dirty = true;
+                }
             }
         }
     }
@@ -949,15 +1322,49 @@ fn warm_next_uncached(app: &mut App<'_>) -> Result<bool> {
         let kp = app.kitty_pages.as_mut();
         if let (Some(kp), Some(bm), Some((w, h))) = (kp, bm, pixel_dims) {
             let transmit = kp.build_transmit(bm, pi, layout_key, revision);
-            // Write directly to stdout. We're outside of term.draw so
-            // no interleaving with ratatui's own writes — io::Stdout
-            // is line-/byte-flushable and acquires its own lock per
-            // call; we flush explicitly so the terminal sees the
-            // bytes before the next draw.
+            // Wrap the transmit in DECSET 2026 (Synchronized Output)
+            // brackets. Without this, Ghostty processes the multi-KB
+            // APC payload immediately on arrival; the per-chunk
+            // graphics-engine work briefly defers any pending cursor
+            // hide that ratatui's previous frame queued, and the
+            // user perceives the cursor flashing in whatever cell
+            // the prior frame's last write left it in. With
+            // BSU/ESU brackets, Ghostty buffers the transmit until
+            // the closing ESU and the cursor stays committed-hidden
+            // for the entire idle window.
+            //
+            // We're outside `term.draw` so no interleaving with
+            // ratatui's own writes; io::Stdout acquires its own
+            // mutex per `write_all`, and our explicit flush sends
+            // BSU + transmit + ESU as one PTY write.
             use std::io::Write;
             let mut stdout = io::stdout().lock();
-            if stdout.write_all(transmit.as_bytes()).is_ok() && stdout.flush().is_ok() {
+            let bsu = b"\x1b[?2026h";
+            let esu = b"\x1b[?2026l";
+            let wrote_ok = stdout.write_all(bsu).is_ok()
+                && stdout.write_all(transmit.as_bytes()).is_ok()
+                && stdout.write_all(esu).is_ok()
+                && stdout.flush().is_ok();
+            if wrote_ok {
                 kp.mark_transmitted(pi, layout_key, revision, w, h);
+                // The transmit just pushed `transmitted_bytes_cumulative`
+                // forward by this page's decoded-RGBA size. If that
+                // pushed any currently-visible page over Ghostty's
+                // image-storage cap (per the per-page snapshot), the
+                // visible page is statistically likely to have been
+                // evicted server-side. Without a redraw, the user
+                // sees that visible page blank until next input. Set
+                // the signal so run_loop forces a draw — the kitty
+                // branch's at-risk check will then re-transmit the
+                // stale visible page from `cached_payload` (no
+                // re-encode). Costs nothing when nothing is at risk.
+                let threshold = crate::kitty_pages::ghostty_budget_bytes();
+                let any_at_risk = visible
+                    .clone()
+                    .any(|p| kp.is_eviction_at_risk(p, threshold));
+                if any_at_risk {
+                    app.idle_warm_pushed_visible_at_risk = true;
+                }
             }
         }
         return Ok(true);
@@ -1014,6 +1421,37 @@ fn dispatch_event_coalesced(app: &mut App<'_>, ev: Event) -> Result<()> {
                 _ => {
                     // Non-drag event broke the run — dispatch the latest drag,
                     // then this event normally.
+                    dispatch_event(app, latest)?;
+                    return dispatch_event(app, next);
+                }
+            }
+        }
+        return dispatch_event(app, latest);
+    }
+    if let Event::Mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        ..
+    }) = ev
+    {
+        // Drain consecutive Moved events; keep only the last. Same
+        // pattern as Drag — the hover hit-test only cares about the
+        // CURRENT cursor position, not every intermediate point on a
+        // 60 Hz mouse-motion stream. Without this, every Moved event
+        // pays for `cell_to_page_coord` + `link_at_norm` even when
+        // the equality debounce in `dispatch_mouse` would suppress
+        // the resulting redraw. Coalescing keeps the hit-test cost
+        // proportional to user attention, not pointer hardware rate.
+        let mut latest = ev;
+        while event::poll(Duration::ZERO)? {
+            let next = event::read()?;
+            match &next {
+                Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    ..
+                }) => {
+                    latest = next;
+                }
+                _ => {
                     dispatch_event(app, latest)?;
                     return dispatch_event(app, next);
                 }
@@ -1150,6 +1588,38 @@ fn dispatch_event(app: &mut App<'_>, ev: Event) -> Result<()> {
             // around line 219 — keep these two derivations in sync.
             app.image_area = ratatui::layout::Rect::new(0, 0, w, h.saturating_sub(1));
             app.invalidate_compose();
+            // Resize can flush Ghostty's image store (the alt-screen
+            // re-allocs and pages we held may not survive). LayoutKey
+            // changes catch most resizes via `is_fresh = false`, but a
+            // status-row-only height tick or a same-pixel-size resize
+            // wouldn't bump the key — and the registry would happily
+            // place against image_ids Ghostty no longer holds. Fold
+            // resize into the same invalidate path the long-jump /
+            // post-scroll-settle triggers use; cached_payload survives
+            // so the next draw re-ships without re-encoding.
+            if let Some(kp) = app.kitty_pages.as_mut() {
+                kp.invalidate_all_transmits();
+            }
+        }
+        Event::FocusGained => {
+            // Ghostty's image-storage-limit is shared across screens;
+            // while we were unfocused another tmux pane / window may
+            // have transmitted enough to evict our pages under the
+            // cap. None of the in-draw triggers (popup_open_prev,
+            // is_long_jump, post_scroll_settle) catches this because
+            // they all gate on scroll_y_px change. Belt-and-braces
+            // invalidate on focus return. Cheap (cached_payload
+            // re-used). Terminals that don't emit FocusGained never
+            // hit this branch — silently safe.
+            if let Some(kp) = app.kitty_pages.as_mut() {
+                kp.invalidate_all_transmits();
+            }
+        }
+        Event::FocusLost => {
+            // No work to do on focus loss — the next FocusGained
+            // handler is what re-ships images. Listed explicitly so a
+            // future change that adds defocus-time housekeeping has
+            // an obvious home and isn't silently swallowed by `_`.
         }
         Event::Mouse(m) => keys::dispatch_mouse(app, m)?,
         // Bracketed paste — the body is the literal pasted text. Route

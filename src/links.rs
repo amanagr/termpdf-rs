@@ -55,26 +55,56 @@ pub fn enumerate(page: &PdfPage<'_>, metrics: &PageMetrics) -> Vec<LinkOnPage> {
         };
         let rect = pdf_rect_to_norm(&bounds, metrics);
 
-        // Action: either a destination (page jump) or a URI.
-        let action = match link.action() {
-            Some(a) => match resolve_action(&a) {
-                Some(act) => act,
-                None => LinkAction::Other,
-            },
-            None => {
-                // No action at all — pdfium's "annotation only" link.
-                // Skip rather than emit a useless hint.
-                continue;
-            }
+        // PDF spec (32000-1:2008 §12.5.6.5) says a link annotation's
+        // target lives in EITHER its `/A` key (an action object) OR
+        // its `/Dest` key (a direct destination shortcut). Most TOC
+        // / cross-reference / footnote links in real-world PDFs use
+        // `/Dest` because it's the simpler form. pdfium exposes
+        // them as separate accessors: `link.action()` reads `/A`,
+        // `link.destination()` reads `/Dest`. The first version of
+        // this enumerator only checked `action()` and `continue`d
+        // on `None`, silently dropping every `/Dest`-style internal
+        // link — clicking them did nothing.
+        //
+        // Resolution order:
+        //   1. `/A` action: URI, GoToDestinationInSameDocument, …
+        //   2. `/Dest` direct destination → GoToPage.
+        // Falling back to `/Dest` ONLY when `/A` doesn't yield a
+        // recognized action keeps URL links (which usually live in
+        // `/A`) working, and recovers the in-PDF link case.
+        let action = match resolve_link(&link) {
+            Some(a) => a,
+            None => continue,
         };
-        // Drop Other (degenerate) actions so users don't see hints
-        // that go nowhere.
-        if matches!(action, LinkAction::Other) {
-            continue;
-        }
         out.push(LinkOnPage { rect, action });
     }
     out
+}
+
+/// Same as `resolve_link` but exposed for the `--probe-links`
+/// diagnostic in `main.rs`. Production code paths route through
+/// `enumerate`; this is a pinhole into the resolution policy for
+/// triaging "links don't work" reports.
+pub fn test_resolve_link(link: &PdfLink<'_>) -> Option<LinkAction> {
+    resolve_link(link)
+}
+
+/// Resolve a link's target via the action-then-destination ladder.
+/// Pure dispatch, separated from `enumerate` so the resolution
+/// policy is testable in isolation against a synthetic action vs.
+/// destination shape.
+fn resolve_link(link: &PdfLink<'_>) -> Option<LinkAction> {
+    if let Some(a) = link.action() {
+        if let Some(act) = resolve_action(&a) {
+            return Some(act);
+        }
+    }
+    if let Some(dest) = link.destination() {
+        if let Ok(page_index) = dest.page_index() {
+            return Some(LinkAction::GoToPage(page_index as usize));
+        }
+    }
+    None
 }
 
 fn resolve_action(action: &PdfAction<'_>) -> Option<LinkAction> {

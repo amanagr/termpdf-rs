@@ -670,11 +670,112 @@ pub fn dispatch_mouse(app: &mut App<'_>, m: MouseEvent) -> Result<()> {
         MouseEventKind::ScrollRight => app.scroll_x_by(SCROLL_LINE),
         MouseEventKind::ScrollLeft => app.scroll_x_by(-SCROLL_LINE),
 
-        // Left-click drag = highlight. Click without drag = exit
-        // Visual mode (handled by mouse_drag_end's small-rect path).
-        MouseEventKind::Down(MouseButton::Left) => app.mouse_drag_start(m.column, m.row),
-        MouseEventKind::Drag(MouseButton::Left) => app.mouse_drag_to(m.column, m.row),
-        MouseEventKind::Up(MouseButton::Left) => app.mouse_drag_end(),
+        // Left-click drag = highlight. Click WITHOUT drag (≤ slop) on
+        // a link = follow-link; on non-link = exit Visual (handled
+        // by mouse_drag_end's small-rect path). The hit-test runs
+        // at Down time so we can record a candidate for the Up to
+        // consume; activation deferred to Up so a real drag
+        // (highlight) doesn't spurious-click a link en route.
+        MouseEventKind::Down(MouseButton::Left) => {
+            let hit = app.link_at_screen(m.column, m.row);
+            if crate::debug_log::enabled() {
+                let cell = app.cell_to_page_coord(m.column, m.row);
+                let nlinks = match cell {
+                    Some((p, _, _)) => app.page_links_cache.get(&p).map_or(0, |v| v.len()),
+                    None => 0,
+                };
+                crate::debug_log::write(
+                    "mouse_down",
+                    &format!(
+                        "col={c} row={r} cell_to_page={cell:?} nlinks_on_page={nlinks} hit={hit:?}",
+                        c = m.column,
+                        r = m.row,
+                    ),
+                );
+            }
+            if let Some((page_idx, link_idx)) = hit {
+                app.pending_link_click = Some(crate::app::PendingLinkClick {
+                    page_idx,
+                    link_idx,
+                    start_col: m.column,
+                    start_row: m.row,
+                });
+            }
+            app.mouse_drag_start(m.column, m.row);
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            // Cancel any pending link-click candidate as soon as the
+            // cursor walks past slop in either axis. Past that point
+            // the user is dragging a selection, and the Up should
+            // commit a highlight, not navigate a link.
+            if let Some(pc) = app.pending_link_click {
+                let dc = (m.column as i32 - pc.start_col as i32).abs();
+                let dr = (m.row as i32 - pc.start_row as i32).abs();
+                if dc > crate::app::LINK_DRAG_SLOP || dr > crate::app::LINK_DRAG_SLOP {
+                    app.pending_link_click = None;
+                }
+            }
+            app.mouse_drag_to(m.column, m.row);
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            // Order matters here. `mouse_drag_start` (called on Down)
+            // entered Visual mode and seeded a selection at the click
+            // point. If we activate the link FIRST (setting status)
+            // and `mouse_drag_end` SECOND, the small-rect cancel path
+            // calls `exit_visual` which calls `self.status.clear()`
+            // — the link-activation status is wiped before the user
+            // can read it (caught by the doc-only audit). Solution:
+            // drag-end FIRST (lets exit_visual run + clear its own
+            // "Drag to select…" status), THEN activate the link
+            // (sets the surviving "→ p.42 (jump 1/1)" status).
+            // `take()` empties the slot regardless of order so the
+            // pending click can't fire twice.
+            let pending = app.pending_link_click.take();
+            if crate::debug_log::enabled() {
+                crate::debug_log::write(
+                    "mouse_up",
+                    &format!(
+                        "col={c} row={r} pending={pending:?}",
+                        c = m.column,
+                        r = m.row
+                    ),
+                );
+            }
+            app.mouse_drag_end();
+            if let Some(pc) = pending {
+                app.activate_link(pc.page_idx, pc.link_idx);
+            }
+        }
+        // Mouse motion without a button held → hover. Cheap O(visible-
+        // pages × links-per-page) hit-test; equality-debounced so a
+        // steady in-link hover doesn't redraw every frame. Status
+        // line picks up `app.hover_link` to render the `→ p.42` /
+        // `→ url…` preview. On terminals that don't deliver `Moved`
+        // events (no SGR motion), this branch is silently dead and
+        // the always-on link underline (paint pass in
+        // `ensure_highlights_baked`) remains the only indicator —
+        // graceful degradation, no detection needed.
+        //
+        // Popup suppression: when help / TOC overlays are visible the
+        // page itself is hidden behind a `Clear` widget, so a hover
+        // over what LOOKED like a link rect is actually a hover over
+        // popup chrome. Mutating `hover_link` here would (a) stale-
+        // preview a link the user can't click anyway and (b)
+        // `invalidate_compose` on every Moved event for free. Force
+        // `hover_link = None` so the preview slot stays empty until
+        // the popup closes.
+        MouseEventKind::Moved => {
+            let popup_open = app.show_help || app.show_toc;
+            let now_hover = if popup_open {
+                None
+            } else {
+                app.link_at_screen(m.column, m.row)
+            };
+            if app.hover_link != now_hover {
+                app.hover_link = now_hover;
+                app.invalidate_compose();
+            }
+        }
 
         _ => {}
     }

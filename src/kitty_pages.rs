@@ -142,7 +142,7 @@ fn max_cached_pages() -> usize {
 /// Configurable via `TERMPDF_GHOSTTY_BUDGET_MB` env (clamped 32–4096 MB).
 const DEFAULT_GHOSTTY_BUDGET_BYTES: u64 = 768 * 1024 * 1024;
 
-fn ghostty_budget_bytes() -> u64 {
+pub(crate) fn ghostty_budget_bytes() -> u64 {
     use std::sync::OnceLock;
     static CACHED: OnceLock<u64> = OnceLock::new();
     *CACHED.get_or_init(|| {
@@ -180,6 +180,19 @@ struct PageEntry {
     /// Independent of `transmitted_*`: this caches the encode output,
     /// not the terminal's image cache.
     cached_payload: Option<CachedPayload>,
+    /// Snapshot of the registry's `transmitted_bytes_cumulative` at
+    /// the moment this page was last marked transmitted. Pairs with
+    /// `KittyPageRegistry::is_eviction_at_risk`: the delta between
+    /// the registry's current cumulative total and this snapshot is
+    /// "bytes that have flowed through Ghostty SINCE this page's
+    /// transmit." If that delta exceeds Ghostty's image-storage cap,
+    /// Ghostty's `evictImage` is likely to have evicted this page
+    /// (it prefers unused images but WILL evict in-use under
+    /// pressure, per `graphics_storage.zig:582-610`). Per-page
+    /// granularity lets the draw path re-transmit exactly the at-
+    /// risk visible pages instead of the blanket
+    /// `invalidate_all_transmits`.
+    bytes_cumulative_at_my_transmit: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -230,6 +243,20 @@ pub struct KittyPageRegistry {
     /// `pages.values().sum()` on every steady-state frame. The hot
     /// early-out check now reads one u64 instead of walking the map.
     transmitted_bytes: u64,
+    /// Cumulative bytes EVER transmitted through Ghostty within this
+    /// "epoch" (resets on `invalidate_all_transmits`). Increments on
+    /// every `mark_transmitted` by the new entry's decoded-RGBA
+    /// size; never decrements. Distinct from `transmitted_bytes`
+    /// (which is a current-resident measure that goes up and down).
+    /// Pairs with `PageEntry::bytes_cumulative_at_my_transmit` to
+    /// detect per-page eviction risk: when (cumulative_now -
+    /// page.cumulative_at_my_transmit) ≥ Ghostty's image-storage
+    /// cap, the page is statistically likely to have been evicted
+    /// even though our local registry believes it's fresh. Cheaper
+    /// and more precise than the blanket `post_scroll_settle`
+    /// invalidate (re-transmits ONLY the at-risk pages, not all
+    /// visible).
+    transmitted_bytes_cumulative: u64,
     /// Scratch buffers reused across `place_page` calls. Memoizes the
     /// per-row diacritic string (varies by viewport `cols` only) and
     /// the restore-cursor escape (varies by `area.width`/`area.height`
@@ -315,6 +342,7 @@ impl KittyPageRegistry {
             lru: VecDeque::new(),
             pending_deletes: Vec::new(),
             transmitted_bytes: 0,
+            transmitted_bytes_cumulative: 0,
             place_scratch: PlaceScratch::default(),
         }
     }
@@ -626,6 +654,13 @@ impl KittyPageRegistry {
         // Every page just lost its "Ghostty holds this" status, so the
         // running total of transmitted bytes is zero.
         self.transmitted_bytes = 0;
+        // Reset the cumulative epoch counter too: the next round of
+        // transmits is starting from a clean slate; their snapshots
+        // should be relative to the new epoch, not the old one.
+        // Otherwise a page transmitted right after invalidate would
+        // inherit a huge `bytes_cumulative_at_my_transmit - 0` delta
+        // from the prior epoch and look "at risk" immediately.
+        self.transmitted_bytes_cumulative = 0;
         if crate::debug_log::enabled() {
             crate::debug_log::write(
                 "invalidate_all",
@@ -657,6 +692,38 @@ impl KittyPageRegistry {
         }
     }
 
+    /// True if cumulative transmits since this page's last
+    /// `mark_transmitted` have exceeded `threshold_bytes` — Ghostty's
+    /// `evictImage` sorts by `(used, time)` and WILL evict in-use
+    /// pages under storage pressure (`graphics_storage.zig:582-610`),
+    /// so a page that's seen a full cap's worth of bytes flow past
+    /// it since its transmit is statistically likely to have been
+    /// evicted. The draw path can then re-transmit pre-emptively
+    /// instead of waiting for the post-scroll-settle blanket
+    /// invalidate. Pages with no prior transmit return false (they
+    /// have no snapshot to compare against — they aren't in
+    /// Ghostty's store yet). The threshold should be sized to
+    /// Ghostty's `image-storage-limit` (320 MB stock; 1 GiB if the
+    /// user followed the README) — caller passes the value so the
+    /// registry stays env-agnostic and unit-testable.
+    pub fn is_eviction_at_risk(&self, page_idx: usize, threshold_bytes: u64) -> bool {
+        self.pages.get(&page_idx).is_some_and(|e| {
+            e.transmitted_layout.is_some()
+                && self
+                    .transmitted_bytes_cumulative
+                    .saturating_sub(e.bytes_cumulative_at_my_transmit)
+                    >= threshold_bytes
+        })
+    }
+
+    /// Cumulative bytes transmitted in the current epoch. Exposed for
+    /// tests + future debug-log paths; production code uses
+    /// `is_eviction_at_risk` directly.
+    #[allow(dead_code)]
+    pub fn transmitted_bytes_cumulative(&self) -> u64 {
+        self.transmitted_bytes_cumulative
+    }
+
     /// Update registry state to reflect that this page has just been
     /// transmitted (or about to be). The corresponding transmit
     /// string is built by `build_transmit` separately.
@@ -684,6 +751,11 @@ impl KittyPageRegistry {
             Some(e) if e.transmitted_layout.is_some() => Self::entry_bytes(e.pixel_w, e.pixel_h),
             _ => 0,
         };
+        // Snapshot the current cumulative total BEFORE adding this
+        // page's bytes — the snapshot is what later eviction-risk
+        // checks compare against, and counting our own bytes would
+        // mean a page is "instantly at risk" by exactly its own size.
+        let cumulative_at_my_transmit = self.transmitted_bytes_cumulative;
         let entry = self.pages.entry(page_idx).or_insert(PageEntry {
             image_id: id,
             transmitted_layout: None,
@@ -691,17 +763,24 @@ impl KittyPageRegistry {
             pixel_w,
             pixel_h,
             cached_payload: None,
+            bytes_cumulative_at_my_transmit: 0,
         });
         entry.image_id = id;
         entry.transmitted_layout = Some(layout);
         entry.transmitted_revision = revision;
         entry.pixel_w = pixel_w;
         entry.pixel_h = pixel_h;
+        entry.bytes_cumulative_at_my_transmit = cumulative_at_my_transmit;
         let new_bytes = Self::entry_bytes(pixel_w, pixel_h);
         self.transmitted_bytes = self
             .transmitted_bytes
             .saturating_sub(prev_bytes)
             .saturating_add(new_bytes);
+        // Cumulative counter never decrements within an epoch. Each
+        // transmit pushes it forward by `new_bytes`; the next call's
+        // snapshot will see this updated value.
+        self.transmitted_bytes_cumulative =
+            self.transmitted_bytes_cumulative.saturating_add(new_bytes);
         self.touch(page_idx);
         if crate::debug_log::enabled() {
             crate::debug_log::write(
@@ -753,6 +832,7 @@ impl KittyPageRegistry {
                 pixel_w,
                 pixel_h,
                 cached_payload: None,
+                bytes_cumulative_at_my_transmit: 0,
             });
             let needs_encode = match &entry.cached_payload {
                 Some(c) => {
@@ -836,6 +916,7 @@ impl KittyPageRegistry {
             pixel_w,
             pixel_h,
             cached_payload: None,
+            bytes_cumulative_at_my_transmit: 0,
         });
         if let Some(c) = &entry.cached_payload {
             if c.layout == layout
@@ -2604,6 +2685,164 @@ mod tests {
         assert!(r.is_fresh(1, layout, 0, 16, 16));
         assert!(!r.is_fresh(0, layout, 0, 16, 16));
         assert!(!r.is_fresh(2, layout, 0, 16, 16));
+    }
+
+    /// Reproduces the smooth-scroll eviction-recovery scenario at the
+    /// registry level. The user reads forward; prefetch transmits
+    /// many pages ahead. Ghostty's image-storage cap (320 MB decoded
+    /// RGBA on stock config) gets hit and silently evicts a still-
+    /// visible page. Our `is_fresh` cache returns true so the draw
+    /// would happily place against a freed image_id → blank page.
+    /// The post-scroll-settle trigger in `ui::draw` calls
+    /// `invalidate_all_transmits`; the registry contract this test
+    /// pins is: after that call, `is_fresh` returns false for the
+    /// previously-transmitted visible page so the next draw issues a
+    /// fresh transmit (using `cached_payload`, no re-encode). If a
+    /// future "optimization" narrows `invalidate_all_transmits` to
+    /// only mark a subset of pages stale, this test catches it.
+    #[test]
+    fn settle_recovery_marks_visible_page_stale_after_eviction_pressure() {
+        let mut r = KittyPageRegistry::new(false, 1000);
+        let layout = LayoutKey {
+            fit_width_px: 64,
+            dark: false,
+        };
+        // Page 142: transmitted earlier, still visible.
+        r.mark_transmitted(142, layout, 0, 16, 16);
+        // Smooth-scroll prefetch ships pages 100..130 — simulates the
+        // cumulative pressure that pushes Ghostty past its cap.
+        for i in 100..130 {
+            r.mark_transmitted(i, layout, 0, 16, 16);
+        }
+        // Local registry still believes 142 is fresh — that's the
+        // failure mode we're catching.
+        assert!(
+            r.is_fresh(142, layout, 0, 16, 16),
+            "precondition: registry believes 142 is fresh (mirrors the \
+             pre-fix behavior where Ghostty has evicted it but we \
+             can't tell)"
+        );
+        // post_scroll_settle fires.
+        r.invalidate_all_transmits();
+        assert!(
+            !r.is_fresh(142, layout, 0, 16, 16),
+            "settle invalidate must mark visible page stale so next \
+             draw re-transmits — this is the load-bearing invariant \
+             for the smooth-scroll blank-page fix"
+        );
+    }
+
+    /// Per-page eviction-risk detector. Threshold is the assumed
+    /// Ghostty cap; when cumulative bytes flowed since this page's
+    /// transmit exceed it, the page is presumed evicted. Catches the
+    /// smooth-scroll case BEFORE the blanket post_scroll_settle
+    /// invalidate fires (and per-page, not all-or-nothing).
+    #[test]
+    fn is_eviction_at_risk_threshold_semantics() {
+        let mut r = KittyPageRegistry::new(false, 1000);
+        let layout = LayoutKey {
+            fit_width_px: 64,
+            dark: false,
+        };
+        // 100×100 page = 100*100*4 = 40_000 bytes per transmit.
+        // Threshold: 200_000 bytes = 5 transmits worth of pressure.
+        let threshold = 200_000u64;
+        // Page 0 transmitted at cumulative=0.
+        r.mark_transmitted(0, layout, 0, 100, 100);
+        assert!(
+            !r.is_eviction_at_risk(0, threshold),
+            "page 0 just transmitted — cumulative=40k since its snapshot, well under threshold"
+        );
+        // Transmit 4 more pages (160k more bytes flow past page 0).
+        for i in 1..5 {
+            r.mark_transmitted(i, layout, 0, 100, 100);
+        }
+        // Cumulative now at 5×40k = 200k. Page 0's snapshot=0 →
+        // delta=200k ≥ threshold=200k. At-risk.
+        assert!(
+            r.is_eviction_at_risk(0, threshold),
+            "after 5 transmits at the threshold-equal mark, page 0 is at risk"
+        );
+        // Page 4 transmitted MOST RECENTLY (snapshot=160k, current=200k,
+        // delta=40k) — well under threshold.
+        assert!(
+            !r.is_eviction_at_risk(4, threshold),
+            "page 4 transmitted last, no pressure since"
+        );
+    }
+
+    /// `is_eviction_at_risk` returns false for pages with no prior
+    /// transmit. Caller's draw path checks `!is_fresh || at_risk`;
+    /// pages without prior transmit go through the !is_fresh branch
+    /// already, so at-risk should not double-fire (and would hit a
+    /// missing snapshot if we let it).
+    #[test]
+    fn is_eviction_at_risk_false_when_no_prior_transmit() {
+        let r = KittyPageRegistry::new(false, 1000);
+        // Threshold doesn't matter — never-transmitted pages are never
+        // at risk. (Their "image_id is in Ghostty's store" is vacuously
+        // false; you can't evict what was never sent.)
+        assert!(!r.is_eviction_at_risk(42, 1));
+        assert!(!r.is_eviction_at_risk(42, u64::MAX));
+    }
+
+    /// Re-transmitting a page resets its snapshot, so subsequent
+    /// pressure has to accumulate from the fresh transmit. Invariant:
+    /// after `mark_transmitted`, `is_eviction_at_risk` MUST return
+    /// false for that page (until further transmits push the
+    /// cumulative past threshold again). This is what makes the
+    /// per-page detector self-clearing without an explicit reset.
+    #[test]
+    fn is_eviction_at_risk_resets_on_re_transmit() {
+        let mut r = KittyPageRegistry::new(false, 1000);
+        let layout = LayoutKey {
+            fit_width_px: 64,
+            dark: false,
+        };
+        let threshold = 100_000u64;
+        r.mark_transmitted(0, layout, 0, 100, 100); // 40k
+        for i in 1..4 {
+            r.mark_transmitted(i, layout, 0, 100, 100); // +40k each
+        }
+        // Cumulative = 160k. Page 0 snapshot=0 → delta=160k ≥ 100k.
+        assert!(r.is_eviction_at_risk(0, threshold));
+        // User scrolled back to page 0; we re-transmit it.
+        r.mark_transmitted(0, layout, 0, 100, 100);
+        // Snapshot=160k, cumulative now=200k → delta=40k < threshold.
+        assert!(
+            !r.is_eviction_at_risk(0, threshold),
+            "re-transmitting MUST clear at-risk for that page — \
+             otherwise the recovery path would loop infinitely"
+        );
+    }
+
+    /// `invalidate_all_transmits` resets the cumulative epoch
+    /// counter. Without this reset, a page transmitted right after
+    /// invalidate would have snapshot=0 (fresh entry) but cumulative
+    /// still carrying the prior epoch's huge value — the very next
+    /// at-risk check would fire spuriously.
+    #[test]
+    fn invalidate_all_transmits_resets_cumulative_epoch() {
+        let mut r = KittyPageRegistry::new(false, 1000);
+        let layout = LayoutKey {
+            fit_width_px: 64,
+            dark: false,
+        };
+        for i in 0..10 {
+            r.mark_transmitted(i, layout, 0, 100, 100);
+        }
+        assert!(r.transmitted_bytes_cumulative() > 0);
+        r.invalidate_all_transmits();
+        assert_eq!(
+            r.transmitted_bytes_cumulative(),
+            0,
+            "epoch counter MUST reset so post-invalidate transmits get \
+             snapshots relative to the new epoch, not the old one"
+        );
+        // Fresh transmit after invalidate. snapshot=0, cumulative=40k
+        // post-mark — at-risk only fires above threshold.
+        r.mark_transmitted(0, layout, 0, 100, 100);
+        assert!(!r.is_eviction_at_risk(0, 1_000_000));
     }
 
     #[test]
